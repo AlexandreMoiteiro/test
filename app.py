@@ -1,3 +1,5 @@
+
+
 # app.py — NAVLOG com rota por coordenadas (auto TC/Dist), CSVs locais e PDF bloqueado
 # Reqs: streamlit, pypdf, pytz
 
@@ -217,24 +219,36 @@ def _parse_float(s):
     try: return float(s)
     except: return None
 
+def _open_csv_any(path: Path):
+    # tenta utf-8; se falhar tenta latin-1; deteta delimitador
+    for enc in ("utf-8", "latin-1"):
+        try:
+            text = path.read_text(encoding=enc)
+            dialect = csv.Sniffer().sniff(text.splitlines()[0] if text else ",")
+            f = io.StringIO(text)
+            return csv.DictReader(f, dialect=dialect)
+        except Exception:
+            continue
+    # fallback simples
+    return csv.DictReader(path.open("r", encoding="utf-8", newline=""))
+
 def load_points_from_csv(path: Path) -> List[dict]:
     rows=[]
     if not path or not path.exists(): return rows
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            name = r.get("Name") or r.get("NOME") or r.get("Nome") or r.get("DESIGNACAO") or r.get("Designacao") or r.get("LOCAL") or r.get("Local") or ""
-            lat  = r.get("lat") or r.get("LAT") or r.get("Latitude") or r.get("LATITUDE") or r.get("Y") or r.get("Lat") or r.get("coord_y")
-            lon  = r.get("lon") or r.get("LON") or r.get("Longitude") or r.get("LONGITUDE") or r.get("X") or r.get("Lon") or r.get("coord_x")
-            typ  = r.get("Type") or r.get("TIPO") or r.get("Tipo") or r.get("Categoria") or ""
-            freq = r.get("Freq") or r.get("FREQ") or r.get("Frequency") or r.get("Frequencia") or r.get("Frequência") or ""
-            elev = r.get("Elev") or r.get("ELEV") or r.get("Elevation") or r.get("ELEVATION") or r.get("Alt") or r.get("ALT")
-            name = str(name).strip()
-            la = _parse_float(lat); lo = _parse_float(lon); ev = _parse_float(elev)
-            if name and la is not None and lo is not None:
-                rows.append({"Name": name.upper(), "Type": (str(typ).upper() if typ else ""),
-                             "Freq": str(freq).strip(), "lat": la, "lon": lo,
-                             "elev": (int(round(ev)) if ev is not None else None)})
+    reader = _open_csv_any(path)
+    for r in reader:
+        name = r.get("Name") or r.get("NOME") or r.get("Nome") or r.get("DESIGNACAO") or r.get("Designacao") or r.get("LOCAL") or r.get("Local") or ""
+        lat  = r.get("lat") or r.get("LAT") or r.get("Latitude") or r.get("LATITUDE") or r.get("Y") or r.get("Lat") or r.get("coord_y")
+        lon  = r.get("lon") or r.get("LON") or r.get("Longitude") or r.get("LONGITUDE") or r.get("X") or r.get("Lon") or r.get("coord_x")
+        typ  = r.get("Type") or r.get("TIPO") or r.get("Tipo") or r.get("Categoria") or ""
+        freq = r.get("Freq") or r.get("FREQ") or r.get("Frequency") or r.get("Frequencia") or r.get("Frequência") or ""
+        elev = r.get("Elev") or r.get("ELEV") or r.get("Elevation") or r.get("ELEVATION") or r.get("Alt") or r.get("ALT")
+        name = str(name).strip()
+        la = _parse_float(lat); lo = _parse_float(lon); ev = _parse_float(elev)
+        if name and la is not None and lo is not None:
+            rows.append({"Name": name.upper(), "Type": (str(typ).upper() if typ else ""),
+                         "Freq": str(freq).strip(), "lat": la, "lon": lo,
+                         "elev": (int(round(ev)) if ev is not None else None)})
     return rows
 
 def build_point_index(rows: List[dict]) -> Dict[str, dict]:
@@ -249,36 +263,37 @@ def build_point_index(rows: List[dict]) -> Dict[str, dict]:
 st.set_page_config(page_title="NAVLOG", layout="wide", initial_sidebar_state="collapsed")
 st.title("Navigation Plan & Inflight Log — Tecnam P2008")
 
-# Carregar CSVs locais (mesma diretoria)
-CSV_FILES = [Path("AD-HEL-ULM.csv"), Path("Localidades-Nova-versao-230223.csv")]
+# CSVs locais (mesma diretoria do app)
+HERE = Path(__file__).parent
+CSV_FILES = [HERE/"AD-HEL-ULM.csv", HERE/"Localidades-Nova-versao-230223.csv"]
 db_rows=[]
 for p in CSV_FILES:
-    try:
-        db_rows += load_points_from_csv(p)
-    except Exception:
-        pass
+    try: db_rows += load_points_from_csv(p)
+    except Exception: pass
 POINTS_DB = build_point_index(db_rows)
 
-# Lista de aeródromos para dropdown (tipo AERO ou padrão LP..)
+# Métricas/diagnóstico
+st.caption(f"Base de pontos: {len(POINTS_DB)} registos carregados.")
+
+# Lista de aeródromos para dropdown
 AERO_LIST = sorted([nm for nm,info in POINTS_DB.items()
-                    if info.get("Type","").upper().startswith("AERO")
-                    or re.fullmatch(r"[A-Z]{4}", nm or "") and nm.startswith("LP")])
+                    if (info.get("Type","").upper().startswith("AERO")
+                        or (re.fullmatch(r"[A-Z]{4}", nm or "") and nm.startswith("LP")))])
 
 def point_latlon(name:str):
-    info = POINTS_DB.get((name or "").upper() , {})
+    info = POINTS_DB.get((name or "").upper(), {})
     return (info.get("lat"), info.get("lon"))
 
 def point_elev(name:str) -> int:
     info = POINTS_DB.get((name or "").upper(), {})
     if info and info.get("elev") is not None:
         return int(info["elev"])
-    # fallback: 0 se desconhecido
     return 0
 
 # Header
 DEFAULT_STUDENT="AMOIT"; DEFAULT_AIRCRAFT="P208"; DEFAULT_CALLSIGN="RVP"
 REGS=["CS-ECC","CS-ECD","CS-DHS","CS-DHT","CS-DHU","CS-DHV","CS-DHW"]
-PDF_TEMPLATE_PATHS=["NAVLOG - FORM.pdf"]
+PDF_TEMPLATE_PATHS=["NAVLOG_FORM.pdf", str(HERE/"NAVLOG_FORM.pdf")]
 
 c1,c2,c3=st.columns(3)
 with c1:
@@ -290,10 +305,15 @@ with c2:
     lesson = st.text_input("Lesson","").upper()
     instrutor = st.text_input("Instrutor","").upper()
 with c3:
-    dep_idx = 0 if AERO_LIST else None
-    dept=st.selectbox("Departure", AERO_LIST, index=dep_idx).upper() if AERO_LIST else st.text_input("Departure").upper()
-    arr =st.selectbox("Arrival",   AERO_LIST, index=min(1,len(AERO_LIST)-1)).upper() if AERO_LIST else st.text_input("Arrival").upper()
-    altn=st.selectbox("Alternate", AERO_LIST, index=min(2,len(AERO_LIST)-1)).upper() if AERO_LIST else st.text_input("Alternate").upper()
+    if AERO_LIST:
+        dept=st.selectbox("Departure", AERO_LIST, index=0).upper()
+        arr =st.selectbox("Arrival",   AERO_LIST, index=min(1,len(AERO_LIST)-1)).upper()
+        altn=st.selectbox("Alternate", AERO_LIST, index=min(2,len(AERO_LIST)-1)).upper()
+    else:
+        st.warning("Não encontrei aeródromos na BD — vou usar campos de texto.")
+        dept=st.text_input("Departure").upper()
+        arr =st.text_input("Arrival").upper()
+        altn=st.text_input("Alternate").upper()
 startup_str=st.text_input("Startup (HH:MM)","")
 
 # Atmosfera / navegação
@@ -352,8 +372,13 @@ st.markdown("### Route (DEP … ARR)")
 default_route = f"{dept} {arr}"
 route_text = st.text_area("Pontos (separados por espaço, vírgulas ou '->') — SEMPRE MAIÚSCULO (eu forço se não estiver)",
                           value=st.session_state.get("route_text", default_route))
-apply_route = st.button("Aplicar rota")
-auto_calc = st.checkbox("Auto calcular TC/Dist por coordenadas", value=True)
+colA, colB, colC = st.columns([1,1,1])
+with colA:
+    apply_route = st.button("Aplicar rota")
+with colB:
+    auto_calc = st.checkbox("Auto calcular TC/Dist por coordenadas", value=True)
+with colC:
+    skip_navaids = st.checkbox("NAVAID NÃO conta como leg", value=True)
 
 if "route_rows" not in st.session_state:
     st.session_state.route_rows = [{"Name": dept, "Type":"AERO", "Freq":""},
@@ -375,18 +400,6 @@ if len(rows)>=2:
 rows = [{**r, "Name": (r.get("Name","").upper()), "Type": (r.get("Type","WPT").upper()), "Freq": (r.get("Freq",""))} for r in rows]
 
 st.markdown("### Tabela de rota (Name/Type/Freq). TC e Dist calculados automaticamente.")
-# Para mostrar TC/Dist calculados ao lado (não editáveis)
-tc_dist_preview = []
-for i in range(len(rows)-1):
-    a_name = rows[i]["Name"]; b_name = rows[i+1]["Name"]
-    la1, lo1 = point_latlon(a_name); la2, lo2 = point_latlon(b_name)
-    if auto_calc and None not in (la1,lo1,la2,lo2):
-        di = nm_haversine(la1, lo1, la2, lo2)
-        tc = initial_true_course(la1, lo1, la2, lo2)
-    else:
-        di = 0.0; tc = 0.0
-    tc_dist_preview.append({"SEGMENTO": f"{a_name}→{b_name}", "TC (°T)": round(tc,1), "Dist (nm)": round(di,1)})
-
 rcfg = {
     "Name": st.column_config.TextColumn("Name"),
     "Type": st.column_config.SelectboxColumn("Type", options=ROUTE_TYPES),
@@ -394,24 +407,39 @@ rcfg = {
 }
 route_edited = st.data_editor(rows, hide_index=True, use_container_width=True,
                               column_config=rcfg, num_rows="dynamic", key="route_table")
-
-# Forçar MAIÚSCULAS após edição
 route_edited = [{"Name": (r.get("Name","").upper()), "Type": (r.get("Type","WPT").upper()), "Freq": (r.get("Freq",""))} for r in route_edited]
 
-# Recalcular TC/Dist agora com possível edição
+# Lista de pontos usada para LEGS (podes excluir NAVAIDs)
+if skip_navaids:
+    leg_points = [r for r in route_edited if r["Type"]!="NAVAID"]
+else:
+    leg_points = route_edited[:]
+
+# Recalcular LEGS
 legs=[]
-for i in range(len(route_edited)-1):
-    a = route_edited[i]["Name"]; b = route_edited[i+1]["Name"]
+missing_coords=set()
+for i in range(len(leg_points)-1):
+    a = leg_points[i]["Name"]; b = leg_points[i+1]["Name"]
     la1, lo1 = point_latlon(a); la2, lo2 = point_latlon(b)
     if auto_calc and None not in (la1,lo1,la2,lo2):
         di = round(nm_haversine(la1, lo1, la2, lo2), 1)
         tc = round(initial_true_course(la1, lo1, la2, lo2), 1)
     else:
         di, tc = 0.0, 0.0
+        if la1 is None or lo1 is None: missing_coords.add(a)
+        if la2 is None or lo2 is None: missing_coords.add(b)
+    # encontrar Freq/Type do destino na lista completa (para PDF)
+    dst_row = next((r for r in route_edited if r["Name"]==b), {"Type":"WPT","Freq":""})
     legs.append({"From": a, "To": b, "Dist": di, "TC": tc,
-                 "ToType": route_edited[i+1]["Type"], "ToFreq": (route_edited[i+1]["Freq"] or "").strip()})
+                 "ToType": dst_row["Type"], "ToFreq": (dst_row["Freq"] or "").strip()})
 
-st.dataframe(tc_dist_preview, use_container_width=True)
+# Pré-visualização dos segmentos
+seg_preview = []
+for l in legs:
+    seg_preview.append({"SEGMENTO": f"{l['From']}→{l['To']}", "TC (°T)": l["TC"], "Dist (nm)": l["Dist"]})
+st.dataframe(seg_preview, use_container_width=True)
+if missing_coords:
+    st.warning("Sem coordenadas na BD para: " + ", ".join(sorted(missing_coords)))
 
 # ======================= Cálculo de perfil vertical =======================
 def pressure_alt(alt_ft, qnh_hpa): return float(alt_ft) + (1013.0 - float(qnh_hpa))*30.0
@@ -486,7 +514,6 @@ def ceil_pos_minutes(x):  # arredonda ↑ e garante 1 min quando >0
 
 rows_fp=[]; seq_points=[]
 PH_ICON = {"CLIMB":"↑","CRUISE":"→","DESCENT":"↓"}
-
 alt_cursor = float(start_alt)
 efob=float(start_fuel)
 
@@ -592,7 +619,7 @@ try:
     template_bytes = read_pdf_bytes(PDF_TEMPLATE_PATHS)
 except Exception as e:
     template_bytes = None
-    st.error(f"Não foi possível ler o PDF: {e}")
+    st.error(f"Não foi possível ler o PDF (NAVLOG_FORM.pdf): {e}")
 
 def build_pdf_items_from_points(points):
     items = []
@@ -638,8 +665,8 @@ if template_bytes:
         put_alias(arr,           "Arrival_Airfield","Arrival","ARR")
         put_alias(altn,          "Alternate","ALTN")
         put_alias(str(point_elev(altn)), "Alt_Alternate","ALTN_ELEV","ALTN ELEV")
-        put_alias("", "Dept_Comm","DEP_FREQ","DEP FREQ")    # desconhecido na BD genérica
-        put_alias("", "Arrival_comm","ARR_FREQ","ARR FREQ") # idem
+        put_alias("", "Dept_Comm","DEP_FREQ","DEP FREQ")
+        put_alias("", "Arrival_comm","ARR_FREQ","ARR FREQ")
         put_alias("123.755", "Enroute_comm","ENR_FREQ","ENR FREQ")
         put_alias(f"{int(round(qnh))}", "QNH","ALT SET","QNH(hPa)")
         put_alias(f"{int(round(temp_c))} / {temp_dev}", "temp_isa_dev","OAT/DEV","OAT ISA DEV")
@@ -649,13 +676,10 @@ if template_bytes:
         put_alias(startup_str, "Startup","STARTUP","ETD-15")
         put_alias(takeoff_str, "Takeoff","ETD","OFF BLOCKS")
 
-        # Freq de DEP/ARR se constarem na BD com Freq
         dep_info = POINTS_DB.get(dept, {})
         arr_info = POINTS_DB.get(arr, {})
-        if dep_info.get("Freq"):
-            put_alias(dep_info["Freq"], "Dept_Comm","DEP_FREQ","DEP FREQ")
-        if arr_info.get("Freq"):
-            put_alias(arr_info["Freq"], "Arrival_comm","ARR_FREQ","ARR FREQ")
+        if dep_info.get("Freq"): put_alias(dep_info["Freq"], "Dept_Comm","DEP_FREQ","DEP FREQ")
+        if arr_info.get("Freq"): put_alias(arr_info["Freq"], "Arrival_comm","ARR_FREQ","ARR FREQ")
 
         # Enriquecer pontos com Freq (só NAVAID com freq)
         def enrich_points_with_freq(spoints, legs):
@@ -687,9 +711,8 @@ if template_bytes:
         put_alias(f"{tot_min//60:02d}:{tot_min%60:02d}", "FLT TIME","BLOCK TIME","TOTAL TIME")
         for key in ("LEVEL F/F","LEVEL_FF","Level_FF","Level F/F","CRZ_LEVEL"):
             put(named, fieldset, key, f"{int(round(cruise_alt))}", maxlens)
-        # Climb fuel aproximado
-        pa_mid_climb = start_alt + 0.5*max(0.0, cruise_alt - start_alt)
-        _, ff_climb_hdr = cruise_lookup(pa_mid_climb, int(rpm_climb),  temp_c)
+        pa_mid_climb_hdr = start_alt + 0.5*max(0.0, cruise_alt - start_alt)
+        _, ff_climb_hdr = cruise_lookup(pa_mid_climb_hdr, int(rpm_climb),  temp_c)
         climb_minutes = (max(0.0, cruise_alt - start_alt) / max(roc_interp_enroute(pressure_alt(start_alt,qnh), temp_c),1e-6))
         put_alias(f"{ff_climb_hdr*(climb_minutes/60.0):.1f}", "CLIMB FUEL","FUEL CLIMB")
         put_alias(f"{tot_min}", "ETE_Total","ETE TOTAL","TOTAL ETE")
@@ -732,4 +755,3 @@ if template_bytes:
             st.success("PDF gerado (campos bloqueados). Revê antes do voo.")
     except Exception as e:
         st.error(f"Erro ao preparar/gerar PDF: {e}")
-
