@@ -1,14 +1,15 @@
-# app.py — NAVLOG (coords de CSV locais + /mnt/data, TC/Dist auto, PDF bloqueado)
+# app.py — NAVLOG (lê AD-HEL-ULM.csv e Localidades-Nova-versao-230223.csv — formatos reais)
+# MAIÚSCULAS, TC/Dist auto, dropdowns de LPxxxx, PDF NAVLOG_FORM.pdf bloqueado
 # Reqs: streamlit, pypdf, pytz
 
 import streamlit as st
 import datetime as dt
-import pytz, io, json, unicodedata, re, math, csv, glob
+import pytz, io, json, unicodedata, re, math, csv
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from math import sin, asin, radians, degrees, fmod, atan2, cos
 
-# =============== PDF helpers ===============
+# ======================= PDF helpers =======================
 try:
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import NameObject, TextStringObject, NumberObject
@@ -20,11 +21,9 @@ def ascii_safe(x: str) -> str:
     return unicodedata.normalize("NFKD", str(x or "")).encode("ascii","ignore").decode("ascii")
 
 def read_pdf_bytes(paths_or_bytes):
-    if isinstance(paths_or_bytes, (bytes, bytearray)):
-        return bytes(paths_or_bytes)
+    if isinstance(paths_or_bytes, (bytes, bytearray)): return bytes(paths_or_bytes)
     for p in (paths_or_bytes or []):
-        if Path(p).exists():
-            return Path(p).read_bytes()
+        if Path(p).exists(): return Path(p).read_bytes()
     raise FileNotFoundError(paths_or_bytes)
 
 def get_fields_and_meta(template_bytes: bytes):
@@ -80,7 +79,7 @@ def fill_pdf(template_bytes: bytes, fields: dict, make_readonly=True) -> bytes:
                         obj = a.get_object()
                         if obj.get("/T"):
                             ff = int(obj.get("/Ff", 0))
-                            obj.update({NameObject("/Ff"): NumberObject(ff | 1)})  # ReadOnly
+                            obj.update({NameObject("/Ff"): NumberObject(ff | 1)})
         except Exception:
             pass
     bio = io.BytesIO(); writer.write(bio); return bio.getvalue()
@@ -88,17 +87,15 @@ def fill_pdf(template_bytes: bytes, fields: dict, make_readonly=True) -> bytes:
 def put(out: dict, fieldset: set, key: str, value: str, maxlens: Dict[str,int]):
     if key in fieldset:
         s = "" if value is None else str(value)
-        if key in maxlens and len(s) > maxlens[key]:
-            s = s[:maxlens[key]]
+        if key in maxlens and len(s) > maxlens[key]: s = s[:maxlens[key]]
         out[key] = s
 
 def pick(fieldset:set, *aliases) -> Optional[str]:
     for nm in aliases:
-        if nm in fieldset:
-            return nm
+        if nm in fieldset: return nm
     return None
 
-# =============== Utilidades numéricas / vento ===============
+# ======================= Utilidades numéricas / vento =======================
 def wrap360(x): x=fmod(x,360.0); return x+360 if x<0 else x
 def angle_diff(a,b): return (a-b+180)%360-180
 def clamp(v,lo,hi): return max(lo,min(hi,v))
@@ -119,8 +116,7 @@ def add_minutes(t:dt.time,m:int):
     return (base+dt.timedelta(minutes=m)).time()
 
 def wind_triangle(tc_deg: float, tas_kt: float, wind_from_deg: float, wind_kt: float):
-    if tas_kt <= 0:
-        return 0.0, wrap360(tc_deg), 0.0
+    if tas_kt <= 0: return 0.0, wrap360(tc_deg), 0.0
     wind_to = wrap360(wind_from_deg + 180.0)
     beta = radians(angle_diff(wind_to, tc_deg))
     cross = wind_kt * sin(beta)
@@ -134,7 +130,7 @@ def wind_triangle(tc_deg: float, tas_kt: float, wind_from_deg: float, wind_kt: f
 def apply_var(true_deg,var_deg,east_is_negative=False):
     return wrap360(true_deg - var_deg if east_is_negative else true_deg + var_deg)
 
-# =============== AFM / performance (650 kg) ===============
+# ======================= AFM (650 kg) =======================
 ROC_ENROUTE = {
     0:{-25:981,0:835,25:704,50:586},  2000:{-25:870,0:726,25:597,50:481},
     4000:{-25:759,0:617,25:491,50:377},6000:{-25:648,0:509,25:385,50:273},
@@ -143,7 +139,6 @@ ROC_ENROUTE = {
 }
 ROC_FACTOR = 0.90
 VY_ENROUTE = {0:67,2000:67,4000:67,6000:67,8000:67,10000:67,12000:67,14000:67}
-
 CRUISE={
     0:{1800:(82,15.3),1900:(89,17.0),2000:(95,18.7),2100:(101,20.7),2250:(110,24.6),2388:(118,26.9)},
     2000:{1800:(82,15.3),1900:(88,16.6),2000:(94,17.5),2100:(100,19.9),2250:(109,23.5)},
@@ -193,157 +188,112 @@ def vy_interp_enroute(pa):
     p0=max([p for p in pas if p<=pa_c]); p1=min([p for p in pas if p>=pa_c])
     return interp1(pa_c, p0, p1, VY_ENROUTE[p0], VY_ENROUTE[p1])
 
-# =============== Coordenadas: parsing robusto + BD ===============
-def dms_to_dd(deg, mn, sec, hemi):
-    sign = -1 if hemi.upper() in ("S","W") else 1
-    return sign * (float(deg) + float(mn or 0)/60.0 + float(sec or 0)/3600.0)
+# ======================= Helpers de coordenadas =======================
+def dms_to_dd(s: str) -> Optional[float]:
+    """Aceita '372755.90N' ou '392747N' e '0084414.21W' etc."""
+    s = (s or "").strip().upper()
+    m = re.fullmatch(r"(\d{2,3})(\d{2})(\d{2}(?:\.\d+)?)\s*([NSEW])", s)
+    if not m: return None
+    deg, mn, sec, hemi = m.groups()
+    deg = float(deg); mn = float(mn); sec = float(sec)
+    val = deg + mn/60.0 + sec/3600.0
+    if hemi in ("S","W"): val = -val
+    return val
 
-def parse_coord(anyval):
-    """Aceita decimal (com , ou .) ou DMS '40°12'34.5\"N'."""
-    if anyval is None: return None
-    s = str(anyval).strip()
-    if not s: return None
-    s2 = s.replace(",", ".")
-    # decimal simples
-    try:
-        return float(s2)
-    except:
-        pass
-    # DMS
-    m = re.search(r"(\d+(?:\.\d+)?)\D+(\d+(?:\.\d+)?)?\D*(\d+(?:\.\d+)?)?\s*([NSEWnsew])", s2)
-    if m:
-        deg, mn, sec, hemi = m.group(1), m.group(2), m.group(3), m.group(4)
-        return dms_to_dd(deg, mn, sec, hemi)
-    return None
+# ======================= Leitura dedicada dos teus ficheiros =======================
+def load_ad_hel_ulm(path: Path) -> List[dict]:
+    """Parseia linhas tipo:
+    LP0078   ALENTEJO AIR PARK ULM   3728N00844W   372755.90N  0084414.21W  SAO TEOTONIO
+    """
+    out=[]
+    if not path.exists(): return out
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = raw.strip().strip('"')
+        if not s or not s.startswith("LP"): continue
+        m = re.search(r'^(LP[0-9A-Z]{4,})\s+(.+?)\s+\d{4,5}[NS]\d{5}[EW]\s+([0-9\.NnSs]+)\s+([0-9\.EeWw]+)\s+(.*)$', s)
+        if not m:
+            # fallback: tenta apanhar os 2 últimos tokens DMS
+            toks = s.split()
+            if len(toks)>=5 and re.fullmatch(r'[NS\dn\.]+', toks[-3]) and re.fullmatch(r'[EW\dn\.]+', toks[-2]):
+                code=toks[0]; name=" ".join(toks[1:-3]); latd=toks[-3]; lond=toks[-2]
+            else:
+                continue
+        else:
+            code, name, latd, lond, _city = m.groups()
+        la = dms_to_dd(latd); lo = dms_to_dd(lond)
+        if la is None or lo is None: continue
+        name = name.upper().strip()
+        out.append({
+            "Name": code.upper(),          # usar LPxxxx como chave principal
+            "Alias": name,                 # alias com nome descritivo
+            "Type": ("AERO" if "ULM" in name or "HEL" in name or "HELI" in name or "AIR" in name else "AERO"),
+            "Freq": "",                    # ficheiro não traz VHF de forma fiável
+            "lat": la, "lon": lo,
+            "elev": None
+        })
+    return out
 
-NAME_KEYS = ["Name","NOME","Nome","DESIGNACAO","Designacao","Designação","LOCAL","Local","PONTO","WPT","FIX","ID","Ident","IDENT","Codigo","Código","CODE","ICAO"]
-LAT_KEYS  = ["lat","LAT","Latitude","LATITUDE","Y","Lat","coord_y","LAT_DD","LAT_D","LATITUDE_DD"]
-LON_KEYS  = ["lon","LON","Longitude","LONGITUDE","X","Lon","coord_x","LONG_DD","LON_D","LONGITUDE_DD"]
-FREQ_KEYS = ["Freq","FREQ","Frequency","Frequencia","Frequência","VHF","NAV","FREQUENCY"]
-ELEV_KEYS = ["Elev","ELEV","Elevation","ELEVATION","Alt","ALT","Altitude","ALTITUDE","Elevação","Elevacao"]
-TYPE_KEYS = ["Type","TIPO","Tipo","Categoria","CATEGORIA","Class","CLASSE"]
-
-def norm_key(s: str) -> str:
-    # para lookup robusto: uppercase, ascii, remove espaços/pontos/hífens
-    s = ascii_safe(s or "").upper()
-    return re.sub(r"[\s\-\._/]+","", s)
-
-def sniff_delimiter(text: str) -> str:
-    sample = "\n".join(text.splitlines()[:30])
-    counts = {";": sample.count(";"), ",": sample.count(","), "\t": sample.count("\t")}
-    return max(counts, key=counts.get) or ","
-
-def read_csv_any(path: Path):
-    for enc in ("utf-8-sig","utf-8","latin-1"):
-        try:
-            text = path.read_text(encoding=enc, errors="ignore")
-            delim = sniff_delimiter(text)
-            return list(csv.DictReader(io.StringIO(text), delimiter=delim))
-        except Exception:
-            continue
-    return []
-
-def load_points_from_csv(path: Path) -> List[dict]:
-    rows=[]
-    if not path or not path.exists(): return rows
-    for r in read_csv_any(path):
-        # nome pode estar repartido entre 2 campos (ex.: 'ICAO' + 'Nome')
-        name = ""
-        icao = ""
-        for k in NAME_KEYS:
-            if k in r and r[k].strip():
-                if k.upper()=="ICAO":
-                    icao = r[k].strip().upper()
-                if not name:
-                    name = r[k].strip()
-        name = (icao or name).upper()
-        lat = None; lon = None; elev = None; freq = ""
-        for k in LAT_KEYS:
-            if k in r and lat is None:
-                lat = parse_coord(r[k])
-        for k in LON_KEYS:
-            if k in r and lon is None:
-                lon = parse_coord(r[k])
-        for k in ELEV_KEYS:
-            if k in r and elev is None and str(r[k]).strip():
-                try: elev = int(round(float(str(r[k]).replace(",","."))))
-                except: pass
-        for k in FREQ_KEYS:
-            if k in r and str(r[k]).strip():
-                freq = str(r[k]).strip()
-        typ = ""
-        for k in TYPE_KEYS:
-            if k in r and str(r[k]).strip():
-                typ = str(r[k]).strip().upper()
-                break
-        if not name or lat is None or lon is None:
-            continue
-        rec={"Name": name, "lat": lat, "lon": lon, "elev": elev,
-             "Freq": freq, "Type": typ}
-        rows.append(rec)
-    return rows
+def load_localidades(path: Path) -> List[dict]:
+    """Linhas tipo:
+    ABRANTES  392747N 0081159W  ABRAN  LC
+    """
+    out=[]
+    if not path.exists(): return out
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = raw.strip().strip('"')
+        if not s or s.startswith("LOCALIDADE") or "Total de registos" in s: continue
+        # nome (coluna larga) + lat + lon + código (5 letras)
+        m = re.match(r'^([A-Z0-9ÁÂÃÀÉÍÓÚÇ\-\s\(\)\/\.]+?)\s+(\d{6,7}[NS])\s+(\d{7,8}[EW])\s+([A-Z0-9]{4,6})', s)
+        if not m: continue
+        nome, latd, lond, code = m.groups()
+        la = dms_to_dd(latd); lo = dms_to_dd(lond)
+        if la is None or lo is None: continue
+        out.append({
+            "Name": code.upper(),          # ex.: PTSOR
+            "Alias": nome.upper().strip(), # nome por extenso
+            "Type": "WPT",
+            "Freq": "",
+            "lat": la, "lon": lo,
+            "elev": None
+        })
+    return out
 
 def build_index(records: List[dict]) -> Dict[str, dict]:
     idx={}
+    def norm(s): return ascii_safe((s or "").upper()).strip()
     for r in records:
-        keys = {r["Name"].upper(), norm_key(r["Name"])}
-        # se parecer ICAO (LP..), usar também como key
-        if re.fullmatch(r"[A-Z]{4}", r["Name"]):
-            keys.add(r["Name"])
-        # se houver coluna ICAO separada, já foi apanhada como Name acima
+        keys = {norm(r["Name"]), norm(r.get("Alias",""))}
         for k in list(keys):
-            idx[k]=r
+            if k: idx[k]=r
     return idx
 
-# procurar CSVs na pasta do script e em /mnt/data
+# carregar da pasta do script e também de /mnt/data (caso corra noutro ambiente)
 HERE = Path(__file__).parent
-SEARCH = [HERE, Path("/mnt/data")]
-CSV_GLOBS = ["AD-HEL-ULM.csv", "Localidades-Nova-versao-230223.csv", "*.csv"]
+AD_FILE = (HERE/"AD-HEL-ULM.csv") if (HERE/"AD-HEL-ULM.csv").exists() else Path("/mnt/data/AD-HEL-ULM.csv")
+LOC_FILE = (HERE/"Localidades-Nova-versao-230223.csv") if (HERE/"Localidades-Nova-versao-230223.csv").exists() else Path("/mnt/data/Localidades-Nova-versao-230223.csv")
 
-def collect_records() -> List[dict]:
-    recs=[]
-    seen=set()
-    for root in SEARCH:
-        for pattern in CSV_GLOBS:
-            for p in root.glob(pattern):
-                if p.is_file() and p.suffix.lower()==".csv":
-                    try:
-                        for r in load_points_from_csv(p):
-                            key=(r["Name"], r["lat"], r["lon"])
-                            if key not in seen:
-                                recs.append(r); seen.add(key)
-                    except Exception:
-                        pass
-    return recs
-
-DB_ROWS = collect_records()
+AD_ROWS  = load_ad_hel_ulm(AD_FILE)
+LOC_ROWS = load_localidades(LOC_FILE)
+DB_ROWS  = AD_ROWS + LOC_ROWS
 POINTS_DB = build_index(DB_ROWS)
 
-# classificar aeródromos para dropdown
-def is_aero(r: dict) -> bool:
-    t = (r.get("Type","") or "").upper()
-    if t in ("AD","AERO","AERODROME","AERÓDROMO","HEL","ULM","APT","AERODROMO"): return True
-    nm = r.get("Name","")
-    return bool(re.fullmatch(r"[A-Z]{4}", nm) and nm.startswith("LP"))
-
-AERO_LIST = sorted({ r["Name"] for r in DB_ROWS if is_aero(r) })
+# aeródromos para dropdown: todos LPxxxx do AD_FILE
+AERO_LIST = sorted([r["Name"] for r in AD_ROWS if re.fullmatch(r"LP[A-Z0-9]{3}", r["Name"])])
 
 def point_lookup(name: str) -> Optional[dict]:
-    if not name: return None
-    nm = name.upper()
-    return POINTS_DB.get(nm) or POINTS_DB.get(norm_key(nm))
+    nm = ascii_safe((name or "").upper()).strip()
+    return POINTS_DB.get(nm)
 
 def point_latlon(name:str):
     rec = point_lookup(name) or {}
     return (rec.get("lat"), rec.get("lon"))
 
 def point_elev(name:str) -> int:
-    rec = point_lookup(name) or {}
-    ev = rec.get("elev")
+    ev = (point_lookup(name) or {}).get("elev")
     try: return int(ev) if ev is not None else 0
     except: return 0
 
-# =============== Dist/TC =================
+# ======================= TC/Dist =======================
 def nm_haversine(lat1, lon1, lat2, lon2):
     R_nm = 3440.065
     φ1, λ1, φ2, λ2 = map(radians, [lat1, lon1, lat2, lon2])
@@ -359,17 +309,16 @@ def initial_true_course(lat1, lon1, lat2, lon2):
     brng = degrees(atan2(y, x))
     return wrap360(brng)
 
-# =============== APP UI =================
+# ======================= UI =======================
 st.set_page_config(page_title="NAVLOG", layout="wide", initial_sidebar_state="collapsed")
 st.title("Navigation Plan & Inflight Log — Tecnam P2008")
+st.caption(f"Pontos carregados: {len(DB_ROWS)}  •  Aeródromos (LP…): {len(AERO_LIST)}")
 
-st.caption(f"BD carregada: {len(DB_ROWS)} pontos • {len(AERO_LIST)} aeródromos detectados.")
-
+# Header
 DEFAULT_STUDENT="AMOIT"; DEFAULT_AIRCRAFT="P208"; DEFAULT_CALLSIGN="RVP"
 REGS=["CS-ECC","CS-ECD","CS-DHS","CS-DHT","CS-DHU","CS-DHV","CS-DHW"]
 PDF_TEMPLATE_PATHS=["NAVLOG_FORM.pdf", str(HERE/"NAVLOG_FORM.pdf")]
 
-# Header
 c1,c2,c3=st.columns(3)
 with c1:
     aircraft=st.text_input("Aircraft",DEFAULT_AIRCRAFT).upper()
@@ -381,11 +330,11 @@ with c2:
     instrutor = st.text_input("Instrutor","").upper()
 with c3:
     if AERO_LIST:
-        dept=st.selectbox("Departure", AERO_LIST, index=0).upper()
-        arr =st.selectbox("Arrival",   AERO_LIST, index=min(1,len(AERO_LIST)-1)).upper()
-        altn=st.selectbox("Alternate", AERO_LIST, index=min(2,len(AERO_LIST)-1)).upper()
+        dept=st.selectbox("Departure (LP… da BD)", AERO_LIST, index=0).upper()
+        arr =st.selectbox("Arrival (LP… da BD)",   AERO_LIST, index=min(1,len(AERO_LIST)-1)).upper()
+        altn=st.selectbox("Alternate (LP… da BD)", AERO_LIST, index=min(2,len(AERO_LIST)-1)).upper()
     else:
-        st.warning("Não encontrei aeródromos na BD — a deteção de colunas pode não bater com os teus CSV. Vou usar campos de texto.")
+        st.warning("Não encontrei LPxxxx no AD-HEL-ULM.csv — verifica o ficheiro.")
         dept=st.text_input("Departure").upper()
         arr =st.text_input("Arrival").upper()
         altn=st.text_input("Alternate").upper()
@@ -404,7 +353,7 @@ with c6:
     wind_from=st.number_input("Wind FROM (°TRUE)",0,360,0,step=1)
     wind_kt=st.number_input("Wind (kt)",0,120,17,step=1)
 
-# Perf / consumos
+# Perf / consumos (descent usa FF de cruise por defeito)
 c7,c8,c9=st.columns(3)
 with c7:
     rpm_climb  = st.number_input("Climb RPM (AFM)",1800,2388,2250,step=10)
@@ -435,7 +384,7 @@ def parse_route_tokens(tokens: List[str]) -> List[dict]:
             t = name.strip().upper()
             freq = maybe.strip()
         typ="WPT"; nm=t
-        if re.fullmatch(r"[A-Z]{4}", nm) and nm.startswith("LP"): typ="AERO"
+        if re.fullmatch(r"LP[A-Z0-9]{3}", nm): typ="AERO"
         m = re.match(r"(NAVAID|VOR|NDB|DME|VORTAC)[:\-]?(.*)$", nm, re.I)
         if m:
             typ="NAVAID"; nm=(m.group(2) or "").strip().upper()
@@ -482,14 +431,12 @@ rcfg = {
 }
 route_edited = st.data_editor(rows, hide_index=True, use_container_width=True,
                               column_config=rcfg, num_rows="dynamic", key="route_table")
-# limpar linhas vazias adicionadas pelo editor
 route_edited = [ {"Name": r.get("Name","").upper(), "Type": r.get("Type","WPT").upper(), "Freq": r.get("Freq","")}
                  for r in route_edited if (r.get("Name") or "").strip() ]
 
-# lista para LEGS (podes excluir NAVAIDs)
+# LEGS (exclui NAVAIDs se marcado)
 leg_points = [r for r in route_edited if (r["Type"]!="NAVAID" or not skip_navaids)]
 
-# Recalcular LEGS + detetar faltas
 legs=[]; missing=set()
 for i in range(len(leg_points)-1):
     a = leg_points[i]["Name"]; b = leg_points[i+1]["Name"]
@@ -510,13 +457,11 @@ st.dataframe(seg_preview, use_container_width=True)
 if missing:
     st.warning("Sem coordenadas na BD para: " + ", ".join(sorted(missing)))
 
-# =============== Perfil vertical / cortes ===============
+# ======================= Perfil vertical / cortes =======================
 def pressure_alt(alt_ft, qnh_hpa): return float(alt_ft) + (1013.0 - float(qnh_hpa))*30.0
 
-dep_elev = point_elev(dept)
-arr_elev = point_elev(arr)
-start_alt = float(dep_elev)
-end_alt   = float(arr_elev)
+dep_elev = point_elev(dept); arr_elev = point_elev(arr)
+start_alt = float(dep_elev); end_alt = float(arr_elev)
 
 pa_start  = pressure_alt(start_alt, qnh)
 pa_cruise = pressure_alt(cruise_alt, qnh)
@@ -529,7 +474,7 @@ delta_desc  = max(0.0, cruise_alt - end_alt)
 t_climb_total = delta_climb / max(roc,1e-6)
 t_desc_total  = delta_desc  / max(rod_fpm,1e-6)
 
-# FFs (descent = cruise)
+# FFs — descent usa SEMPRE cruise FF
 pa_mid_climb = start_alt + 0.5*delta_climb
 _, ff_climb  = cruise_lookup(pa_mid_climb, int(rpm_climb),  temp_c)
 _, ff_cruise = cruise_lookup(pa_cruise,   int(rpm_cruise),  temp_c)
@@ -559,10 +504,7 @@ for j in range(N-1, -1, -1):
     descent_nm[j] = min(dist[j], gs * use_t / 60.0); rem_t -= use_t
     if rem_t <= 1e-9: idx_tod = j; break
 
-startup = parse_hhmm(startup_str)
-takeoff = add_minutes(startup,15) if startup else None
-clock = takeoff
-
+startup = parse_hhmm(startup_str); takeoff = add_minutes(startup,15) if startup else None; clock = takeoff
 def ceil_pos_minutes(x):  return max(1, int(math.ceil(x - 1e-9))) if x > 0 else 0
 
 rows_fp=[]; seq_points=[]
@@ -621,23 +563,25 @@ eta = clock; landing = eta; shutdown = add_minutes(eta,5) if eta else None
 # ===== Tabela da APP =====
 st.markdown("### Flight plan — cortes dentro do leg (App)")
 cfg={
-    "Fase":      st.column_config.TextColumn("Fase"),
+    "Fase": st.column_config.TextColumn("Fase"),
     "Leg/Marker": st.column_config.TextColumn("Leg / Marker"),
-    "To (Name)":  st.column_config.TextColumn("To (Name)", disabled=True),
-    "ALT (ft)":   st.column_config.TextColumn("ALT (ft)"),
-    "Detalhe":    st.column_config.TextColumn("Detalhe"),
-    "TC (°T)":    st.column_config.NumberColumn("TC (°T)", disabled=True),
-    "TH (°T)":    st.column_config.NumberColumn("TH (°T)", disabled=True),
-    "MH (°M)":    st.column_config.NumberColumn("MH (°M)", disabled=True),
-    "TAS (kt)":   st.column_config.NumberColumn("TAS (kt)", disabled=True),
-    "GS (kt)":    st.column_config.NumberColumn("GS (kt)", disabled=True),
-    "FF (L/h)":   st.column_config.NumberColumn("FF (L/h)", disabled=True),
-    "Dist (nm)":  st.column_config.NumberColumn("Dist (nm)", disabled=True),
-    "ETE (min)":  st.column_config.NumberColumn("ETE (min)", disabled=True),
-    "ETO":        st.column_config.TextColumn("ETO", disabled=True),
-    "Burn (L)":   st.column_config.NumberColumn("Burn (L)", disabled=True),
-    "EFOB (L)":   st.column_config.NumberColumn("EFOB (L)", disabled=True),
+    "To (Name)": st.column_config.TextColumn("To (Name)", disabled=True),
+    "ALT (ft)": st.column_config.TextColumn("ALT (ft)"),
+    "Detalhe": st.column_config.TextColumn("Detalhe"),
+    "TC (°T)": st.column_config.NumberColumn("TC (°T)", disabled=True),
+    "TH (°T)": st.column_config.NumberColumn("TH (°T)", disabled=True),
+    "MH (°M)": st.column_config.NumberColumn("MH (°M)", disabled=True),
+    "TAS (kt)": st.column_config.NumberColumn("TAS (kt)", disabled=True),
+    "GS (kt)": st.column_config.NumberColumn("GS (kt)", disabled=True),
+    "FF (L/h)": st.column_config.NumberColumn("FF (L/h)", disabled=True),
+    "Dist (nm)": st.column_config.NumberColumn("Dist (nm)", disabled=True),
+    "ETE (min)": st.column_config.NumberColumn("ETE (min)", disabled=True),
+    "ETO": st.column_config.TextColumn("ETO", disabled=True),
+    "Burn (L)": st.column_config.NumberColumn("Burn (L)", disabled=True),
+    "EFOB (L)": st.column_config.NumberColumn("EFOB (L)", disabled=True),
 }
+st.data_editor([], key="dummy")  # evita erro quando vazio
+st.data_editor(_, disabled=True) if False else None
 st.data_editor(rows_fp, hide_index=True, use_container_width=True, num_rows="fixed", column_config=cfg, key="fp_table")
 
 tot_ete_m = int(sum(int(r['ETE (min)']) for r in rows_fp)) if rows_fp else 0
@@ -646,14 +590,14 @@ if eta:
     tot_line += f" • **ETA {eta.strftime('%H:%M')}** • **Landing {landing.strftime('%H:%M')}** • **Shutdown {shutdown.strftime('%H:%M')}**"
 st.markdown(tot_line)
 
-# =============== PDF export ===============
+# ======================= PDF export =======================
 st.markdown("### PDF export")
 show_fields = st.checkbox("Mostrar nomes de campos do PDF (debug)")
 try:
     template_bytes = read_pdf_bytes(PDF_TEMPLATE_PATHS)
 except Exception as e:
     template_bytes = None
-    st.error(f"Não foi possível ler 'NAVLOG_FORM.pdf' ao lado do app: {e}")
+    st.error(f"Não foi possível ler 'NAVLOG_FORM.pdf': {e}")
 
 def build_pdf_items_from_points(points):
     items = []
@@ -662,19 +606,18 @@ def build_pdf_items_from_points(points):
             "Name": p["name"], "Alt": str(int(round(p["alt"]))),
             "TC":  (str(p["tc"]) if idx>1 else ""), "TH": (str(p["th"]) if idx>1 else ""),
             "MH":  (str(p["mh"]) if idx>1 else ""), "TAS": (str(p["tas"]) if idx>1 else ""),
-            "GS":  (str(p["gs"]) if idx>1 else ""),  "Dist": (f"{p['dist']:.1f}" if idx>1 and isinstance(p["dist"], (int,float)) else ""),
-            "ETE": (str(p["ete"]) if idx>1 else ""), "ETO":  (p["eto"] if idx>1 else (p["eto"] or "")),
+            "GS":  (str(p["gs"]) if idx>1 else ""), "Dist": (f"{p['dist']:.1f}" if idx>1 and isinstance(p["dist"], (int,float)) else ""),
+            "ETE": (str(p["ete"]) if idx>1 else ""), "ETO": (p["eto"] if idx>1 else (p["eto"] or "")),
             "Burn": (f"{p['burn']:.1f}" if idx>1 and isinstance(p["burn"], (int,float)) else ""),
             "EFOB": (f"{p['efob']:.1f}" if idx>1 and isinstance(p["efob"], (int,float)) else f"{p['efob']:.1f}" if idx==1 else ""),
-            "Freq": str(p.get("freq") or "")
+            "Freq": ""
         }
         items.append(it)
     return items
 
 if template_bytes:
     fieldset, maxlens = get_fields_and_meta(template_bytes)
-    if show_fields:
-        st.code("\n".join(sorted(fieldset)))
+    if show_fields: st.code("\n".join(sorted(fieldset)))
     try:
         named: Dict[str,str] = {}
         def put_alias(value, *aliases):
@@ -683,74 +626,56 @@ if template_bytes:
 
         takeoff_str = add_minutes(parse_hhmm(startup_str),15).strftime("%H:%M") if startup_str else ""
         temp_dev = round(temp_c - isa_temp(point_elev(dept) + (1013.0 - qnh)*30.0))
-        put_alias(aircraft,      "Aircraft","Aeronave","ACFT")
-        put_alias(registration,  "Registration","Matricula","REG")
-        put_alias(callsign,      "Callsign","Indicativo","CS")
-        put_alias(student,       "Student","Aluno")
-        put_alias(lesson,        "Lesson","Aula")
-        put_alias(instrutor,     "Instrutor","Instructor","INSTR")
-        put_alias(dept,          "Dept_Airfield","Departure","DEP")
-        put_alias(arr,           "Arrival_Airfield","Arrival","ARR")
-        put_alias(altn,          "Alternate","ALTN")
-        put_alias(str(point_elev(altn)), "Alt_Alternate","ALTN_ELEV","ALTN ELEV")
-        # Freq se disponível na BD
-        dep_info = point_lookup(dept) or {}
-        arr_info = point_lookup(arr) or {}
-        put_alias(dep_info.get("Freq",""), "Dept_Comm","DEP_FREQ","DEP FREQ")
-        put_alias(arr_info.get("Freq",""), "Arrival_comm","ARR_FREQ","ARR FREQ")
-        put_alias("123.755", "Enroute_comm","ENR_FREQ","ENR FREQ")
-        put_alias(f"{int(round(qnh))}", "QNH","ALT SET","QNH(hPa)")
-        put_alias(f"{int(round(temp_c))} / {temp_dev}", "temp_isa_dev","OAT/DEV","OAT ISA DEV")
-        put_alias(f"{int(round(wind_from)):03d}/{int(round(wind_kt)):02d}", "wind","WIND")
-        put_alias(f"{var_deg:.1f}{'E' if var_is_e else 'W'}", "mag_var","VAR")
-        put_alias(f"{int(round(cruise_alt))}", "flt_lvl_altitude","CRZ_ALT","FL/ALT")
-        put_alias(startup_str, "Startup","STARTUP","ETD-15")
-        put_alias(takeoff_str, "Takeoff","ETD","OFF BLOCKS")
+        put_alias(aircraft,"Aircraft","Aeronave","ACFT")
+        put_alias(registration,"Registration","Matricula","REG")
+        put_alias(callsign,"Callsign","Indicativo","CS")
+        put_alias(student,"Student","Aluno")
+        put_alias(lesson,"Lesson","Aula")
+        put_alias(instrutor,"Instrutor","Instructor","INSTR")
+        put_alias(dept,"Dept_Airfield","Departure","DEP")
+        put_alias(arr,"Arrival_Airfield","Arrival","ARR")
+        put_alias(altn,"Alternate","ALTN")
+        put_alias(str(point_elev(altn)),"Alt_Alternate","ALTN_ELEV","ALTN ELEV")
+        put_alias("","Dept_Comm","DEP_FREQ","DEP FREQ")
+        put_alias("","Arrival_comm","ARR_FREQ","ARR FREQ")
+        put_alias("123.755","Enroute_comm","ENR_FREQ","ENR FREQ")
+        put_alias(f"{int(round(qnh))}","QNH","ALT SET","QNH(hPa)")
+        put_alias(f"{int(round(temp_c))} / {temp_dev}","temp_isa_dev","OAT/DEV","OAT ISA DEV")
+        put_alias(f"{int(round(wind_from)):03d}/{int(round(wind_kt)):02d}","wind","WIND")
+        put_alias(f"{var_deg:.1f}{'E' if var_is_e else 'W'}","mag_var","VAR")
+        put_alias(f"{int(round(cruise_alt))}","flt_lvl_altitude","CRZ_ALT","FL/ALT")
+        put_alias(startup_str,"Startup","STARTUP","ETD-15")
+        put_alias(takeoff_str,"Takeoff","ETD","OFF BLOCKS")
 
-        # enriquecer pontos com Freq (NAVAID c/ freq)
-        byname = { l["To"]:(l.get("ToType","WPT"), (l.get("ToFreq") or "").strip()) for l in legs }
-        sp=[]
-        for p in seq_points:
-            typ,freq = byname.get(p["name"].upper(), ("WPT",""))
-            q=dict(p); q["freq"]= freq if (typ=="NAVAID" and freq) else ""
-            sp.append(q)
-        pdf_items = build_pdf_items_from_points(sp)
-
+        pdf_items = build_pdf_items_from_points(seq_points)
         last_eto = pdf_items[-1]["ETO"] if pdf_items else ""
-        put_alias(last_eto, "Landing","ETA","ON BLOCKS")
-        put_alias((add_minutes(parse_hhmm(last_eto),5).strftime("%H:%M") if last_eto else ""), "Shutdown","SHUTDOWN")
-        put_alias(f"{takeoff_str} / {last_eto}", "ETD/ETA","ETD ETA")
+        put_alias(last_eto,"Landing","ETA","ON BLOCKS")
+        put_alias((add_minutes(parse_hhmm(last_eto),5).strftime("%H:%M") if last_eto else ""),"Shutdown","SHUTDOWN")
+        put_alias(f"{takeoff_str} / {last_eto}","ETD/ETA","ETD ETA")
 
         tot_min = sum(int(it["ETE"] or "0") for it in pdf_items)
         tot_nm  = sum(float(it["Dist"] or 0.0) for it in pdf_items)
         tot_bo  = sum(float(it["Burn"] or 0.0) for it in pdf_items)
         last_efob = pdf_items[-1]["EFOB"] if pdf_items else ""
-        put_alias(f"{tot_min//60:02d}:{tot_min%60:02d}", "FLT TIME","BLOCK TIME","TOTAL TIME")
+        put_alias(f"{tot_min//60:02d}:{tot_min%60:02d}","FLT TIME","BLOCK TIME","TOTAL TIME")
         for key in ("LEVEL F/F","LEVEL_FF","Level_FF","Level F/F","CRZ_LEVEL"):
             put(named, fieldset, key, f"{int(round(cruise_alt))}", maxlens)
         pa_mid_climb_hdr = start_alt + 0.5*max(0.0, cruise_alt - start_alt)
-        _, ff_climb_hdr = cruise_lookup(pa_mid_climb_hdr, int(rpm_climb),  temp_c)
+        _, ff_climb_hdr = cruise_lookup(pa_mid_climb_hdr, int(rpm_climb), temp_c)
         climb_minutes = (max(0.0, cruise_alt - start_alt) / max(roc_interp_enroute(pressure_alt(start_alt,qnh), temp_c),1e-6))
-        put_alias(f"{ff_climb_hdr*(climb_minutes/60.0):.1f}", "CLIMB FUEL","FUEL CLIMB")
-        put_alias(f"{tot_min}", "ETE_Total","ETE TOTAL","TOTAL ETE")
-        put_alias(f"{tot_nm:.1f}", "Dist_Total","TOTAL DIST")
-        put_alias(f"{tot_bo:.1f}", "PL_BO_TOTAL","BURN TOTAL","TOTAL BURN")
-        put_alias(last_efob, "EFOB_TOTAL","AFOB_TOTAL","FOB END")
+        put_alias(f"{ff_climb_hdr*(climb_minutes/60.0):.1f}","CLIMB FUEL","FUEL CLIMB")
+        put_alias(f"{tot_min}","ETE_Total","ETE TOTAL","TOTAL ETE")
+        put_alias(f"{tot_nm:.1f}","Dist_Total","TOTAL DIST")
+        put_alias(f"{tot_bo:.1f}","PL_BO_TOTAL","BURN TOTAL","TOTAL BURN")
+        put_alias(last_efob,"EFOB_TOTAL","AFOB_TOTAL","FOB END")
 
         def field_aliases(idx, base):
-            s=str(idx)
-            return (f"{base}{s}", f"{base}_{s}", f"{base} {s}", f"{base}{int(s):02d}")
-
+            s=str(idx); return (f"{base}{s}", f"{base}_{s}", f"{base} {s}", f"{base}{int(s):02d}")
         for i, r in enumerate(pdf_items[:11], start=1):
-            for base, val in [
-                ("Name",  r["Name"]), ("Alt",   r["Alt"]),
-                ("TCRS",  r["TC"]),   ("THDG",  r["TH"]),   ("MHDG",  r["MH"]),
-                ("TAS",   r["TAS"]),  ("GS",    r["GS"]),
-                ("Dist",  r["Dist"]), ("ETE",   r["ETE"]),  ("ETO",   r["ETO"]),
-                ("PL_BO", r["Burn"]), ("EFOB",  r["EFOB"]), ("AFOB",  r["EFOB"]),
-                ("FREQ",  r["Freq"]),
-            ]:
-                if val != "":
+            for base, val in [("Name",r["Name"]),("Alt",r["Alt"]),("TCRS",r["TC"]),("THDG",r["TH"]),("MHDG",r["MH"]),
+                              ("TAS",r["TAS"]),("GS",r["GS"]),("Dist",r["Dist"]),("ETE",r["ETE"]),("ETO",r["ETO"]),
+                              ("PL_BO",r["Burn"]),("EFOB",r["EFOB"]),("AFOB",r["EFOB"]),("FREQ",r["Freq"])]:
+                if val!="":
                     key = pick(fieldset, *field_aliases(i, base))
                     if key: put(named, fieldset, key, val, maxlens)
 
@@ -763,3 +688,4 @@ if template_bytes:
             st.success("PDF gerado (campos bloqueados). Revê antes do voo.")
     except Exception as e:
         st.error(f"Erro ao preparar/gerar PDF: {e}")
+
