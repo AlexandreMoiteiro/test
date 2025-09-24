@@ -1,4 +1,6 @@
-# app.py — NAVLOG planeado (TOC/TOD), preenche NAVLOG_FORM.pdf e gera Relatório legível
+
+
+# app.py — NAVLOG (PDF) com cortes intra-leg, arredondamentos ajustados e relatório legível
 # Reqs: streamlit, pypdf, reportlab, pytz
 
 import streamlit as st
@@ -8,11 +10,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from math import sin, asin, radians, degrees, fmod
 
-# ============== Config ==============
+# =================== Config ===================
 st.set_page_config(page_title="NAVLOG (PDF + Relatório)", layout="wide", initial_sidebar_state="collapsed")
-PDF_TEMPLATE_PATHS = ["NAVLOG_FORM.pdf"]   # teu template
+PDF_TEMPLATE_PATHS = ["NAVLOG_FORM.pdf"]   # template novo
 
-# ============== Imports opcionais ==============
+# =================== Imports opcionais ===================
 try:
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import NameObject, TextStringObject
@@ -30,40 +32,48 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# ============== Arredondamento / Formatação ==============
+# =================== Arredondamento / Formatação ===================
 def _round_default(x: float) -> int:
-    """Default: <1000 de 5 em 5; >=1000 à centena."""
+    """Default anterior (já não usado em distâncias/fuel sensíveis): <1000 → 5; ≥1000 → 100."""
     if x is None: return 0
     v = float(x)
     base = 5 if abs(v) < 1000 else 100
     return int(round(v / base) * base)
 
 def _round_unit(x: float) -> int:
-    """Parâmetros sensíveis (fuel, velocidades, minutos): à unidade."""
     if x is None: return 0
     return int(round(float(x)))
 
+def _round_half(x: float) -> float:
+    if x is None: return 0.0
+    return round(float(x) * 2.0) / 2.0  # múltiplos de 0.5
+
 def _round_angle(x: float) -> int:
-    """Ângulos ao grau [0..359]."""
     if x is None: return 0
     return int(round(float(x))) % 360
 
 def fmt(x: float, kind: str = "default") -> str:
     """
     kind:
-      - "default" (altitudes, distâncias): <1000->5; >=1000->100
-      - "fuel"     (EFOB, Burn, FF): unidade
-      - "speed"    (TAS/GS): unidade
-      - "mins"     (ETE/ACC): unidade (já inteiro a montante)
-      - "angle"    (TC/TH/MH): grau
+      - "dist"   → 1 casa decimal (ex.: 3.4)
+      - "fuel"   → múltiplos de 0.5 (ex.: 12.5)
+      - "ff"     → unidade (L/h)
+      - "speed"  → unidade (kt)
+      - "mins"   → unidade (min)
+      - "angle"  → grau
+      - "alt"    → regra antiga (5/100)
+      - "default"→ regra antiga (5/100)
     """
-    if kind == "fuel":  return str(_round_unit(x))
-    if kind == "speed": return str(_round_unit(x))
-    if kind == "mins":  return str(_round_unit(x))
-    if kind == "angle": return str(_round_angle(x))
+    if kind == "dist":   return f"{round(float(x or 0), 1):.1f}"
+    if kind == "fuel":   return f"{_round_half(x):.1f}"
+    if kind == "ff":     return str(_round_unit(x))
+    if kind == "speed":  return str(_round_unit(x))
+    if kind == "mins":   return str(_round_unit(x))
+    if kind == "angle":  return str(_round_angle(x))
+    if kind == "alt":    return str(_round_default(x))
     return str(_round_default(x))
 
-# ============== Helpers ==============
+# =================== Helpers ===================
 def ascii_safe(x: str) -> str:
     return unicodedata.normalize("NFKD", str(x or "")).encode("ascii","ignore").decode("ascii")
 
@@ -87,7 +97,7 @@ def interp1(x,x0,x1,y0,y1):
 def wrap360(x): x=fmod(x,360.0); return x+360 if x<0 else x
 def angle_diff(a,b): return (a-b+180)%360-180
 
-# ============== AFM (igual ao teu) ==============
+# =================== AFM (igual ao teu) ===================
 ROC_ENROUTE = {
     0:{-25:981,0:835,25:704,50:586},  2000:{-25:870,0:726,25:597,50:481},
     4000:{-25:759,0:617,25:491,50:377},6000:{-25:648,0:509,25:385,50:273},
@@ -146,12 +156,12 @@ def vy_interp_enroute(pa):
     p0=max([p for p in pas if p<=pa_c]); p1=min([p for p in pas if p>=pa_c])
     return interp1(pa_c, p0, p1, VY_ENROUTE[p0], VY_ENROUTE[p1])
 
-# ============== Vento & variação ==============
+# =================== Vento & variação ===================
 def wind_triangle(tc_deg: float, tas_kt: float, wind_from_deg: float, wind_kt: float):
     if tas_kt <= 0:
         return 0.0, wrap360(tc_deg), 0.0
     delta = radians(angle_diff(wind_from_deg, tc_deg))
-    cross = wind_kt * sin(delta)           # + se vento pela esquerda
+    cross = wind_kt * sin(delta)
     s = max(-1.0, min(1.0, cross/max(tas_kt,1e-9)))
     wca = degrees(asin(s))
     th  = wrap360(tc_deg + wca)
@@ -161,7 +171,7 @@ def wind_triangle(tc_deg: float, tas_kt: float, wind_from_deg: float, wind_kt: f
 def apply_var(true_deg,var_deg,east_is_negative=False):
     return wrap360(true_deg - var_deg if east_is_negative else true_deg + var_deg)
 
-# ============== Aeródromos (exemplo) ==============
+# =================== Aeródromos (exemplo) ===================
 AEROS={
  "LPSO":{"elev":390,"freq":"119.805"},
  "LPEV":{"elev":807,"freq":"122.705"},
@@ -172,7 +182,7 @@ AEROS={
 def aero_elev(icao): return int(AEROS.get(icao,{}).get("elev",0))
 def aero_freq(icao): return AEROS.get(icao,{}).get("freq","")
 
-# ============== PDF helpers ==============
+# =================== PDF helpers ===================
 def read_pdf_bytes(paths: List[str]) -> bytes:
     for p in paths:
         if Path(p).exists():
@@ -237,69 +247,7 @@ def put(out: dict, fieldset: set, key: str, value: str, maxlens: Dict[str,int]):
             s = s[:maxlens[key]]
         out[key] = s
 
-# ============== Posicionamento por linha (corrige “fora do sítio”) ==============
-def canon(s: str) -> str:
-    return re.sub(r'[^A-Z0-9]', '', (s or '').upper())
-
-GRID_BASES = [
-    "FIX","NAME","NAVAIDS","ALT","TCRS","MCRS","T CRS","M CRS",
-    "GS","TAS","SPEED","DIST","ETE","ETO","ACC",
-    "PL B/O","Pl B/O","PL_BO","PL BO","EFOB",
-    "T HDG","M HDG"  # se existirem
-]
-def base_of(name:str) -> str:
-    c = (name or "").upper()
-    # normalizar nomes comuns
-    c = c.replace("  ", " ")
-    c = c.replace("TRUE COURSE","T CRS").replace("MAG COURSE","M CRS")
-    c = c.replace("COURSE TRUE","T CRS").replace("COURSE MAG","M CRS")
-    return c
-
-def fields_to_micro_rows(fields_pos: List[dict]) -> List[List[dict]]:
-    """Agrupa por página, ordena por Y desc e ‘clusteriza’ por linhas micro (top/bottom)."""
-    # filtra só campos da grelha
-    def is_grid_field(nm:str)->bool:
-        b = base_of(nm)
-        return any(b.startswith(x) for x in GRID_BASES)
-    grid = [f for f in fields_pos if is_grid_field(f["name"])]
-    micro_rows_all=[]
-    for pg in sorted(set(f["page"] for f in grid)):
-        page_fields = [f for f in grid if f["page"]==pg]
-        # ordenar por Y desc
-        for f in page_fields:
-            x0,y0,x1,y1 = f["rect"]; f["xc"]=(x0+x1)/2.0; f["yc"]=(y0+y1)/2.0
-        page_fields.sort(key=lambda a: (-a["yc"], a["xc"]))
-        # cluster por Y (pequeno threshold para separar top/bottom da mesma linha)
-        y_tol = 6.0
-        cur=[]; last_y=None
-        for f in page_fields:
-            if last_y is None or abs(f["yc"]-last_y) <= y_tol:
-                cur.append(f); last_y = f["yc"] if last_y is None else (last_y+f["yc"])/2.0
-            else:
-                micro_rows_all.append(sorted(cur, key=lambda z: z["xc"]))
-                cur=[f]; last_y=f["yc"]
-        if cur:
-            micro_rows_all.append(sorted(cur, key=lambda z: z["xc"]))
-    return micro_rows_all  # sequência: topo->baixo, por página
-
-def find_first_in_row(micro_row: List[dict], starts_with: List[str]) -> Optional[str]:
-    for f in micro_row:
-        nm = base_of(f["name"])
-        for s in starts_with:
-            if nm.startswith(s):
-                return f["name"]
-    return None
-
-def find_all_in_row(micro_row: List[dict], starts_with: List[str]) -> List[str]:
-    out=[]
-    for f in micro_row:
-        nm = base_of(f["name"])
-        for s in starts_with:
-            if nm.startswith(s):
-                out.append(f["name"]); break
-    return out
-
-# ============== UI ==============
+# =================== UI ===================
 st.title("Navigation Plan & Inflight Log — Tecnam P2008 (PDF + Relatório)")
 
 DEFAULT_STUDENT="AMOIT"; DEFAULT_AIRCRAFT="P208"; DEFAULT_CALLSIGN="RVP"
@@ -441,7 +389,7 @@ nav_view = st.data_editor(
 )
 st.session_state.navaids = nav_view
 
-# ============== Cálculo vertical + cortes ==============
+# =================== Cálculo vertical + cortes ===================
 def pressure_alt(alt_ft, qnh_hpa): return float(alt_ft) + (1013.0 - float(qnh_hpa))*30.0
 dep_elev = aero_elev(dept); arr_elev = aero_elev(arr)
 start_alt = float(dep_elev); end_alt = float(arr_elev)
@@ -497,19 +445,24 @@ clock = takeoff
 def ceil_pos_minutes(x):  # arredonda ↑ e garante 1 min quando >0
     return max(1, int(math.ceil(x - 1e-9))) if x > 0 else 0
 
-rows=[]; seq_points=[]; calc_steps=[]
+rows=[]; seq_points=[]
+calc_rows=[]       # tabela p/ relatório (legível)
+calc_details=[]    # passo-a-passo por segmento (fórmulas + valores)
 PH_ICON = {"CLIMB":"↑","CRUISE":"→","DESCENT":"↓"}
-alt_cursor = float(start_alt); total_ete = total_burn = 0.0
+alt_cursor = float(start_alt)
 efob=float(start_fuel)
 
 def add_segment(phase:str, from_nm:str, to_nm:str, i_leg:int, d_nm:float, tas:float, ff_lph:float):
-    global clock, total_ete, total_burn, efob, alt_cursor
+    global clock, efob, alt_cursor
     if d_nm <= 1e-9: return
     tc = float(legs[i_leg]["TC"])
+    delta_deg = angle_diff(wind_from, tc)
     wca, th, gs = wind_triangle(tc, tas, wind_from, wind_kt)
+    mh = apply_var(th, var_deg, var_is_e)
     ete_raw = 60.0 * d_nm / max(gs,1e-6)
     ete = ceil_pos_minutes(ete_raw)
-    burn = ff_lph * (ete_raw/60.0)
+    burn_raw = ff_lph * (ete_raw/60.0)
+    burn = _round_half(burn_raw)
 
     alt_start = alt_cursor
     if phase == "CLIMB":
@@ -522,41 +475,55 @@ def add_segment(phase:str, from_nm:str, to_nm:str, i_leg:int, d_nm:float, tas:fl
     eto = ""
     if clock:
         clock = add_minutes(clock, ete); eto = clock.strftime("%H:%M")
-    total_ete += ete; total_burn += burn
-    efob = max(0.0, efob - burn); alt_cursor = alt_end
+    efob = max(0.0, _round_half(efob - burn_raw))
+    alt_cursor = alt_end
 
     rows.append({
         "Fase": PH_ICON[phase], "Leg/Marker": f"{from_nm}→{to_nm}",
-        "ALT (ft)": f"{fmt(alt_start,'default')}→{fmt(alt_end,'default')}",
+        "ALT (ft)": f"{fmt(alt_start,'alt')}→{fmt(alt_end,'alt')}",
         "TC (°T)": _round_angle(tc), "TH (°T)": _round_angle(th),
-        "MH (°M)": _round_angle(apply_var(th, var_deg, var_is_e)),
+        "MH (°M)": _round_angle(mh),
         "TAS (kt)": _round_unit(tas), "GS (kt)": _round_unit(gs),
-        "FF (L/h)": _round_unit(ff_lph), "Dist (nm)": _round_default(d_nm),
-        "ETE (min)": int(ete), "ETO": eto, "Burn (L)": _round_unit(burn),
-        "EFOB (L)": _round_unit(efob)
+        "FF (L/h)": _round_unit(ff_lph),
+        "Dist (nm)": fmt(d_nm,'dist'),
+        "ETE (min)": int(ete), "ETO": eto,
+        "Burn (L)": fmt(burn,'fuel'),
+        "EFOB (L)": fmt(efob,'fuel')
     })
 
     seq_points.append({
         "name": to_nm, "alt": _round_default(alt_end),
         "tc": _round_angle(tc), "th": _round_angle(th),
-        "mh": _round_angle(apply_var(th, var_deg, var_is_e)),
+        "mh": _round_angle(mh),
         "tas": _round_unit(tas), "gs": _round_unit(gs),
-        "dist": d_nm, "ete": int(ete), "eto": eto, "burn": burn, "efob": efob
+        "dist": float(f"{d_nm:.3f}"),  # manter precisão interna
+        "ete": int(ete), "eto": eto,
+        "burn": float(burn_raw), "efob": float(efob)
     })
 
-    # Passos (texto curto) p/ relatório
-    calc_steps.append([
-        from_nm, to_nm, phase,
-        f"{_round_angle(tc)}°", f"{_round_angle(apply_var(th, var_deg, var_is_e))}°",
-        _round_unit(tas), _round_unit(gs),
-        _round_default(d_nm), int(ete), eto or "—",
-        _round_unit(burn), _round_unit(efob),
-        f"{fmt(alt_start,'default')}→{fmt(alt_end,'default')}"
-    ])
+    calc_rows.append([f"{from_nm}→{to_nm}", phase,
+                      f"{_round_angle(tc)}°", f"{_round_angle(mh)}°",
+                      _round_unit(tas), _round_unit(gs),
+                      fmt(d_nm,'dist'), int(ete), eto or "—",
+                      fmt(burn,'fuel'), fmt(efob,'fuel'),
+                      f"{fmt(alt_start,'alt')}→{fmt(alt_end,'alt')}"])
 
-# DEP para a 1ª linha sem métrica
+    calc_details.append(
+        f"{from_nm}→{to_nm} [{phase}]  "
+        f"TC={tc:.1f}°, Δ(wind−TC)={delta_deg:.1f}°; "
+        f"WCA=asin((W/TAS)*sinΔ)={wca:.2f}°;  TH=TC+WCA={th:.2f}°; "
+        f"MH=TH±Var={mh:.2f}° (Var={'E' if var_is_e else 'W'} {var_deg:.1f}°);  "
+        f"GS=TAS*cos(WCA)−W*cosΔ={gs:.2f} kt;  "
+        f"Dist={d_nm:.2f} nm;  ETE_raw=60*D/GS={ete_raw:.2f} min → ETE={ete} min;  "
+        f"Burn_raw=FF*(ETE_raw/60)={burn_raw:.2f} L → Burn={fmt(burn,'fuel')} L;  "
+        f"ALT {alt_start:.0f}→{alt_end:.0f} ft."
+    )
+
+# DEP “linha 0” (sem métricas)
 seq_points.append({"name": dept, "alt": _round_default(start_alt),
-                   "tc":"", "th":"", "mh":"", "tas":"", "gs":"", "dist":"", "ete":"", "eto": (takeoff.strftime("%H:%M") if takeoff else ""), "burn":"", "efob": efob})
+                   "tc":"", "th":"", "mh":"", "tas":"", "gs":"", "dist":"",
+                   "ete":"", "eto": (takeoff.strftime("%H:%M") if takeoff else ""),
+                   "burn":"", "efob": float(start_fuel)})
 
 for i in range(N):
     leg_from, leg_to = legs[i]["From"], legs[i]["To"]
@@ -584,24 +551,69 @@ st.dataframe(rows, use_container_width=True)
 
 tot_ete_m = int(sum(int(r['ETE (min)']) for r in rows))
 tot_nm  = sum(float(p['dist']) for p in seq_points if isinstance(p.get('dist'), (int,float)))
-tot_bo  = sum(float(r['Burn (L)']) for r in rows)
+tot_bo_raw = sum(float(p['burn']) for p in seq_points if isinstance(p.get('burn'), (int,float)))
+tot_bo = _round_half(tot_bo_raw)
 st.markdown(
-    f"**Totais** — Dist {fmt(tot_nm,'default')} nm • "
+    f"**Totais** — Dist {fmt(tot_nm,'dist')} nm • "
     f"ETE {tot_ete_m//60:02d}:{tot_ete_m%60:02d} • "
     f"Burn {fmt(tot_bo,'fuel')} L • EFOB {fmt(efob,'fuel')} L"
 )
 if eta:
     st.markdown(f"**ETA {eta.strftime('%H:%M')}** • **Landing {landing.strftime('%H:%M')}** • **Shutdown {shutdown.strftime('%H:%M')}**")
 
-# Ajustar NAVAIDS ao nº real de linhas (DEP + chegadas, incluindo TOC/TOD)
+# Ajustar NAVAIDS ao nº real de linhas (DEP + chegadas)
 if len(st.session_state.navaids) < len(seq_points):
     st.session_state.navaids += [{"IDENT":"", "FREQ":""} for _ in range(len(seq_points)-len(st.session_state.navaids))]
 elif len(st.session_state.navaids) > len(seq_points):
     st.session_state.navaids = st.session_state.navaids[:len(seq_points)]
 
-# ============== PDF export ==============
-st.markdown("### PDF export (apenas PDF)")
-show_debug = st.checkbox("Mostrar debug de linhas (posições)")
+# =================== Mapeamento robusto para o PDF (por sufixo/posição) ===================
+def suffix_of(name:str) -> int:
+    m = re.search(r'_(\d+)$', name or "")
+    return int(m.group(1)) if m else 0
+
+def grid_prefix(nm:str) -> str:
+    s = (nm or "").upper()
+    s = s.replace("  "," ")
+    s = s.replace("TRUE COURSE","T CRS").replace("MAG COURSE","M CRS")
+    s = s.replace("COURSE TRUE","T CRS").replace("COURSE MAG","M CRS")
+    return s
+
+def build_row_groups(fields_pos: List[dict]) -> List[Tuple[List[dict], List[dict]]]:
+    """Agrupa por sufixo (0..N) e divide cada sufixo em top/bottom pela coordenada Y."""
+    # Considerar só campos da grelha (evita cabeçalhos)
+    KEEP = ("FIX","NAME","NAVAIDS","ALT","T CRS","M CRS","TCRS","MCRS",
+            "T HDG","M HDG","GS","TAS","SPEED","DIST","ETE","ETO","ATO",
+            "ACC","RETO","DIFF","PL B/O","PL_BO","PL BO","EFOB","ACT B/O","AFOB")
+    grid = [f for f in fields_pos if grid_prefix(f["name"]).startswith(KEEP)]
+    by_suf: Dict[int, List[dict]] = {}
+    for f in grid:
+        by_suf.setdefault(suffix_of(f["name"]), []).append(f)
+    rows=[]
+    for suf in sorted(by_suf.keys()):
+        fs = by_suf[suf]
+        # preparar centros
+        for f in fs:
+            x0,y0,x1,y1 = f["rect"]; f["xc"]=(x0+x1)/2.0; f["yc"]=(y0+y1)/2.0
+        # split por Y (top vs bottom)
+        ys = sorted(f["yc"] for f in fs)
+        if not ys: 
+            continue
+        ymid = (ys[0]+ys[-1])/2.0
+        top = [f for f in fs if f["yc"] >= ymid]
+        bot = [f for f in fs if f["yc"] <  ymid]
+        # ordenar por X
+        top.sort(key=lambda z: z["xc"]); bot.sort(key=lambda z: z["xc"])
+        rows.append((top, bot))
+    return rows
+
+def put_if_exists(out: dict, fieldset:set, maxlens:Dict[str,int], fields_list: List[dict], idx: int, value: str):
+    if 0 <= idx < len(fields_list):
+        put(out, fieldset, fields_list[idx]["name"], value, maxlens)
+
+# =================== PDF export ===================
+st.markdown("### PDF export (só PDF)")
+show_debug = st.checkbox("Mostrar inspeção de campos (debug)")
 
 try:
     template_bytes = read_pdf_bytes(PDF_TEMPLATE_PATHS)
@@ -610,7 +622,6 @@ except Exception as e:
     st.error(f"Não foi possível ler o PDF de template: {e}")
 
 pdf_bytes_out = None
-report_bytes_out = None
 
 if not template_bytes:
     st.info("Coloca o ficheiro NAVLOG_FORM.pdf no diretório da app.")
@@ -624,100 +635,44 @@ else:
         fieldset, maxlens, fields_pos = set(), {}, []
 
     if show_debug and fields_pos:
-        st.write(f"N.º total de campos: {len(fieldset)} | com posições: {len(fields_pos)}")
+        st.write(f"Campos: {len(fieldset)} | c/ posição: {len(fields_pos)}")
+        st.write("Ex.:", sorted(list(fieldset))[:15])
 
     if fieldset and fields_pos:
-        # Detectar micro-rows (top/bottom alternadas), por página
-        micro_rows = fields_to_micro_rows(fields_pos)
-        if show_debug:
-            st.write(f"Micro-rows detectadas: {len(micro_rows)} (cada linha da grelha deverá ter 2 micro-rows)")
-
-        # Mapeamento por micro-rows (top/bottom)
         named: Dict[str,str] = {}
 
         # ===== Cabeçalho (se existirem) =====
-        header_candidates = {
-            "FLIGHT LEVEL / ALTITUDE": fmt(cruise_alt,'default'),
+        head = {
+            "FLIGHT LEVEL / ALTITUDE": fmt(cruise_alt,'alt'),
             "WIND": f"{int(round(wind_from)):03d}/{int(round(wind_kt)):02d}",
             "MAG VAR": f"{int(round(var_deg))}{'E' if var_is_e else 'W'}",
-            "TEMP / ISA DEV.": f"{fmt(temp_c,'default')} / {fmt(temp_c - isa_temp(pressure_alt(aero_elev(dept), qnh)),'default')}",
+            "TEMP / ISA DEV.": f"{fmt(temp_c,'alt')} / {fmt(temp_c - isa_temp(pressure_alt(aero_elev(dept), qnh)),'alt')}",
             "Dept_Airfield": dept, "Arrival_Airfield": arr,
-            "Alternate_Airfield": altn, "Alt_Alternate": fmt(aero_elev(altn),'default'),
+            "Alternate_Airfield": altn, "Alt_Alternate": fmt(aero_elev(altn),'alt'),
             "Startup": startup_str,
             "Takeoff": (add_minutes(parse_hhmm(startup_str),15).strftime("%H:%M") if startup_str else "")
         }
-        for k,v in header_candidates.items():
+        for k,v in head.items():
             put(named, fieldset, k, v, maxlens)
 
-        # Constrói itens para escrita (DEP + chegadas)
-        # Cada linha lógica = 2 micro-rows: top (leg metrics) + bottom (second line)
-        def write_row(r_idx: int, top: List[dict], bottom: List[dict], item: dict):
-            # FIX / ALT
-            f_fix = find_first_in_row(top, ["FIX","NAME"])
-            if f_fix: put(named, fieldset, f_fix, item["Name"], maxlens)
-            f_alt = find_first_in_row(top, ["ALT"])
-            if f_alt: put(named, fieldset, f_alt, item["Alt"], maxlens)
-
-            # NAVAIDS IDENT (top) / FREQ (bottom)
-            f_nav_top  = find_first_in_row(top, ["NAVAIDS"])
-            f_nav_bot  = find_first_in_row(bottom, ["NAVAIDS"])
-            ident = (st.session_state.navaids[r_idx]["IDENT"] if r_idx < len(st.session_state.navaids) else "")
-            freq  = (st.session_state.navaids[r_idx]["FREQ"]  if r_idx < len(st.session_state.navaids) else "")
-            if f_nav_top: put(named, fieldset, f_nav_top, ident, maxlens)
-            if f_nav_bot: put(named, fieldset, f_nav_bot, freq, maxlens)
-
-            # DIRECTION
-            f_tcrs = find_first_in_row(top, ["T CRS","TCRS"])
-            f_mcrs = find_first_in_row(bottom, ["M CRS","MCRS"])
-            if item["TC"]!="" and f_tcrs: put(named, fieldset, f_tcrs, item["TC"], maxlens)
-            if item["MH"]!="" and f_mcrs: put(named, fieldset, f_mcrs, item["MH"], maxlens)
-
-            # SPEED: GS (top), TAS (bottom)
-            f_gs_top = find_first_in_row(top, ["GS"]) or find_first_in_row(top, ["SPEED"])
-            f_tas_bot= find_first_in_row(bottom, ["TAS"]) or find_first_in_row(bottom, ["SPEED"])
-            if item["GS"]!="" and f_gs_top: put(named, fieldset, f_gs_top, item["GS"], maxlens)
-            if item["TAS"]!="" and f_tas_bot: put(named, fieldset, f_tas_bot, item["TAS"], maxlens)
-
-            # DIST: LEG (top), ACC (bottom)
-            f_dist_top = find_first_in_row(top, ["DIST"])
-            f_dist_acc = find_first_in_row(bottom, ["DIST","ACC"])  # alguns templates usam ACC
-            if item["Dist_leg"]!="" and f_dist_top: put(named, fieldset, f_dist_top, item["Dist_leg"], maxlens)
-            if item["Dist_acc"]!="" and f_dist_acc: put(named, fieldset, f_dist_acc, item["Dist_acc"], maxlens)
-
-            # TIME: ETE & ETO (top), ACC (bottom)
-            f_ete = find_first_in_row(top, ["ETE"])
-            f_eto = find_first_in_row(top, ["ETO"])
-            f_acc = find_first_in_row(bottom, ["ACC"])
-            if item["ETE"]!="" and f_ete: put(named, fieldset, f_ete, item["ETE"], maxlens)
-            if item["ETO"]!="" and f_eto: put(named, fieldset, f_eto, item["ETO"], maxlens)
-            if item["ACC_time"]!="" and f_acc: put(named, fieldset, f_acc, item["ACC_time"], maxlens)
-            # ATO/RETO/DIFF ficam vazios
-
-            # FUEL: Pl B/O + EFOB (top)
-            f_pbo = find_first_in_row(top, ["PL B/O","Pl B/O","PL_BO","PL BO"])
-            f_efob= find_first_in_row(top, ["EFOB"])
-            if item["Burn"]!="" and f_pbo:  put(named, fieldset, f_pbo,  item["Burn"], maxlens)
-            if item["EFOB"]!="" and f_efob: put(named, fieldset, f_efob, item["EFOB"], maxlens)
-            # Act B/O, AFOB (bottom) — não preencher
-
-        # Preparar itens formatados (DEP + segmentos)
-        def build_pdf_items(seq_points):
+        # ===== Construir itens por ponto (DEP + chegadas) =====
+        def build_pdf_items(points):
             items=[]
             acc_dist = 0.0
             acc_time = 0
-            for idx, p in enumerate(seq_points):
+            for idx, p in enumerate(points):
                 is_seg = (idx>0)
                 if is_seg and isinstance(p["dist"], (int,float)): acc_dist += float(p["dist"])
                 if is_seg: acc_time += int(p["ete"] or 0)
                 it = {
                     "Name": p["name"],
-                    "Alt": fmt(p["alt"], 'default') if p["alt"]!="" else "",
+                    "Alt": fmt(p["alt"], 'alt') if p["alt"]!="" else "",
                     "TC":  (fmt(p["tc"], 'angle') if is_seg else ""),
                     "MH":  (fmt(p["mh"], 'angle') if is_seg else ""),
                     "GS":  (fmt(p["gs"], 'speed') if is_seg else ""),
                     "TAS": (fmt(p["tas"], 'speed') if is_seg else ""),
-                    "Dist_leg": (fmt(p["dist"], 'default') if is_seg and isinstance(p["dist"], (int,float)) else ""),
-                    "Dist_acc": (fmt(acc_dist, 'default') if is_seg else ""),
+                    "Dist_leg": (fmt(p["dist"], 'dist') if is_seg and isinstance(p["dist"], (int,float)) else ""),
+                    "Dist_acc": (fmt(acc_dist, 'dist') if is_seg else ""),
                     "ETE":  (fmt(p["ete"], 'mins') if is_seg else ""),
                     "ETO":  (p["eto"] if is_seg else (p["eto"] or "")),
                     "ACC_time": (fmt(acc_time, 'mins') if is_seg else ""),
@@ -729,16 +684,35 @@ else:
 
         pdf_items = build_pdf_items(seq_points)
 
-        # Escrever por pares de micro-rows
-        total_pairs = len(micro_rows)//2
-        use_rows = min(len(pdf_items), total_pairs)
-        if show_debug:
-            st.write(f"Linhas lógicas disponíveis: {total_pairs} | a escrever: {use_rows}")
-
+        # ===== Agrupar linhas por sufixo e preencher por posição =====
+        row_pairs = build_row_groups(fields_pos)
+        use_rows = min(len(pdf_items), len(row_pairs))
         for i in range(use_rows):
-            top_row = micro_rows[2*i]
-            bot_row = micro_rows[2*i+1]
-            write_row(i, top_row, bot_row, pdf_items[i])
+            top, bot = row_pairs[i]
+            item = pdf_items[i]
+
+            # TOP (ordem fixa por coluna): [FIX, NAVAIDS(IDENT), ALT, T CRS, M CRS, GS, DIST(LEG), ETE, ETO, ATO, Pl B/O, EFOB]
+            put_if_exists(named, fieldset, maxlens, top, 0, item["Name"])
+            put_if_exists(named, fieldset, maxlens, top, 1, st.session_state.navaids[i]["IDENT"] if i < len(st.session_state.navaids) else "")
+            put_if_exists(named, fieldset, maxlens, top, 2, item["Alt"])
+            put_if_exists(named, fieldset, maxlens, top, 3, item["TC"])
+            put_if_exists(named, fieldset, maxlens, top, 4, item["MH"])
+            put_if_exists(named, fieldset, maxlens, top, 5, item["GS"])
+            put_if_exists(named, fieldset, maxlens, top, 6, item["Dist_leg"])
+            put_if_exists(named, fieldset, maxlens, top, 7, item["ETE"])
+            put_if_exists(named, fieldset, maxlens, top, 8, item["ETO"])
+            # ATO (top[9]) deixamos vazio
+            put_if_exists(named, fieldset, maxlens, top,10, item["Burn"])
+            put_if_exists(named, fieldset, maxlens, top,11, item["EFOB"])
+
+            # BOTTOM (ordem por coluna): [LAT/LONG(vazio), NAVAIDS(FREQ), FL(vazio), T HDG, M HDG, TAS, DIST(ACC), TIME(ACC), RETO, DIFF, Act B/O, AFOB]
+            put_if_exists(named, fieldset, maxlens, bot, 1, st.session_state.navaids[i]["FREQ"] if i < len(st.session_state.navaids) else "")
+            put_if_exists(named, fieldset, maxlens, bot, 3, item["TC"] if item["TC"]!="" else "")  # T HDG ~ TH TRUE (aceitam TC/TH conforme template)
+            put_if_exists(named, fieldset, maxlens, bot, 4, item["MH"])
+            put_if_exists(named, fieldset, maxlens, bot, 5, item["TAS"])
+            put_if_exists(named, fieldset, maxlens, bot, 6, item["Dist_acc"])
+            put_if_exists(named, fieldset, maxlens, bot, 7, item["ACC_time"])
+            # RETO/DIFF/Act B/O/AFOB ficam em branco
 
         # Totais e tempos finais (se existirem campos)
         last_eto = pdf_items[-1]["ETO"] if pdf_items else ""
@@ -747,25 +721,24 @@ else:
         put(named, fieldset, "ETD/ETA", f"{(add_minutes(parse_hhmm(startup_str),15).strftime('%H:%M') if startup_str else '')} / {last_eto}", maxlens)
         tot_min = sum(int(it["ETE"] or "0") for it in pdf_items)
         put(named, fieldset, "FLT TIME", f"{tot_min//60:02d}:{tot_min%60:02d}", maxlens)
-        put(named, fieldset, "CLIMB FUEL", fmt((ff_climb*(t_climb_total/60.0)),'fuel'), maxlens)
+        put(named, fieldset, "CLIMB FUEL", fmt((ff_climb*( (max(t_climb_total,0))/60.0 )),'fuel'), maxlens)
 
-        # ===== Gerar PDF =====
+        # ===== Botão: gerar PDF =====
         if st.button("Gerar PDF preenchido", type="primary"):
             try:
                 pdf_bytes_out = fill_pdf(template_bytes, named)
-                # Nome do ficheiro — pelo número da Lesson (não pela matrícula)
-                # Se capturarmos dígitos, usamos só o número; senão o texto da Lesson sanitizado.
+                # Nome do ficheiro — pelo número da Lesson
                 m = re.search(r'(\d+)', lesson or "")
-                lesson_id = m.group(1) if m else ascii_safe(lesson or "LESSON")
+                lesson_num = m.group(1) if m else "00"
                 safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
-                filename_pdf = f"{safe_date}_LESSON-{lesson_id}_NAVLOG.pdf"
+                filename_pdf = f"{safe_date}_LESSON-{lesson_num}_NAVLOG.pdf"
                 st.download_button("📄 Download PDF", data=pdf_bytes_out, file_name=filename_pdf, mime="application/pdf")
-                st.success("PDF gerado (apenas planeado). Revê antes do voo.")
+                st.success("PDF gerado (planeado).")
             except Exception as e:
                 st.error(f"Erro ao gerar PDF: {e}")
 
-# ============== Relatório legível (PDF) ==============
-def build_report_pdf_human(calc_rows: List[List], params: Dict[str,str]) -> bytes:
+# =================== Relatório legível (PDF) ===================
+def build_report_pdf(calc_rows: List[List], details: List[str], params: Dict[str,str]) -> bytes:
     if not REPORTLAB_OK:
         raise RuntimeError("reportlab missing")
     bio = io.BytesIO()
@@ -773,10 +746,10 @@ def build_report_pdf_human(calc_rows: List[List], params: Dict[str,str]) -> byte
                             leftMargin=18*mm, rightMargin=18*mm,
                             topMargin=15*mm, bottomMargin=15*mm)
     styles = getSampleStyleSheet()
-    H1 = styles["Heading1"]; H2 = styles["Heading2"]; H3 = styles["Heading3"]; P = styles["BodyText"]
+    H1 = styles["Heading1"]; H2 = styles["Heading2"]; P = styles["BodyText"]
 
     story=[]
-    story.append(Paragraph("NAVLOG — Relatório de Cálculos (Planeado)", H1))
+    story.append(Paragraph("NAVLOG — Relatório (Planeado)", H1))
     story.append(Spacer(1,6))
 
     # Resumo do voo
@@ -788,20 +761,18 @@ def build_report_pdf_human(calc_rows: List[List], params: Dict[str,str]) -> byte
         ["Partida", params.get("dept","—")],
         ["Chegada", params.get("arr","—")],
         ["Alternante", params.get("altn","—")],
-        ["Nível/Alt Cruzeiro", params.get("cruise_alt","—") + " ft"],
+        ["Cruise Alt", params.get("cruise_alt","—")+" ft"],
         ["QNH", params.get("qnh","—")],
         ["Vento", params.get("wind","—")],
         ["Var. Magn.", params.get("var","—")],
         ["OAT / ISA dev", params.get("temp_isa","—")],
-        ["Startup", params.get("startup","—")],
-        ["ETD", params.get("etd","—")],
-        ["ETA", params.get("eta","—")],
-        ["Shutdown", params.get("shutdown","—")],
+        ["Startup / ETD", f"{params.get('startup','—')} / {params.get('etd','—')}"],
+        ["ETA / Shutdown", f"{params.get('eta','—')} / {params.get('shutdown','—')}"],
         ["Tempo total (PLN)", params.get("flt_time","—")],
         ["Fuel inicial", params.get("start_fuel","—")+" L"],
     ]
-    t = Table(resume, hAlign="LEFT", colWidths=[45*mm, None])
-    t.setStyle(TableStyle([
+    t1 = Table(resume, hAlign="LEFT", colWidths=[45*mm, None])
+    t1.setStyle(TableStyle([
         ("GRID",(0,0),(-1,-1),0.25,colors.lightgrey),
         ("BACKGROUND",(0,0),(0,-1),colors.whitesmoke),
         ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
@@ -809,27 +780,33 @@ def build_report_pdf_human(calc_rows: List[List], params: Dict[str,str]) -> byte
         ("LEFTPADDING",(0,0),(-1,-1),4),
         ("RIGHTPADDING",(0,0),(-1,-1),4),
     ]))
-    story.append(t)
+    story.append(t1)
     story.append(Spacer(1,8))
 
-    story.append(Paragraph("Fórmulas utilizadas (vento FROM):", H2))
-    formulae = [
-        "WCA = asin( (W/TAS) · sin(θwind_from − θcourse_true) )",
-        "TH  = TC + WCA",
-        "GS  = TAS·cos(WCA) − W·cos(θwind_from − θcourse_true)",
-        "ETE (min) = ceil( 60 · Dist / GS ), com mínimo 1 se Dist > 0",
-        "Burn (L) = FF (L/h) · (ETE_real/60)  [usamos ETE_real antes do arredondamento]",
+    story.append(Paragraph("Rates e ajustes usados", H2))
+    rates = [
+        ["Vy (kt)", params.get("vy","—")],
+        ["ROC (ft/min)", params.get("roc","—")],
+        ["ROD (ft/min)", params.get("rod","—")],
+        ["TAS climb / cruise / descent (kt)", params.get("tases","—")],
+        ["FF climb / cruise / descent (L/h)", params.get("ffs","—")],
+        ["Arredondamentos", params.get("rounding","—")],
     ]
-    for f in formulae:
-        story.append(Paragraph(f"• {f}", P))
-    story.append(Spacer(1,6))
+    t2 = Table(rates, hAlign="LEFT", colWidths=[60*mm, None])
+    t2.setStyle(TableStyle([
+        ("GRID",(0,0),(-1,-1),0.25,colors.lightgrey),
+        ("BACKGROUND",(0,0),(0,-1),colors.whitesmoke),
+        ("FONTSIZE",(0,0),(-1,-1),9),
+    ]))
+    story.append(t2)
+    story.append(Spacer(1,8))
 
-    story.append(Paragraph("Segmentos (por ordem):", H2))
-    # Tabela de segmentos legível
-    data = [["From→To","Fase","TC°","MH°","TAS","GS","Dist","ETE","ETO","Burn","EFOB","ALT ini→fim"]]
-    for r in calc_rows:
-        data.append(r)
-    ts = TableStyle([
+    story.append(Paragraph("Segmentos (resumo)", H2))
+    data = [["From→To","Fase","TC°","MH°","TAS","GS","Dist(nm)","ETE","ETO","Burn(L)","EFOB(L)","ALT ini→fim"]]
+    data += calc_rows
+    t3 = Table(data, hAlign="LEFT",
+               colWidths=[34*mm, 12*mm, 10*mm, 10*mm, 12*mm, 12*mm, 18*mm, 10*mm, 16*mm, 14*mm, 14*mm, 26*mm])
+    t3.setStyle(TableStyle([
         ("GRID",(0,0),(-1,-1),0.25,colors.grey),
         ("BACKGROUND",(0,0),(-1,0),colors.lightgrey),
         ("ALIGN",(2,1),(5,-1),"RIGHT"),
@@ -838,11 +815,13 @@ def build_report_pdf_human(calc_rows: List[List], params: Dict[str,str]) -> byte
         ("FONTSIZE",(0,0),(-1,-1),8.7),
         ("LEFTPADDING",(0,0),(-1,-1),3),
         ("RIGHTPADDING",(0,0),(-1,-1),3),
-    ])
-    tbl = Table(data, hAlign="LEFT",
-                colWidths=[34*mm, 12*mm, 10*mm, 10*mm, 10*mm, 10*mm, 12*mm, 10*mm, 14*mm, 12*mm, 12*mm, 24*mm])
-    tbl.setStyle(ts)
-    story.append(tbl)
+    ]))
+    story.append(t3)
+    story.append(Spacer(1,8))
+
+    story.append(Paragraph("Cálculos por segmento (passo-a-passo)", H2))
+    for s in details:
+        story.append(Paragraph("• " + s, P))
 
     doc.build(story)
     return bio.getvalue()
@@ -853,30 +832,29 @@ if st.button("Gerar Relatório (PDF legível)"):
             "aircraft": aircraft, "registration": registration, "callsign": callsign,
             "lesson": lesson,
             "dept": dept, "arr": arr, "altn": altn,
-            "qnh": fmt(qnh,'default'),
+            "qnh": fmt(qnh,'alt'),
             "wind": f"{int(round(wind_from)):03d}/{int(round(wind_kt)):02d}",
             "var": f"{int(round(var_deg))}{'E' if var_is_e else 'W'}",
-            "cruise_alt": fmt(cruise_alt,'default'),
-            "temp_isa": f"{fmt(temp_c,'default')} / {fmt(temp_c - isa_temp(pressure_alt(aero_elev(dept), qnh)),'default')}",
+            "cruise_alt": fmt(cruise_alt,'alt'),
+            "temp_isa": f"{fmt(temp_c,'alt')} / {fmt(temp_c - isa_temp(pressure_alt(aero_elev(dept), qnh)),'alt')}",
             "startup": startup_str,
             "etd": (add_minutes(parse_hhmm(startup_str),15).strftime("%H:%M") if startup_str else ""),
             "eta": (eta.strftime("%H:%M") if eta else ""), "shutdown": (shutdown.strftime("%H:%M") if shutdown else ""),
             "flt_time": f"{tot_ete_m//60:02d}:{tot_ete_m%60:02d}",
-            "start_fuel": fmt(start_fuel,'fuel')
+            "start_fuel": fmt(start_fuel,'fuel'),
+            "vy": str(_round_unit(vy_kt)),
+            "roc": str(_round_unit(roc)),
+            "rod": str(_round_unit(rod_fpm)),
+            "tases": f"{_round_unit(tas_climb)} / {_round_unit(tas_cruise)} / {_round_unit(tas_descent)}",
+            "ffs": f"{fmt(ff_climb,'ff')} / {fmt(ff_cruise,'ff')} / {fmt(ff_descent,'ff')}",
+            "rounding": "Dist 0.1 nm; Tempo min inteiro (ceil); Fuel 0.5 L; Vel/TAS/GS 1 kt; Ângulos 1°; Alt <1000→5 / ≥1000→100."
         }
-        # Transforma calc_steps (lista de listas) no formato esperado: [From→To, Fase, ...]
-        calc_rows = []
-        for r in calc_steps:
-            # r = [from, to, phase, TC°, MH°, TAS, GS, Dist, ETE, ETO, Burn, EFOB, ALTini→fim]
-            calc_rows.append([f"{r[0]}→{r[1]}", r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]])
-        report_bytes_out = build_report_pdf_human(calc_rows, params)
-        # Nomeia relatório também pela Lesson
+        report_bytes_out = build_report_pdf(calc_rows, calc_details, params)
         m = re.search(r'(\d+)', lesson or "")
-        lesson_id = m.group(1) if m else ascii_safe(lesson or "LESSON")
+        lesson_num = m.group(1) if m else "00"
         safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
-        filename_rep = f"{safe_date}_LESSON-{lesson_id}_NAVLOG_RELATORIO.pdf"
+        filename_rep = f"{safe_date}_LESSON-{lesson_num}_NAVLOG_RELATORIO.pdf"
         st.download_button("📑 Download Relatório (PDF)", data=report_bytes_out, file_name=filename_rep, mime="application/pdf")
         st.success("Relatório gerado.")
     except Exception as e:
         st.error(f"Erro ao gerar relatório: {e}")
-
