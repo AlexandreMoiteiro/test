@@ -1,5 +1,6 @@
-# app.py — NAVLOG planeado (TOC/TOD), preenche PDF, exporta JPEG e relatório de cálculos
-# Reqs: streamlit, pypdf, pymupdf, reportlab, pytz
+# app.py — NAVLOG planeado (TOC/TOD), preenche NAVLOG_FORM.pdf e gera Relatório legível
+# Reqs: streamlit, pypdf, reportlab, pytz
+
 import streamlit as st
 import datetime as dt
 import pytz, io, json, unicodedata, re, math
@@ -7,11 +8,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from math import sin, asin, radians, degrees, fmod
 
-# =================== Config ===================
-st.set_page_config(page_title="NAVLOG (PDF→JPEG + Relatório)", layout="wide", initial_sidebar_state="collapsed")
-PDF_TEMPLATE_PATHS = ["NAVLOG_FORM.pdf"]   # nome do teu template
+# ============== Config ==============
+st.set_page_config(page_title="NAVLOG (PDF + Relatório)", layout="wide", initial_sidebar_state="collapsed")
+PDF_TEMPLATE_PATHS = ["NAVLOG_FORM.pdf"]   # teu template
 
-# =================== Imports opcionais ===================
+# ============== Imports opcionais ==============
 try:
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import NameObject, TextStringObject
@@ -20,20 +21,16 @@ except Exception:
     PYPDF_OK = False
 
 try:
-    import fitz  # PyMuPDF
-    PYMUPDF_OK = True
-except Exception:
-    PYMUPDF_OK = False
-
-try:
     from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     REPORTLAB_OK = True
 except Exception:
     REPORTLAB_OK = False
 
-# =================== Arredondamento / Formatação ===================
+# ============== Arredondamento / Formatação ==============
 def _round_default(x: float) -> int:
     """Default: <1000 de 5 em 5; >=1000 à centena."""
     if x is None: return 0
@@ -66,7 +63,7 @@ def fmt(x: float, kind: str = "default") -> str:
     if kind == "angle": return str(_round_angle(x))
     return str(_round_default(x))
 
-# =================== Helpers ===================
+# ============== Helpers ==============
 def ascii_safe(x: str) -> str:
     return unicodedata.normalize("NFKD", str(x or "")).encode("ascii","ignore").decode("ascii")
 
@@ -90,7 +87,7 @@ def interp1(x,x0,x1,y0,y1):
 def wrap360(x): x=fmod(x,360.0); return x+360 if x<0 else x
 def angle_diff(a,b): return (a-b+180)%360-180
 
-# =================== AFM (igual ao teu) ===================
+# ============== AFM (igual ao teu) ==============
 ROC_ENROUTE = {
     0:{-25:981,0:835,25:704,50:586},  2000:{-25:870,0:726,25:597,50:481},
     4000:{-25:759,0:617,25:491,50:377},6000:{-25:648,0:509,25:385,50:273},
@@ -149,7 +146,7 @@ def vy_interp_enroute(pa):
     p0=max([p for p in pas if p<=pa_c]); p1=min([p for p in pas if p>=pa_c])
     return interp1(pa_c, p0, p1, VY_ENROUTE[p0], VY_ENROUTE[p1])
 
-# =================== Vento & variação ===================
+# ============== Vento & variação ==============
 def wind_triangle(tc_deg: float, tas_kt: float, wind_from_deg: float, wind_kt: float):
     if tas_kt <= 0:
         return 0.0, wrap360(tc_deg), 0.0
@@ -164,7 +161,7 @@ def wind_triangle(tc_deg: float, tas_kt: float, wind_from_deg: float, wind_kt: f
 def apply_var(true_deg,var_deg,east_is_negative=False):
     return wrap360(true_deg - var_deg if east_is_negative else true_deg + var_deg)
 
-# =================== Aeródromos (exemplo) ===================
+# ============== Aeródromos (exemplo) ==============
 AEROS={
  "LPSO":{"elev":390,"freq":"119.805"},
  "LPEV":{"elev":807,"freq":"122.705"},
@@ -175,42 +172,44 @@ AEROS={
 def aero_elev(icao): return int(AEROS.get(icao,{}).get("elev",0))
 def aero_freq(icao): return AEROS.get(icao,{}).get("freq","")
 
-# =================== PDF helpers ===================
+# ============== PDF helpers ==============
 def read_pdf_bytes(paths: List[str]) -> bytes:
     for p in paths:
         if Path(p).exists():
             return Path(p).read_bytes()
     raise FileNotFoundError(paths)
 
-def get_fields_and_meta(template_bytes: bytes):
-    """Lê nomes e MaxLen dos campos do formulário do PDF."""
+def get_form_fields(template_bytes: bytes):
+    """Devolve (fieldset, maxlens, fields_pos) onde fields_pos = [{name,page,(x0,y0,x1,y1)}]."""
     if not PYPDF_OK:
         raise RuntimeError("Dependência ausente: pypdf. Instala com: pip install pypdf")
     reader = PdfReader(io.BytesIO(template_bytes))
     field_names, maxlens = set(), {}
+    fields_pos = []
     try:
         fd = reader.get_fields() or {}
         field_names |= set(fd.keys())
-        for k, v in fd.items():
+        for k,v in fd.items():
             ml = v.get("/MaxLen")
-            if ml:
-                maxlens[k] = int(ml)
-    except Exception:
-        pass
+            if ml: maxlens[k] = int(ml)
+    except: pass
     try:
-        for page in reader.pages:
+        for p_idx, page in enumerate(reader.pages):
             if "/Annots" in page:
                 for a in page["/Annots"]:
                     obj = a.get_object()
-                    if obj.get("/T"):
-                        nm = str(obj["/T"])
-                        field_names.add(nm)
+                    nm = obj.get("/T")
+                    rc = obj.get("/Rect")
+                    if nm:
+                        name = str(nm)
+                        field_names.add(name)
+                        if rc and len(rc)==4:
+                            x0,y0,x1,y1 = [float(z) for z in rc]
+                            fields_pos.append({"name":name, "page":p_idx, "rect":(x0,y0,x1,y1)})
                         ml = obj.get("/MaxLen")
-                        if ml:
-                            maxlens[nm] = int(ml)
-    except Exception:
-        pass
-    return field_names, maxlens
+                        if ml: maxlens[name] = int(ml)
+    except: pass
+    return field_names, maxlens, fields_pos
 
 def fill_pdf(template_bytes: bytes, fields: dict) -> bytes:
     if not PYPDF_OK: raise RuntimeError("pypdf missing")
@@ -231,16 +230,6 @@ def fill_pdf(template_bytes: bytes, fields: dict) -> bytes:
         writer.update_page_form_field_values(page, str_fields)
     bio = io.BytesIO(); writer.write(bio); return bio.getvalue()
 
-def pdf_to_jpeg_bytes(pdf_bytes: bytes, page_index: int = 0, dpi: int = 220) -> bytes:
-    if not PYMUPDF_OK: raise RuntimeError("pymupdf (fitz) missing")
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(page_index)
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    return pix.tobytes("jpg")  # bytes JPG
-
-# util: escreve se existir (respeita MaxLen)
 def put(out: dict, fieldset: set, key: str, value: str, maxlens: Dict[str,int]):
     if key in fieldset:
         s = "" if value is None else str(value)
@@ -248,34 +237,70 @@ def put(out: dict, fieldset: set, key: str, value: str, maxlens: Dict[str,int]):
             s = s[:maxlens[key]]
         out[key] = s
 
-# =================== Field matching robusto ===================
+# ============== Posicionamento por linha (corrige “fora do sítio”) ==============
 def canon(s: str) -> str:
     return re.sub(r'[^A-Z0-9]', '', (s or '').upper())
 
-def series(fieldset: set, base_names: List[str]) -> List[str]:
-    """Devolve todos os nomes que começam por algum base (canon) ordenados por sufixo numérico (""->0)."""
-    bases = [canon(b) for b in base_names]
-    pairs=[]
-    for k in fieldset:
-        ck = canon(k)
-        for b in bases:
-            if ck.startswith(b):
-                m = re.search(r'(\d+)$', k)  # sufixo numérico (ou nada)
-                n = int(m.group(1)) if m else 0
-                pairs.append((n, k))
-                break
-    pairs.sort(key=lambda x: x[0])
-    return [k for _,k in pairs]
+GRID_BASES = [
+    "FIX","NAME","NAVAIDS","ALT","TCRS","MCRS","T CRS","M CRS",
+    "GS","TAS","SPEED","DIST","ETE","ETO","ACC",
+    "PL B/O","Pl B/O","PL_BO","PL BO","EFOB",
+    "T HDG","M HDG"  # se existirem
+]
+def base_of(name:str) -> str:
+    c = (name or "").upper()
+    # normalizar nomes comuns
+    c = c.replace("  ", " ")
+    c = c.replace("TRUE COURSE","T CRS").replace("MAG COURSE","M CRS")
+    c = c.replace("COURSE TRUE","T CRS").replace("COURSE MAG","M CRS")
+    return c
 
-def get_row_field(fields_list: List[str], row_index: int, subindex: int = 0, per_row: int = 1) -> Optional[str]:
-    """Campo na 'row_index' considerando 'per_row' entradas por linha e 'subindex' (0..per_row-1)."""
-    pos = row_index*per_row + subindex
-    if pos < len(fields_list):
-        return fields_list[pos]
+def fields_to_micro_rows(fields_pos: List[dict]) -> List[List[dict]]:
+    """Agrupa por página, ordena por Y desc e ‘clusteriza’ por linhas micro (top/bottom)."""
+    # filtra só campos da grelha
+    def is_grid_field(nm:str)->bool:
+        b = base_of(nm)
+        return any(b.startswith(x) for x in GRID_BASES)
+    grid = [f for f in fields_pos if is_grid_field(f["name"])]
+    micro_rows_all=[]
+    for pg in sorted(set(f["page"] for f in grid)):
+        page_fields = [f for f in grid if f["page"]==pg]
+        # ordenar por Y desc
+        for f in page_fields:
+            x0,y0,x1,y1 = f["rect"]; f["xc"]=(x0+x1)/2.0; f["yc"]=(y0+y1)/2.0
+        page_fields.sort(key=lambda a: (-a["yc"], a["xc"]))
+        # cluster por Y (pequeno threshold para separar top/bottom da mesma linha)
+        y_tol = 6.0
+        cur=[]; last_y=None
+        for f in page_fields:
+            if last_y is None or abs(f["yc"]-last_y) <= y_tol:
+                cur.append(f); last_y = f["yc"] if last_y is None else (last_y+f["yc"])/2.0
+            else:
+                micro_rows_all.append(sorted(cur, key=lambda z: z["xc"]))
+                cur=[f]; last_y=f["yc"]
+        if cur:
+            micro_rows_all.append(sorted(cur, key=lambda z: z["xc"]))
+    return micro_rows_all  # sequência: topo->baixo, por página
+
+def find_first_in_row(micro_row: List[dict], starts_with: List[str]) -> Optional[str]:
+    for f in micro_row:
+        nm = base_of(f["name"])
+        for s in starts_with:
+            if nm.startswith(s):
+                return f["name"]
     return None
 
-# =================== UI ===================
-st.title("Navigation Plan & Inflight Log — Tecnam P2008 (PDF→JPEG + Relatório)")
+def find_all_in_row(micro_row: List[dict], starts_with: List[str]) -> List[str]:
+    out=[]
+    for f in micro_row:
+        nm = base_of(f["name"])
+        for s in starts_with:
+            if nm.startswith(s):
+                out.append(f["name"]); break
+    return out
+
+# ============== UI ==============
+st.title("Navigation Plan & Inflight Log — Tecnam P2008 (PDF + Relatório)")
 
 DEFAULT_STUDENT="AMOIT"; DEFAULT_AIRCRAFT="P208"; DEFAULT_CALLSIGN="RVP"
 REGS=["CS-ECC","CS-ECD","CS-DHS","CS-DHT","CS-DHU","CS-DHV","CS-DHW"]
@@ -288,7 +313,7 @@ with c1:
     callsign=st.text_input("Callsign",DEFAULT_CALLSIGN)
 with c2:
     student=st.text_input("Student",DEFAULT_STUDENT)
-    lesson = st.text_input("Lesson","")
+    lesson = st.text_input("Lesson (ex: 12)", "")
     instrutor = st.text_input("Instrutor","")
 with c3:
     dept=st.selectbox("Departure",list(AEROS.keys()),index=0)
@@ -407,7 +432,6 @@ N = len(legs)
 
 # ===== NAVAIDS por fix =====
 st.markdown("### NAVAIDS por fix (IDENT / FREQ)")
-# navaids para [DEP] + cada chegada (inclui TOC/TOD quando houver cortes)
 if "navaids" not in st.session_state:
     st.session_state.navaids = [{"IDENT":"", "FREQ":""} for _ in range(max(1, N+1))]
 nav_view = st.data_editor(
@@ -417,7 +441,7 @@ nav_view = st.data_editor(
 )
 st.session_state.navaids = nav_view
 
-# =================== Cálculo vertical + cortes ===================
+# ============== Cálculo vertical + cortes ==============
 def pressure_alt(alt_ft, qnh_hpa): return float(alt_ft) + (1013.0 - float(qnh_hpa))*30.0
 dep_elev = aero_elev(dept); arr_elev = aero_elev(arr)
 start_alt = float(dep_elev); end_alt = float(arr_elev)
@@ -520,15 +544,15 @@ def add_segment(phase:str, from_nm:str, to_nm:str, i_leg:int, d_nm:float, tas:fl
         "dist": d_nm, "ete": int(ete), "eto": eto, "burn": burn, "efob": efob
     })
 
-    # Para relatório (com valores crús + formatados)
-    calc_steps.append(
-        f"[{from_nm}→{to_nm} / {phase}] "
-        f"TC={tc:.1f}°, WCA=asin((W/TAS)*sin Δ)={wca:.2f}°, TH=TC+WCA={th:.2f}°, "
-        f"GS=TAS*cos(WCA)-W*cos Δ={gs:.2f} kt; Dist={d_nm:.2f} nm → "
-        f"ETE_raw=60*D/GS={ete_raw:.2f} min → ETE={ete} min; "
-        f"Burn={ff_lph:.2f}*(ETE_raw/60)={burn:.2f} L; "
-        f"ALT {alt_start:.0f}->{alt_end:.0f} ft; ETO={eto}; EFOB={efob:.2f} L"
-    )
+    # Passos (texto curto) p/ relatório
+    calc_steps.append([
+        from_nm, to_nm, phase,
+        f"{_round_angle(tc)}°", f"{_round_angle(apply_var(th, var_deg, var_is_e))}°",
+        _round_unit(tas), _round_unit(gs),
+        _round_default(d_nm), int(ete), eto or "—",
+        _round_unit(burn), _round_unit(efob),
+        f"{fmt(alt_start,'default')}→{fmt(alt_end,'default')}"
+    ])
 
 # DEP para a 1ª linha sem métrica
 seq_points.append({"name": dept, "alt": _round_default(start_alt),
@@ -575,11 +599,10 @@ if len(st.session_state.navaids) < len(seq_points):
 elif len(st.session_state.navaids) > len(seq_points):
     st.session_state.navaids = st.session_state.navaids[:len(seq_points)]
 
-# ===== PDF export =====
-st.markdown("### PDF export")
-show_fields = st.checkbox("Mostrar nomes de campos do PDF (debug)")
+# ============== PDF export ==============
+st.markdown("### PDF export (apenas PDF)")
+show_debug = st.checkbox("Mostrar debug de linhas (posições)")
 
-# carregar template
 try:
     template_bytes = read_pdf_bytes(PDF_TEMPLATE_PATHS)
 except Exception as e:
@@ -587,7 +610,6 @@ except Exception as e:
     st.error(f"Não foi possível ler o PDF de template: {e}")
 
 pdf_bytes_out = None
-jpeg_bytes_out = None
 report_bytes_out = None
 
 if not template_bytes:
@@ -596,46 +618,25 @@ elif not PYPDF_OK:
     st.error("A biblioteca **pypdf** não está instalada. Instala com: `pip install pypdf`.")
 else:
     try:
-        fieldset, maxlens = get_fields_and_meta(template_bytes)
+        fieldset, maxlens, fields_pos = get_form_fields(template_bytes)
     except Exception as e:
         st.error(f"Falha a ler os campos do PDF (pypdf): {e}")
-        fieldset, maxlens = set(), {}
+        fieldset, maxlens, fields_pos = set(), {}, []
 
-    if show_fields and fieldset:
-        st.code("\n".join(sorted(fieldset)))
+    if show_debug and fields_pos:
+        st.write(f"N.º total de campos: {len(fieldset)} | com posições: {len(fields_pos)}")
 
-    if fieldset:
-        # coleções por coluna (detecção robusta)
-        FIX_FIELDS    = series(fieldset, ["FIX","NAME"])
-        NAVAIDS_ALL   = series(fieldset, ["NAVAIDS"])
-        ALT_FIELDS    = series(fieldset, ["ALT"])
+    if fieldset and fields_pos:
+        # Detectar micro-rows (top/bottom alternadas), por página
+        micro_rows = fields_to_micro_rows(fields_pos)
+        if show_debug:
+            st.write(f"Micro-rows detectadas: {len(micro_rows)} (cada linha da grelha deverá ter 2 micro-rows)")
 
-        # DIRECTION: preferir listas separadas; fallback para base única com 2 col/linha
-        TCRS_FIELDS   = series(fieldset, ["T CRS","TCRS","TRUE CRS","TRUE COURSE"])
-        MCRS_FIELDS   = series(fieldset, ["M CRS","MCRS","MAG CRS","MAG COURSE"])
-        DIR_FIELDS    = series(fieldset, ["CRS","COURSE","DIRECTION"])  # fallback 2 por linha: True (par/1ª), Mag (ímpar/2ª)
-
-        SPEED_FIELDS  = series(fieldset, ["SPEED"])   # se houver 2/linha (GS/TAS)
-        GS_FIELDS     = series(fieldset, ["GS"])
-        TAS_FIELDS    = series(fieldset, ["TAS"])
-
-        DIST_FIELDS   = series(fieldset, ["DIST"])    # 2/linha: LEG (top), ACC (bottom)
-        ETE_FIELDS    = series(fieldset, ["ETE"])
-        ETO_FIELDS    = series(fieldset, ["ETO"])
-        ACC_FIELDS    = series(fieldset, ["ACC"])     # tempo acumulado
-
-        PBO_FIELDS    = series(fieldset, ["PL B/O","Pl B/O","PL_BO","PL BO"])
-        EFOB_FIELDS   = series(fieldset, ["EFOB"])
-        # Campos Actual (deixar vazio)
-        # ATO/RETO/DIFF/Act B/O/AFOB intencionalmente não escritos
-
-        def write_field(named, key, value):
-            put(named, fieldset, key, value, maxlens)
-
-        # ===== Cabeçalho básico (se existirem) =====
+        # Mapeamento por micro-rows (top/bottom)
         named: Dict[str,str] = {}
-        # Info de topo (alguns templates têm estes nomes)
-        for k, v in {
+
+        # ===== Cabeçalho (se existirem) =====
+        header_candidates = {
             "FLIGHT LEVEL / ALTITUDE": fmt(cruise_alt,'default'),
             "WIND": f"{int(round(wind_from)):03d}/{int(round(wind_kt)):02d}",
             "MAG VAR": f"{int(round(var_deg))}{'E' if var_is_e else 'W'}",
@@ -644,24 +645,73 @@ else:
             "Alternate_Airfield": altn, "Alt_Alternate": fmt(aero_elev(altn),'default'),
             "Startup": startup_str,
             "Takeoff": (add_minutes(parse_hhmm(startup_str),15).strftime("%H:%M") if startup_str else "")
-        }.items():
-            write_field(named, k, v)
+        }
+        for k,v in header_candidates.items():
+            put(named, fieldset, k, v, maxlens)
 
-        # ===== Linhas (DEP + segmentos) =====
-        def build_pdf_items_from_points(points):
-            """Cada item é o ponto de chegada; idx 0 = DEP."""
-            items = []
+        # Constrói itens para escrita (DEP + chegadas)
+        # Cada linha lógica = 2 micro-rows: top (leg metrics) + bottom (second line)
+        def write_row(r_idx: int, top: List[dict], bottom: List[dict], item: dict):
+            # FIX / ALT
+            f_fix = find_first_in_row(top, ["FIX","NAME"])
+            if f_fix: put(named, fieldset, f_fix, item["Name"], maxlens)
+            f_alt = find_first_in_row(top, ["ALT"])
+            if f_alt: put(named, fieldset, f_alt, item["Alt"], maxlens)
+
+            # NAVAIDS IDENT (top) / FREQ (bottom)
+            f_nav_top  = find_first_in_row(top, ["NAVAIDS"])
+            f_nav_bot  = find_first_in_row(bottom, ["NAVAIDS"])
+            ident = (st.session_state.navaids[r_idx]["IDENT"] if r_idx < len(st.session_state.navaids) else "")
+            freq  = (st.session_state.navaids[r_idx]["FREQ"]  if r_idx < len(st.session_state.navaids) else "")
+            if f_nav_top: put(named, fieldset, f_nav_top, ident, maxlens)
+            if f_nav_bot: put(named, fieldset, f_nav_bot, freq, maxlens)
+
+            # DIRECTION
+            f_tcrs = find_first_in_row(top, ["T CRS","TCRS"])
+            f_mcrs = find_first_in_row(bottom, ["M CRS","MCRS"])
+            if item["TC"]!="" and f_tcrs: put(named, fieldset, f_tcrs, item["TC"], maxlens)
+            if item["MH"]!="" and f_mcrs: put(named, fieldset, f_mcrs, item["MH"], maxlens)
+
+            # SPEED: GS (top), TAS (bottom)
+            f_gs_top = find_first_in_row(top, ["GS"]) or find_first_in_row(top, ["SPEED"])
+            f_tas_bot= find_first_in_row(bottom, ["TAS"]) or find_first_in_row(bottom, ["SPEED"])
+            if item["GS"]!="" and f_gs_top: put(named, fieldset, f_gs_top, item["GS"], maxlens)
+            if item["TAS"]!="" and f_tas_bot: put(named, fieldset, f_tas_bot, item["TAS"], maxlens)
+
+            # DIST: LEG (top), ACC (bottom)
+            f_dist_top = find_first_in_row(top, ["DIST"])
+            f_dist_acc = find_first_in_row(bottom, ["DIST","ACC"])  # alguns templates usam ACC
+            if item["Dist_leg"]!="" and f_dist_top: put(named, fieldset, f_dist_top, item["Dist_leg"], maxlens)
+            if item["Dist_acc"]!="" and f_dist_acc: put(named, fieldset, f_dist_acc, item["Dist_acc"], maxlens)
+
+            # TIME: ETE & ETO (top), ACC (bottom)
+            f_ete = find_first_in_row(top, ["ETE"])
+            f_eto = find_first_in_row(top, ["ETO"])
+            f_acc = find_first_in_row(bottom, ["ACC"])
+            if item["ETE"]!="" and f_ete: put(named, fieldset, f_ete, item["ETE"], maxlens)
+            if item["ETO"]!="" and f_eto: put(named, fieldset, f_eto, item["ETO"], maxlens)
+            if item["ACC_time"]!="" and f_acc: put(named, fieldset, f_acc, item["ACC_time"], maxlens)
+            # ATO/RETO/DIFF ficam vazios
+
+            # FUEL: Pl B/O + EFOB (top)
+            f_pbo = find_first_in_row(top, ["PL B/O","Pl B/O","PL_BO","PL BO"])
+            f_efob= find_first_in_row(top, ["EFOB"])
+            if item["Burn"]!="" and f_pbo:  put(named, fieldset, f_pbo,  item["Burn"], maxlens)
+            if item["EFOB"]!="" and f_efob: put(named, fieldset, f_efob, item["EFOB"], maxlens)
+            # Act B/O, AFOB (bottom) — não preencher
+
+        # Preparar itens formatados (DEP + segmentos)
+        def build_pdf_items(seq_points):
+            items=[]
             acc_dist = 0.0
             acc_time = 0
-            for idx, p in enumerate(points):  # 0 = DEP
-                is_seg = (idx > 0)
-                if is_seg and isinstance(p["dist"], (int,float)):
-                    acc_dist += float(p["dist"])
-                if is_seg:
-                    acc_time += int(p["ete"] or 0)
+            for idx, p in enumerate(seq_points):
+                is_seg = (idx>0)
+                if is_seg and isinstance(p["dist"], (int,float)): acc_dist += float(p["dist"])
+                if is_seg: acc_time += int(p["ete"] or 0)
                 it = {
                     "Name": p["name"],
-                    "Alt": fmt(p["alt"], 'default') if p["alt"] != "" else "",
+                    "Alt": fmt(p["alt"], 'default') if p["alt"]!="" else "",
                     "TC":  (fmt(p["tc"], 'angle') if is_seg else ""),
                     "MH":  (fmt(p["mh"], 'angle') if is_seg else ""),
                     "GS":  (fmt(p["gs"], 'speed') if is_seg else ""),
@@ -677,168 +727,156 @@ else:
                 items.append(it)
             return items
 
-        pdf_items = build_pdf_items_from_points(seq_points)
-        rows_count = len(pdf_items)  # DEP + chegadas
+        pdf_items = build_pdf_items(seq_points)
 
-        for r in range(rows_count):
-            it = pdf_items[r]
-            # ---- FIX / ALT
-            if r < len(FIX_FIELDS):  write_field(named, FIX_FIELDS[r], it["Name"])
-            if r < len(ALT_FIELDS):  write_field(named, ALT_FIELDS[r], it["Alt"])
+        # Escrever por pares de micro-rows
+        total_pairs = len(micro_rows)//2
+        use_rows = min(len(pdf_items), total_pairs)
+        if show_debug:
+            st.write(f"Linhas lógicas disponíveis: {total_pairs} | a escrever: {use_rows}")
 
-            # ---- NAVAIDS: 2 por linha (IDENT / FREQ) vindos da UI
-            ident = (st.session_state.navaids[r]["IDENT"] if r < len(st.session_state.navaids) else "")
-            freq  = (st.session_state.navaids[r]["FREQ"]  if r < len(st.session_state.navaids) else "")
-            ident_field = get_row_field(NAVAIDS_ALL, r, 0, per_row=2)
-            freq_field  = get_row_field(NAVAIDS_ALL, r, 1, per_row=2)
-            if ident_field: write_field(named, ident_field, ident)
-            if freq_field:  write_field(named, freq_field,  freq)
+        for i in range(use_rows):
+            top_row = micro_rows[2*i]
+            bot_row = micro_rows[2*i+1]
+            write_row(i, top_row, bot_row, pdf_items[i])
 
-            # ---- DIRECTION (T CRS / M CRS)
-            if r < len(TCRS_FIELDS) and it["TC"]!="":
-                write_field(named, TCRS_FIELDS[r], it["TC"])
-            if r < len(MCRS_FIELDS) and it["MH"]!="":
-                write_field(named, MCRS_FIELDS[r], it["MH"])
-            # Fallback: uma única base (2 col/linha): True na 1ª, Mag na 2ª
-            if len(TCRS_FIELDS)==0 and len(MCRS_FIELDS)==0 and len(DIR_FIELDS) >= 2*rows_count:
-                dir_true = get_row_field(DIR_FIELDS, r, 0, per_row=2)
-                dir_mag  = get_row_field(DIR_FIELDS, r, 1, per_row=2)
-                if dir_true and it["TC"]!="": write_field(named, dir_true, it["TC"])
-                if dir_mag  and it["MH"]!="": write_field(named, dir_mag,  it["MH"])
-
-            # ---- SPEED: GS/TAS (2 por linha se só houver "SPEED_*"; ou listas GS_/TAS_)
-            if len(GS_FIELDS) >= rows_count and r < len(GS_FIELDS):
-                write_field(named, GS_FIELDS[r], it["GS"])
-            if len(TAS_FIELDS) >= rows_count and r < len(TAS_FIELDS):
-                write_field(named, TAS_FIELDS[r], it["TAS"])
-            if len(SPEED_FIELDS) >= 2*rows_count:
-                sp_gs = get_row_field(SPEED_FIELDS, r, 0, per_row=2)
-                sp_tas= get_row_field(SPEED_FIELDS, r, 1, per_row=2)
-                if sp_gs:  write_field(named, sp_gs,  it["GS"])
-                if sp_tas: write_field(named, sp_tas, it["TAS"])
-
-            # ---- DIST: LEG (alto) + ACC (baixo)
-            if len(DIST_FIELDS) >= 2*rows_count:
-                d_leg = get_row_field(DIST_FIELDS, r, 0, per_row=2)
-                d_acc = get_row_field(DIST_FIELDS, r, 1, per_row=2)
-                if d_leg: write_field(named, d_leg, it["Dist_leg"])
-                if d_acc: write_field(named, d_acc, it["Dist_acc"])
-
-            # ---- TIME: ETE / ETO (top), ACC (bottom). ATO/RETO/DIFF ficam vazios.
-            if r < len(ETE_FIELDS): write_field(named, ETE_FIELDS[r], it["ETE"])
-            if r < len(ETO_FIELDS): write_field(named, ETO_FIELDS[r], it["ETO"])
-            if r < len(ACC_FIELDS): write_field(named, ACC_FIELDS[r], it["ACC_time"])
-
-            # ---- FUEL: Pl B/O + EFOB (top). Act B/O + AFOB ficam vazios.
-            if r < len(PBO_FIELDS):  write_field(named, PBO_FIELDS[r], it["Burn"])
-            if r < len(EFOB_FIELDS): write_field(named, EFOB_FIELDS[r], it["EFOB"])
-
-        # ===== Totais e tempos finais =====
+        # Totais e tempos finais (se existirem campos)
         last_eto = pdf_items[-1]["ETO"] if pdf_items else ""
         put(named, fieldset, "LANDING", last_eto, maxlens)
         put(named, fieldset, "SHUTDOWN", (add_minutes(parse_hhmm(last_eto),5).strftime("%H:%M") if last_eto else ""), maxlens)
         put(named, fieldset, "ETD/ETA", f"{(add_minutes(parse_hhmm(startup_str),15).strftime('%H:%M') if startup_str else '')} / {last_eto}", maxlens)
-
-        # Totais planeados
         tot_min = sum(int(it["ETE"] or "0") for it in pdf_items)
         put(named, fieldset, "FLT TIME", f"{tot_min//60:02d}:{tot_min%60:02d}", maxlens)
         put(named, fieldset, "CLIMB FUEL", fmt((ff_climb*(t_climb_total/60.0)),'fuel'), maxlens)
 
-        # ===== Botão: gerar PDF + JPEG =====
-        if st.button("Gerar PDF preenchido + JPEG", type="primary"):
+        # ===== Gerar PDF =====
+        if st.button("Gerar PDF preenchido", type="primary"):
             try:
                 pdf_bytes_out = fill_pdf(template_bytes, named)
-                safe_reg = ascii_safe(registration)
+                # Nome do ficheiro — pelo número da Lesson (não pela matrícula)
+                # Se capturarmos dígitos, usamos só o número; senão o texto da Lesson sanitizado.
+                m = re.search(r'(\d+)', lesson or "")
+                lesson_id = m.group(1) if m else ascii_safe(lesson or "LESSON")
                 safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
-                filename_pdf = f"{safe_date}_{safe_reg}_NAVLOG.pdf"
+                filename_pdf = f"{safe_date}_LESSON-{lesson_id}_NAVLOG.pdf"
                 st.download_button("📄 Download PDF", data=pdf_bytes_out, file_name=filename_pdf, mime="application/pdf")
-
-                if not PYMUPDF_OK:
-                    st.warning("PyMuPDF não instalado — sem JPEG. Instala com: `pip install pymupdf`.")
-                else:
-                    jpeg_bytes_out = pdf_to_jpeg_bytes(pdf_bytes_out, page_index=0, dpi=220)
-                    filename_jpg = f"{safe_date}_{safe_reg}_NAVLOG.jpg"
-                    st.image(jpeg_bytes_out, caption="Pré-visualização NAVLOG (JPEG)", use_column_width=True)
-                    st.download_button("🖼️ Download JPEG", data=jpeg_bytes_out, file_name=filename_jpg, mime="image/jpeg")
+                st.success("PDF gerado (apenas planeado). Revê antes do voo.")
             except Exception as e:
-                st.error(f"Erro ao gerar PDF/JPEG: {e}")
+                st.error(f"Erro ao gerar PDF: {e}")
 
-# ===== Relatório PDF dos cálculos =====
-def build_report_pdf(calc_steps: List[str], rows, seq_points, params: Dict[str,str]) -> bytes:
+# ============== Relatório legível (PDF) ==============
+def build_report_pdf_human(calc_rows: List[List], params: Dict[str,str]) -> bytes:
     if not REPORTLAB_OK:
         raise RuntimeError("reportlab missing")
     bio = io.BytesIO()
-    c = rl_canvas.Canvas(bio, pagesize=A4)
-    W, H = A4
-    x, y = 20*mm, H-20*mm
-    def line(txt, size=10, lead=12):
-        nonlocal y
-        c.setFont("Helvetica", size)
-        c.drawString(x, y, txt)
-        y -= lead
-        if y < 20*mm:
-            c.showPage()
-            y = H-20*mm
+    doc = SimpleDocTemplate(bio, pagesize=A4,
+                            leftMargin=18*mm, rightMargin=18*mm,
+                            topMargin=15*mm, bottomMargin=15*mm)
+    styles = getSampleStyleSheet()
+    H1 = styles["Heading1"]; H2 = styles["Heading2"]; H3 = styles["Heading3"]; P = styles["BodyText"]
 
-    c.setTitle("NAVLOG — Relatório de Cálculos")
-    c.setAuthor("NAVLOG App")
+    story=[]
+    story.append(Paragraph("NAVLOG — Relatório de Cálculos (Planeado)", H1))
+    story.append(Spacer(1,6))
 
-    # Cabeçalho
-    line("NAVLOG — Relatório de Cálculos (Planeado)", 14, 18)
-    for k in ["aircraft","registration","callsign","dept","arr","altn","qnh","temp","wind","var","cruise_alt","startup","etd","eta","shutdown","flt_time","start_fuel"]:
-        if k in params:
-            line(f"- {k}: {params[k]}")
+    # Resumo do voo
+    resume = [
+        ["Aeronave", params.get("aircraft","—")],
+        ["Matrícula", params.get("registration","—")],
+        ["Callsign", params.get("callsign","—")],
+        ["Lição", params.get("lesson","—")],
+        ["Partida", params.get("dept","—")],
+        ["Chegada", params.get("arr","—")],
+        ["Alternante", params.get("altn","—")],
+        ["Nível/Alt Cruzeiro", params.get("cruise_alt","—") + " ft"],
+        ["QNH", params.get("qnh","—")],
+        ["Vento", params.get("wind","—")],
+        ["Var. Magn.", params.get("var","—")],
+        ["OAT / ISA dev", params.get("temp_isa","—")],
+        ["Startup", params.get("startup","—")],
+        ["ETD", params.get("etd","—")],
+        ["ETA", params.get("eta","—")],
+        ["Shutdown", params.get("shutdown","—")],
+        ["Tempo total (PLN)", params.get("flt_time","—")],
+        ["Fuel inicial", params.get("start_fuel","—")+" L"],
+    ]
+    t = Table(resume, hAlign="LEFT", colWidths=[45*mm, None])
+    t.setStyle(TableStyle([
+        ("GRID",(0,0),(-1,-1),0.25,colors.lightgrey),
+        ("BACKGROUND",(0,0),(0,-1),colors.whitesmoke),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("FONTSIZE",(0,0),(-1,-1),9),
+        ("LEFTPADDING",(0,0),(-1,-1),4),
+        ("RIGHTPADDING",(0,0),(-1,-1),4),
+    ]))
+    story.append(t)
+    story.append(Spacer(1,8))
 
-    line("", lead=8)
-    line("Fórmulas:", 12, 16)
-    line(" • WCA = asin( (W/TAS) * sin(θw_from − θc) )")
-    line(" • TH  = TC + WCA")
-    line(" • GS  = TAS*cos(WCA) − W*cos(θw_from − θc)")
-    line(" • ETE (min) = ceil( 60 * Dist / GS ), min 1 se Dist>0")
-    line(" • Burn (L) = FF (L/h) * (ETE_real/60)  [usamos ETE_real antes do ceil]")
+    story.append(Paragraph("Fórmulas utilizadas (vento FROM):", H2))
+    formulae = [
+        "WCA = asin( (W/TAS) · sin(θwind_from − θcourse_true) )",
+        "TH  = TC + WCA",
+        "GS  = TAS·cos(WCA) − W·cos(θwind_from − θcourse_true)",
+        "ETE (min) = ceil( 60 · Dist / GS ), com mínimo 1 se Dist > 0",
+        "Burn (L) = FF (L/h) · (ETE_real/60)  [usamos ETE_real antes do arredondamento]",
+    ]
+    for f in formulae:
+        story.append(Paragraph(f"• {f}", P))
+    story.append(Spacer(1,6))
 
-    line("", lead=8)
-    line("Segmentos:", 12, 16)
-    for s in calc_steps:
-        for chunk in re.findall('.{1,110}(?:\\s+|$)', s):
-            line(chunk.strip())
+    story.append(Paragraph("Segmentos (por ordem):", H2))
+    # Tabela de segmentos legível
+    data = [["From→To","Fase","TC°","MH°","TAS","GS","Dist","ETE","ETO","Burn","EFOB","ALT ini→fim"]]
+    for r in calc_rows:
+        data.append(r)
+    ts = TableStyle([
+        ("GRID",(0,0),(-1,-1),0.25,colors.grey),
+        ("BACKGROUND",(0,0),(-1,0),colors.lightgrey),
+        ("ALIGN",(2,1),(5,-1),"RIGHT"),
+        ("ALIGN",(6,1),(10,-1),"RIGHT"),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("FONTSIZE",(0,0),(-1,-1),8.7),
+        ("LEFTPADDING",(0,0),(-1,-1),3),
+        ("RIGHTPADDING",(0,0),(-1,-1),3),
+    ])
+    tbl = Table(data, hAlign="LEFT",
+                colWidths=[34*mm, 12*mm, 10*mm, 10*mm, 10*mm, 10*mm, 12*mm, 10*mm, 14*mm, 12*mm, 12*mm, 24*mm])
+    tbl.setStyle(ts)
+    story.append(tbl)
 
-    line("", lead=8)
-    line("Resumo por ponto:", 12, 16)
-    acc_dist = 0.0; acc_time = 0
-    for i, p in enumerate(seq_points):
-        if i==0:
-            line(f"[DEP {p['name']}] ALT={fmt(p['alt'],'default')} ft, ETO={p['eto']}, EFOB={fmt(p['efob'],'fuel')} L")
-        else:
-            acc_dist += float(p["dist"])
-            acc_time += int(p["ete"])
-            line(f"{p['name']}: ALT={fmt(p['alt'],'default')} ft, TC={fmt(p['tc'],'angle')}°, MH={fmt(p['mh'],'angle')}°, "
-                 f"TAS={fmt(p['tas'],'speed')} kt, GS={fmt(p['gs'],'speed')} kt, "
-                 f"LEG={fmt(p['dist'],'default')} nm, ACC={fmt(acc_dist,'default')} nm, "
-                 f"ETE={fmt(p['ete'],'mins')} min, ETO={p['eto']}, Burn={fmt(p['burn'],'fuel')} L, "
-                 f"EFOB={fmt(p['efob'],'fuel')} L")
-
-    c.showPage(); c.save()
+    doc.build(story)
     return bio.getvalue()
 
-if st.button("Gerar Relatório de Cálculos (PDF)"):
+if st.button("Gerar Relatório (PDF legível)"):
     try:
         params = {
             "aircraft": aircraft, "registration": registration, "callsign": callsign,
-            "dept": dept, "arr": arr, "altn": altn, "qnh": fmt(qnh,'default'),
-            "temp": fmt(temp_c,'default'), "wind": f"{int(round(wind_from)):03d}/{int(round(wind_kt)):02d}",
+            "lesson": lesson,
+            "dept": dept, "arr": arr, "altn": altn,
+            "qnh": fmt(qnh,'default'),
+            "wind": f"{int(round(wind_from)):03d}/{int(round(wind_kt)):02d}",
             "var": f"{int(round(var_deg))}{'E' if var_is_e else 'W'}",
-            "cruise_alt": fmt(cruise_alt,'default'), "startup": startup_str,
+            "cruise_alt": fmt(cruise_alt,'default'),
+            "temp_isa": f"{fmt(temp_c,'default')} / {fmt(temp_c - isa_temp(pressure_alt(aero_elev(dept), qnh)),'default')}",
+            "startup": startup_str,
             "etd": (add_minutes(parse_hhmm(startup_str),15).strftime("%H:%M") if startup_str else ""),
             "eta": (eta.strftime("%H:%M") if eta else ""), "shutdown": (shutdown.strftime("%H:%M") if shutdown else ""),
             "flt_time": f"{tot_ete_m//60:02d}:{tot_ete_m%60:02d}",
             "start_fuel": fmt(start_fuel,'fuel')
         }
-        report_bytes_out = build_report_pdf(calc_steps, rows, seq_points, params)
-        safe_reg = ascii_safe(registration)
+        # Transforma calc_steps (lista de listas) no formato esperado: [From→To, Fase, ...]
+        calc_rows = []
+        for r in calc_steps:
+            # r = [from, to, phase, TC°, MH°, TAS, GS, Dist, ETE, ETO, Burn, EFOB, ALTini→fim]
+            calc_rows.append([f"{r[0]}→{r[1]}", r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]])
+        report_bytes_out = build_report_pdf_human(calc_rows, params)
+        # Nomeia relatório também pela Lesson
+        m = re.search(r'(\d+)', lesson or "")
+        lesson_id = m.group(1) if m else ascii_safe(lesson or "LESSON")
         safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
-        filename_rep = f"{safe_date}_{safe_reg}_NAVLOG_RELATORIO.pdf"
+        filename_rep = f"{safe_date}_LESSON-{lesson_id}_NAVLOG_RELATORIO.pdf"
         st.download_button("📑 Download Relatório (PDF)", data=report_bytes_out, file_name=filename_rep, mime="application/pdf")
         st.success("Relatório gerado.")
     except Exception as e:
         st.error(f"Erro ao gerar relatório: {e}")
+
