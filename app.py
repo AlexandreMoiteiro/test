@@ -1,6 +1,4 @@
-
-
-# app.py — NAVLOG (PDF) com cortes intra-leg, arredondamentos ajustados e relatório legível
+# app.py — NAVLOG (PDF) com cortes intra-leg, arredondamentos ajustados, step-down profile e relatório legível
 # Reqs: streamlit, pypdf, reportlab, pytz
 
 import streamlit as st
@@ -12,7 +10,8 @@ from math import sin, asin, radians, degrees, fmod
 
 # =================== Config ===================
 st.set_page_config(page_title="NAVLOG (PDF + Relatório)", layout="wide", initial_sidebar_state="collapsed")
-PDF_TEMPLATE_PATHS = ["NAVLOG_FORM.pdf"]   # template novo
+# tenta primeiro o PDF junto da app; se não existir, usa o enviado
+PDF_TEMPLATE_PATHS = ["NAVLOG_FORM.pdf", "/mnt/data/NAVLOG_FORM.pdf"]
 
 # =================== Imports opcionais ===================
 try:
@@ -34,7 +33,6 @@ except Exception:
 
 # =================== Arredondamento / Formatação ===================
 def _round_default(x: float) -> int:
-    """Default anterior (já não usado em distâncias/fuel sensíveis): <1000 → 5; ≥1000 → 100."""
     if x is None: return 0
     v = float(x)
     base = 5 if abs(v) < 1000 else 100
@@ -46,24 +44,13 @@ def _round_unit(x: float) -> int:
 
 def _round_half(x: float) -> float:
     if x is None: return 0.0
-    return round(float(x) * 2.0) / 2.0  # múltiplos de 0.5
+    return round(float(x) * 2.0) / 2.0
 
 def _round_angle(x: float) -> int:
     if x is None: return 0
     return int(round(float(x))) % 360
 
 def fmt(x: float, kind: str = "default") -> str:
-    """
-    kind:
-      - "dist"   → 1 casa decimal (ex.: 3.4)
-      - "fuel"   → múltiplos de 0.5 (ex.: 12.5)
-      - "ff"     → unidade (L/h)
-      - "speed"  → unidade (kt)
-      - "mins"   → unidade (min)
-      - "angle"  → grau
-      - "alt"    → regra antiga (5/100)
-      - "default"→ regra antiga (5/100)
-    """
     if kind == "dist":   return f"{round(float(x or 0), 1):.1f}"
     if kind == "fuel":   return f"{_round_half(x):.1f}"
     if kind == "ff":     return str(_round_unit(x))
@@ -79,8 +66,8 @@ def ascii_safe(x: str) -> str:
 
 def parse_hhmm(s:str):
     s=(s or "").strip()
-    for fmt in ("%H:%M","%H%M"):
-        try: return dt.datetime.strptime(s,fmt).time()
+    for f in ("%H:%M","%H%M"):
+        try: return dt.datetime.strptime(s,f).time()
         except: pass
     return None
 
@@ -190,7 +177,6 @@ def read_pdf_bytes(paths: List[str]) -> bytes:
     raise FileNotFoundError(paths)
 
 def get_form_fields(template_bytes: bytes):
-    """Devolve (fieldset, maxlens, fields_pos) onde fields_pos = [{name,page,(x0,y0,x1,y1)}]."""
     if not PYPDF_OK:
         raise RuntimeError("Dependência ausente: pypdf. Instala com: pip install pypdf")
     reader = PdfReader(io.BytesIO(template_bytes))
@@ -442,12 +428,11 @@ for j in range(N-1, -1, -1):
 startup = parse_hhmm(startup_str)
 takeoff = add_minutes(startup,15) if startup else None
 clock = takeoff
-def ceil_pos_minutes(x):  # arredonda ↑ e garante 1 min quando >0
+def ceil_pos_minutes(x):
     return max(1, int(math.ceil(x - 1e-9))) if x > 0 else 0
 
 rows=[]; seq_points=[]
-calc_rows=[]       # tabela p/ relatório (legível)
-calc_details=[]    # passo-a-passo por segmento (fórmulas + valores)
+calc_rows=[]; calc_details=[]
 PH_ICON = {"CLIMB":"↑","CRUISE":"→","DESCENT":"↓"}
 alt_cursor = float(start_alt)
 efob=float(start_fuel)
@@ -496,7 +481,7 @@ def add_segment(phase:str, from_nm:str, to_nm:str, i_leg:int, d_nm:float, tas:fl
         "tc": _round_angle(tc), "th": _round_angle(th),
         "mh": _round_angle(mh),
         "tas": _round_unit(tas), "gs": _round_unit(gs),
-        "dist": float(f"{d_nm:.3f}"),  # manter precisão interna
+        "dist": float(f"{d_nm:.3f}"),
         "ete": int(ete), "eto": eto,
         "burn": float(burn_raw), "efob": float(efob)
     })
@@ -545,9 +530,66 @@ for i in range(N):
 
 eta = clock; landing = eta; shutdown = add_minutes(eta,5) if eta else None
 
-# ===== Tabela rápida na App =====
+# ===== Cálculo do perfil de step-down (ALT REQ) =====
+# UI para restrições por fix
+st.markdown("### Altitudes publicadas por fix (opcional — AT OR BELOW / limite máximo)")
+if "stepdowns" not in st.session_state or len(st.session_state.get("stepdowns",[])) != len(seq_points):
+    st.session_state.stepdowns = [{"Published(ft)":""} for _ in range(len(seq_points))]
+step_view = st.data_editor(
+    st.session_state.stepdowns, hide_index=True, use_container_width=True,
+    column_config={"Published(ft)": st.column_config.TextColumn("Published(ft)")}
+)
+st.session_state.stepdowns = step_view
+
+# construir arrays auxiliares a partir de seq_points
+M = len(seq_points)
+# distância do ponto k-1 para k está em seq_points[k]["dist"] (nm) se numérico
+seg_dist = [0.0]*M
+seg_gs   = [float(descent_ref_kt)]*M
+for k in range(1,M):
+    d = seq_points[k].get("dist")
+    seg_dist[k] = float(d) if isinstance(d,(int,float)) else 0.0
+    g = seq_points[k].get("gs")
+    seg_gs[k] = float(g) if isinstance(g,(int,float)) and g>0 else float(descent_ref_kt)
+
+# limites L[i] (ft) — AT OR BELOW; destino força elev do aeródromo
+INF = 10**9
+L = [INF]*M
+for i in range(M):
+    raw = st.session_state.stepdowns[i].get("Published(ft)","").strip()
+    try:
+        L[i] = float(raw)
+    except:
+        L[i] = INF
+L[-1] = float(end_alt)  # destino
+# envelope não crescente (AT OR BELOW)
+for i in range(1,M):
+    L[i] = min(L[i], L[i-1])
+
+# perdas por segmento (ft) se descer a ROD com GS do segmento
+seg_loss = [rod_fpm * (60.0 / max(seg_gs[k],1e-6)) * seg_dist[k] for k in range(M)]
+
+# varrimento inverso: required_alt[M-1] = L[M-1]; required[i] = min(L[i], required[i+1] + seg_loss[i+1])
+required_alt = [0.0]*M
+required_alt[-1] = L[-1]
+for i in range(M-2, -1, -1):
+    required_alt[i] = min(L[i], required_alt[i+1] + seg_loss[i+1])
+
+# mostrar na tabela rápida + guardamos para PDF
 st.markdown("### Flight plan — cortes dentro do leg (App)")
-st.dataframe(rows, use_container_width=True)
+# vamos replicar 'rows' e acrescentar ALT REQ
+rows_with_req = []
+req_idx = 0
+# mapear seq_points aos 'rows': cada linha em rows é um segmento terminado num ponto de seq_points[k]
+# criamos um iterador de pontos (ignorando o primeiro que é DEP)
+for r in rows:
+    req_idx += 1  # porque o primeiro seq_points[0] é o DEP
+    alt_req_str = fmt(required_alt[req_idx], 'alt') if req_idx < M else ""
+    new_r = dict(r)
+    new_r["ALT REQ (ft)"] = alt_req_str
+    rows_with_req.append(new_r)
+
+st.dataframe(rows_with_req, use_container_width=True)
 
 tot_ete_m = int(sum(int(r['ETE (min)']) for r in rows))
 tot_nm  = sum(float(p['dist']) for p in seq_points if isinstance(p.get('dist'), (int,float)))
@@ -567,49 +609,24 @@ if len(st.session_state.navaids) < len(seq_points):
 elif len(st.session_state.navaids) > len(seq_points):
     st.session_state.navaids = st.session_state.navaids[:len(seq_points)]
 
-# =================== Mapeamento robusto para o PDF (por sufixo/posição) ===================
-def suffix_of(name:str) -> int:
-    m = re.search(r'_(\d+)$', name or "")
-    return int(m.group(1)) if m else 0
+# =================== Mapeamento robusto par/ímpar para o PDF ===================
+def _suffix(n: int) -> str:
+    return "" if n == 0 else f"_{n}"
 
-def grid_prefix(nm:str) -> str:
-    s = (nm or "").upper()
-    s = s.replace("  "," ")
-    s = s.replace("TRUE COURSE","T CRS").replace("MAG COURSE","M CRS")
-    s = s.replace("COURSE TRUE","T CRS").replace("COURSE MAG","M CRS")
-    return s
+def field_name(base: str, rec_idx: int, is_bottom: bool) -> str:
+    # índice absoluto linear no PDF: topo=0, fundo=1; topo do 2.º=2, fundo=3; etc.
+    k = 2*rec_idx + (1 if is_bottom else 0)
+    return f"{base}{_suffix(k)}"
 
-def build_row_groups(fields_pos: List[dict]) -> List[Tuple[List[dict], List[dict]]]:
-    """Agrupa por sufixo (0..N) e divide cada sufixo em top/bottom pela coordenada Y."""
-    # Considerar só campos da grelha (evita cabeçalhos)
-    KEEP = ("FIX","NAME","NAVAIDS","ALT","T CRS","M CRS","TCRS","MCRS",
-            "T HDG","M HDG","GS","TAS","SPEED","DIST","ETE","ETO","ATO",
-            "ACC","RETO","DIFF","PL B/O","PL_BO","PL BO","EFOB","ACT B/O","AFOB")
-    grid = [f for f in fields_pos if grid_prefix(f["name"]).startswith(KEEP)]
-    by_suf: Dict[int, List[dict]] = {}
-    for f in grid:
-        by_suf.setdefault(suffix_of(f["name"]), []).append(f)
-    rows=[]
-    for suf in sorted(by_suf.keys()):
-        fs = by_suf[suf]
-        # preparar centros
-        for f in fs:
-            x0,y0,x1,y1 = f["rect"]; f["xc"]=(x0+x1)/2.0; f["yc"]=(y0+y1)/2.0
-        # split por Y (top vs bottom)
-        ys = sorted(f["yc"] for f in fs)
-        if not ys: 
-            continue
-        ymid = (ys[0]+ys[-1])/2.0
-        top = [f for f in fs if f["yc"] >= ymid]
-        bot = [f for f in fs if f["yc"] <  ymid]
-        # ordenar por X
-        top.sort(key=lambda z: z["xc"]); bot.sort(key=lambda z: z["xc"])
-        rows.append((top, bot))
-    return rows
-
-def put_if_exists(out: dict, fieldset:set, maxlens:Dict[str,int], fields_list: List[dict], idx: int, value: str):
-    if 0 <= idx < len(fields_list):
-        put(out, fieldset, fields_list[idx]["name"], value, maxlens)
+def put_rec(out, fieldset, maxlens, rec_idx: int, colmap: Dict[str, Tuple[Optional[str], Optional[str]]], values: Dict[str,str]):
+    for key, (top_base, bot_base) in colmap.items():
+        val = values.get(key, "")
+        if top_base is not None:
+            nm = field_name(top_base, rec_idx, is_bottom=False)
+            if nm in fieldset: put(out, fieldset, nm, val, maxlens)
+        if bot_base is not None:
+            nm = field_name(bot_base, rec_idx, is_bottom=True)
+            if nm in fieldset: put(out, fieldset, nm, val, maxlens)
 
 # =================== PDF export ===================
 st.markdown("### PDF export (só PDF)")
@@ -635,10 +652,10 @@ else:
         fieldset, maxlens, fields_pos = set(), {}, []
 
     if show_debug and fields_pos:
-        st.write(f"Campos: {len(fieldset)} | c/ posição: {len(fields_pos)}")
-        st.write("Ex.:", sorted(list(fieldset))[:15])
+        st.write(f"Campos encontrados: {len(fieldset)}")
+        st.write("Alguns nomes:", sorted(list(fieldset))[:20])
 
-    if fieldset and fields_pos:
+    if fieldset:
         named: Dict[str,str] = {}
 
         # ===== Cabeçalho (se existirem) =====
@@ -656,7 +673,7 @@ else:
             put(named, fieldset, k, v, maxlens)
 
         # ===== Construir itens por ponto (DEP + chegadas) =====
-        def build_pdf_items(points):
+        def build_pdf_items(points, required_alt_ft):
             items=[]
             acc_dist = 0.0
             acc_time = 0
@@ -664,9 +681,11 @@ else:
                 is_seg = (idx>0)
                 if is_seg and isinstance(p["dist"], (int,float)): acc_dist += float(p["dist"])
                 if is_seg: acc_time += int(p["ete"] or 0)
+                # usar ALT REQ no PDF (se existir); fallback para ALT calculada do segmento
+                alt_req = required_alt_ft[idx] if idx < len(required_alt_ft) and required_alt_ft[idx] < 1e9 else p["alt"]
                 it = {
                     "Name": p["name"],
-                    "Alt": fmt(p["alt"], 'alt') if p["alt"]!="" else "",
+                    "Alt": fmt(alt_req, 'alt') if alt_req!="" else "",
                     "TC":  (fmt(p["tc"], 'angle') if is_seg else ""),
                     "MH":  (fmt(p["mh"], 'angle') if is_seg else ""),
                     "GS":  (fmt(p["gs"], 'speed') if is_seg else ""),
@@ -682,37 +701,48 @@ else:
                 items.append(it)
             return items
 
-        pdf_items = build_pdf_items(seq_points)
+        pdf_items = build_pdf_items(seq_points, required_alt)
 
-        # ===== Agrupar linhas por sufixo e preencher por posição =====
-        row_pairs = build_row_groups(fields_pos)
-        use_rows = min(len(pdf_items), len(row_pairs))
+        # ===== Colmap: nomes internos do PDF (linha de cima vs linha de baixo) =====
+        colmap = {
+            "FIX": ("FIX", None),
+            "NAVAIDS_IDENT": ("NAVAIDS", None),
+            "NAVAIDS_FREQ": (None, "NAVAIDS"),
+            "ALT": ("ALT", None),
+            "TC_TRUE": ("T CRS", None),     # topo: T CRS
+            "MH_MAG": (None, "M CRS"),      # baixo: M CRS (mostrado como M HDG)
+            "GS": ("GS", None),
+            "TAS": (None, "SPEED"),         # baixo: SPEED_odd ≈ TAS
+            "DIST_LEG": ("DIST", None),
+            "DIST_ACC": (None, "DIST"),
+            "ETE": ("ETE", None),
+            "ACC_TIME": (None, "ETE"),
+            "ETO": ("ETO", None),
+            "PL_BO": ("Pl B/O", None),
+            "EFOB": ("EFOB", None),
+        }
+
+        use_rows = min(len(pdf_items), len(st.session_state.navaids))
         for i in range(use_rows):
-            top, bot = row_pairs[i]
-            item = pdf_items[i]
-
-            # TOP (ordem fixa por coluna): [FIX, NAVAIDS(IDENT), ALT, T CRS, M CRS, GS, DIST(LEG), ETE, ETO, ATO, Pl B/O, EFOB]
-            put_if_exists(named, fieldset, maxlens, top, 0, item["Name"])
-            put_if_exists(named, fieldset, maxlens, top, 1, st.session_state.navaids[i]["IDENT"] if i < len(st.session_state.navaids) else "")
-            put_if_exists(named, fieldset, maxlens, top, 2, item["Alt"])
-            put_if_exists(named, fieldset, maxlens, top, 3, item["TC"])
-            put_if_exists(named, fieldset, maxlens, top, 4, item["MH"])
-            put_if_exists(named, fieldset, maxlens, top, 5, item["GS"])
-            put_if_exists(named, fieldset, maxlens, top, 6, item["Dist_leg"])
-            put_if_exists(named, fieldset, maxlens, top, 7, item["ETE"])
-            put_if_exists(named, fieldset, maxlens, top, 8, item["ETO"])
-            # ATO (top[9]) deixamos vazio
-            put_if_exists(named, fieldset, maxlens, top,10, item["Burn"])
-            put_if_exists(named, fieldset, maxlens, top,11, item["EFOB"])
-
-            # BOTTOM (ordem por coluna): [LAT/LONG(vazio), NAVAIDS(FREQ), FL(vazio), T HDG, M HDG, TAS, DIST(ACC), TIME(ACC), RETO, DIFF, Act B/O, AFOB]
-            put_if_exists(named, fieldset, maxlens, bot, 1, st.session_state.navaids[i]["FREQ"] if i < len(st.session_state.navaids) else "")
-            put_if_exists(named, fieldset, maxlens, bot, 3, item["TC"] if item["TC"]!="" else "")  # T HDG ~ TH TRUE (aceitam TC/TH conforme template)
-            put_if_exists(named, fieldset, maxlens, bot, 4, item["MH"])
-            put_if_exists(named, fieldset, maxlens, bot, 5, item["TAS"])
-            put_if_exists(named, fieldset, maxlens, bot, 6, item["Dist_acc"])
-            put_if_exists(named, fieldset, maxlens, bot, 7, item["ACC_time"])
-            # RETO/DIFF/Act B/O/AFOB ficam em branco
+            it = pdf_items[i]
+            values = {
+                "FIX": it["Name"],
+                "NAVAIDS_IDENT": st.session_state.navaids[i]["IDENT"] if i < len(st.session_state.navaids) else "",
+                "NAVAIDS_FREQ":  st.session_state.navaids[i]["FREQ"]  if i < len(st.session_state.navaids) else "",
+                "ALT": it["Alt"],
+                "TC_TRUE": it["TC"],
+                "MH_MAG": it["MH"],
+                "GS": it["GS"],
+                "TAS": it["TAS"],
+                "DIST_LEG": it["Dist_leg"],
+                "DIST_ACC": it["Dist_acc"],
+                "ETE": it["ETE"],
+                "ACC_TIME": it["ACC_time"],
+                "ETO": it["ETO"],
+                "PL_BO": it["Burn"],
+                "EFOB": it["EFOB"],
+            }
+            put_rec(named, fieldset, maxlens, i, colmap, values)
 
         # Totais e tempos finais (se existirem campos)
         last_eto = pdf_items[-1]["ETO"] if pdf_items else ""
@@ -727,7 +757,6 @@ else:
         if st.button("Gerar PDF preenchido", type="primary"):
             try:
                 pdf_bytes_out = fill_pdf(template_bytes, named)
-                # Nome do ficheiro — pelo número da Lesson
                 m = re.search(r'(\d+)', lesson or "")
                 lesson_num = m.group(1) if m else "00"
                 safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
@@ -752,7 +781,6 @@ def build_report_pdf(calc_rows: List[List], details: List[str], params: Dict[str
     story.append(Paragraph("NAVLOG — Relatório (Planeado)", H1))
     story.append(Spacer(1,6))
 
-    # Resumo do voo
     resume = [
         ["Aeronave", params.get("aircraft","—")],
         ["Matrícula", params.get("registration","—")],
