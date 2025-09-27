@@ -1,5 +1,4 @@
-
-# app.py — NAVLOG (PDF + Relatório) — ETE arredondado a 10 s; Wind Alt / ISA dev no PDF
+# app.py — NAVLOG (PDF + Relatório)
 # Regras (display):
 #   Dist 0.1 nm; Tempo arredondado ↑ ao próximo múltiplo de 10 s (ETE em mm:ss; totais em HH:MM:SS);
 #   Fuel 0.5 L; TAS/GS/FF/ângulos 1;
@@ -87,10 +86,10 @@ def ascii_safe(x: str) -> str:
 def parse_hhmm(s:str):
     s=(s or "").strip()
     for fmt in ("%H:%M:%S","%H:%M","%H%M"):
-        try: 
+        try:
             t = dt.datetime.strptime(s,fmt).time()
             return t
-        except: 
+        except:
             pass
     return None
 
@@ -287,7 +286,7 @@ with st.form("hdr"):
             rod_fpm = st.number_input("ROD (ft/min)", 200, 1500, 700, step=10)
             start_fuel = st.number_input("Fuel inicial (EFOB_START) [L]", 0.0, 1000.0, 85.0, step=0.1)
         st.markdown("---")
-        use_navaids = st.checkbox("Usar NAVAIDs (tabela + PDF)", value=False)  # default OFF
+        use_navaids = st.checkbox("Usar NAVAIDs no PDF", value=False)  # default OFF; colunas ficam sempre visíveis
         cruise_ref_kt  = st.number_input("Cruise speed (kt)", 40, 140, 90, step=1)
         descent_ref_kt = st.number_input("Descent speed (kt)", 40, 120, 65, step=1)
 
@@ -334,7 +333,7 @@ def make_default_plan_rows(points: List[str], cruise_alt:int) -> List[dict]:
             "TC": 0.0,
             "Dist": 0.0,
             "ALT_to_ft": float(arr_elev if to_is_last else _round_alt(cruise_alt)),
-            # Navaids (por To)
+            # Navaids (por To) — sempre visíveis
             "UseNavaid": False,
             "Navaid_IDENT": "",
             "Navaid_FREQ": "",
@@ -370,23 +369,17 @@ tab_plan, tab_results, tab_pdf, tab_report = st.tabs(["📝 Planeamento", "📊 
 
 with tab_plan:
     st.markdown("### Planeamento")
-    base_cfg = {
+    column_config = {
         "From": st.column_config.TextColumn("From", disabled=True),
         "To":   st.column_config.TextColumn("To", disabled=True),
         "TC":   st.column_config.NumberColumn("TC (°T)", step=0.1, min_value=0.0, max_value=359.9),
         "Dist": st.column_config.NumberColumn("Dist (nm)", step=0.1, min_value=0.0),
         "ALT_to_ft": st.column_config.NumberColumn("ALT alvo no To (ft)", step=50, min_value=0.0),
-    }
-    nav_cfg = {
         "UseNavaid": st.column_config.CheckboxColumn("Usar navaid?"),
         "Navaid_IDENT": st.column_config.TextColumn("Navaid IDENT"),
         "Navaid_FREQ":  st.column_config.TextColumn("Navaid FREQ"),
     }
-    cols = list(base_cfg.keys())
-    column_config = base_cfg.copy()
-    if use_navaids:
-        column_config |= nav_cfg
-        cols += list(nav_cfg.keys())
+    cols = list(column_config.keys())
 
     with st.form("plan_form"):
         plan_edit = st.data_editor(
@@ -436,7 +429,7 @@ alt_targets = [start_alt] + [float(legs[i].get("ALT_to_ft", arr_elev if i==N-1 e
 
 front_used_dist = [0.0]*N
 back_used_dist  = [0.0]*N
-climb_time_alloc   = [0.0]*N  # minutos “contínuos” (não arredondados) para cálculo de climb fuel
+climb_time_alloc   = [0.0]*N  # minutos contínuos para cálculo de climb fuel
 descent_time_alloc = [0.0]*N
 impossible_notes = []
 toc_markers = []; tod_markers = []
@@ -505,22 +498,22 @@ def add_seg(phase, frm, to, i_leg, d_nm, tas, ff_lph, alt_start_ft, rate_fpm, wd
     wca, th, gs = wind_triangle(tc, tas, wdir, wkt)
     mc = apply_var(tc, var_deg, var_is_e); mh = apply_var(th, var_deg, var_is_e)
 
-    # ETE: calcular em segundos e arredondar ↑ a 10 s
-    ete_min_raw = 60.0 * d_nm / max(gs,1e-6)          # minutos (contínuo)
-    ete_sec_raw = ete_min_raw * 60.0                  # segundos
-    ete_sec     = ceil_to_10s(ete_sec_raw)            # arredondado a 10 s
+    # ETE: em segundos, arred. a 10 s
+    ete_min_raw = 60.0 * d_nm / max(gs,1e-6)      # minutos (contínuo)
+    ete_sec_raw = ete_min_raw * 60.0              # segundos
+    ete_sec     = ceil_to_10s(ete_sec_raw)        # arredondado a 10 s
     ete_disp    = mmss_from_seconds(ete_sec)
 
-    # Fuel com o tempo contínuo em horas; arredondamento só no display (0.5 L)
+    # Fuel com tempo contínuo (antes do arred.)
     burn_raw = ff_lph * (ete_sec_raw / 3600.0)
     burn = _round_half(burn_raw)
 
-    # Altitude com tempo contínuo (em minutos)
+    # Altitude com tempo contínuo
     if phase == "CLIMB":   alt_end_ft = alt_start_ft + rate_fpm * (ete_sec_raw/60.0)
     elif phase == "DESCENT": alt_end_ft = alt_start_ft - rate_fpm * (ete_sec_raw/60.0)
     else: alt_end_ft = alt_start_ft
 
-    # ETO: adiciona ete_sec ao relógio; mostra HH:MM
+    # ETO HH:MM
     eto = ""
     if clock:
         clock = add_seconds(clock, ete_sec)
@@ -646,7 +639,7 @@ with tab_pdf:
 
     if fieldset:
         etd = (add_seconds(parse_hhmm(startup_str), 15*60).strftime("%H:%M") if startup_str else "")
-        # Cabeçalho (+ campos extra/aliases)
+        # Cabeçalho (+ campos exatos/aliases razoáveis)
         H(["AIRCRAFT"], aircraft)
         H(["REGISTRATION"], registration)
         H(["CALLSIGN"], callsign)
@@ -659,41 +652,35 @@ with tab_pdf:
         H(["INSTRUTOR","INSTRUCTOR"], instrutor)
         H(["STUDENT"], student)
 
-        # Tempo total (HH:MM a partir dos segundos somados)
         tot_ete_sec = sum(int(p.get('ete_sec',0)) for p in seq_points if isinstance(p.get('ete_sec'), (int,float)))
         H(["FLT TIME","FLIGHT TIME","TOTAL FLT TIME"], f"{(tot_ete_sec//3600):02d}:{((tot_ete_sec%3600)//60):02d}")
 
-        # Flight Level / Wind altitude: usar altitude de cruzeiro arredondada
-        H(["LEVEL F/F","LEVEL F F","FLIGHT LEVEL / ALTITUDE","WIND ALT","WIND ALTITUDE","WIND_LEVEL","Wind_Altitude","Wind FL"],
-          fmt(cruise_alt,'alt'))
+        # Wind altitude / Level — usar altitude de cruzeiro arredondada
+        H(["LEVEL F/F","FLIGHT LEVEL / ALTITUDE","WIND ALT","WIND ALTITUDE"], fmt(cruise_alt,'alt'))
 
-        # Climb fuel (usando tempo contínuo alocado a climb)
+        # Climb fuel (tempo contínuo)
         H(["CLIMB FUEL","CLIMB_FUEL"], fmt((sum(climb_time_alloc)/60.0*ff_climb),'fuel'))
 
-        # QNH / Frequências
         H(["QNH"], str(int(round(qnh))))
         H(["DEPT","DEPARTURE FREQ"], aero_freq(points[0]))
         H(["ENROUTE","EN-ROUTE"], "123.755")
         H(["ARRIVAL","ARRIVAL FREQ"], aero_freq(points[-1]))
 
         # Alternate + elevação arredondada
-        H(["Alternate_Airfield","ALTN","ALTERNATE"], altn)
-        H(["Alternate_Elevation","Alt_Alternate","ALTN_ELEV","ALTERNATE_ELEVATION","TextField_7"], fmt(altn_elev,'alt'))
+        H(["Alternate_Airfield"], altn)
+        H(["Alternate_Elevation","TextField_7"], fmt(altn_elev,'alt'))
         H(["ALTN_FREQ","Alternate_Freq","Alternate Frequency"], aero_freq(altn))
 
-        # Campos de vento e ISA dev (aliases comuns)
-        H(["WIND","WIND INFO","WIND_INFO"], f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}")
+        # Wind FROM + MAG VAR + OAT / ISA DEV
+        H(["WIND"], f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}")
         isa_dev = int(round(temp_c - isa_temp(pressure_alt(dep_elev, qnh))))
-        H(["TEMP / ISA DEV","TEMP / ISA DEV.","TEMP ISA DEV","OAT / ISA DEV","OAT & ISA DEV"], f"{int(round(temp_c))} / {isa_dev}")
-        # Se o template tiver campos separados:
-        H(["OAT","TEMP","OAT (°C)"], str(int(round(temp_c))))
-        H(["ISA DEV","ISA_DEV","ISA DEVIATION","ISA Deviation"], str(isa_dev))
+        H(["TEMP / ISA DEV"], f"{int(round(temp_c))} / {isa_dev}")
+        H(["MAG  VAR","MAG VAR","MAGVAR"], f"{int(round(var_deg))}{'E' if var_is_e else 'W'}")
 
         H(["CLEARANCES"], "")
         H(["Departure_Airfield"], points[0])
         H(["Arrival_Airfield"], points[-1])
         H(["Leg_Number"], str(len(seq_points)))
-        H(["MAG  VAR","MAG VAR","MAGVAR"], f"{int(round(var_deg))}{'E' if var_is_e else 'W'}")
 
         # Linhas
         acc_dist = 0.0
@@ -718,18 +705,17 @@ with tab_pdf:
                 acc_dist += float(p["dist"] or 0.0)
                 acc_sec  += int(p.get("ete_sec",0) or 0)
                 H([tag+"True_Course"],      fmt(p["tc"], 'angle'))
-                H([tag+"Magnetic_Course"],  fmt(p["mc"], 'angle'))
-                H([tag+"Ground_Speed"],     fmt(p["gs"], 'speed'))
-                H([tag+"Leg_Distance"],     fmt(p["dist"], 'dist'))
-                H([tag+"Leg_ETE","Leg_ETE_mmss","ETE"],  mmss_from_seconds(int(p.get("ete_sec",0))))
-                H([tag+"ETO"],              p["eto"])
-                H([tag+"Planned_Burnoff"],  fmt(p["burn"], 'fuel'))
-                H([tag+"Estimated_FOB"],    fmt(p["efob"], 'fuel'))
                 H([tag+"True_Heading"],     fmt(p["th"], 'angle'))
                 H([tag+"Magnetic_Heading"], fmt(p["mh"], 'angle'))
                 H([tag+"True_Airspeed"],    fmt(p["tas"], 'speed'))
+                H([tag+"Ground_Speed"],     fmt(p["gs"], 'speed'))
+                H([tag+"Leg_Distance"],     fmt(p["dist"], 'dist'))
+                H([tag+"Leg_ETE"],          mmss_from_seconds(int(p.get("ete_sec",0))))
+                H([tag+"ETO"],              p["eto"])
+                H([tag+"Planned_Burnoff"],  fmt(p["burn"], 'fuel'))
+                H([tag+"Estimated_FOB"],    fmt(p["efob"], 'fuel'))
                 H([tag+"Cumulative_Distance"], fmt(acc_dist,'dist'))
-                H([tag+"Cumulative_ETE","Cumulative_ETE_mmss"], mmss_from_seconds(acc_sec))
+                H([tag+"Cumulative_ETE"],      mmss_from_seconds(acc_sec))
             else:
                 H([tag+"ETO"], p["eto"])
                 H([tag+"Estimated_FOB"], fmt(p["efob"], 'fuel'))
