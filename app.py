@@ -1,6 +1,8 @@
 # app.py — NAVLOG (PDF + Relatório)
 # - UI limpa com forms (inputs não desaparecem)
-# - Tabela única por perna (From→To), vento geral opcional OU vento por waypoint
+# - Tabela única por perna (From→To), com toggles:
+#     • Usar vento geral (FROM). Se ON: sem colunas de vento na tabela; se OFF: vento FROM por waypoint.
+#     • Usar navaids. Se OFF: sem colunas de navaids; se ON: editar por waypoint.
 # - Altitudes-alvo por waypoint (default: DEP/ARR=elevação exata; interm=cruise; ALTN no cabeçalho)
 # - TOC/TOD corretos dentro das pernas
 # - Import/Export JSON v2 (rota, TCs/Dist, ALT targets) apenas
@@ -156,6 +158,7 @@ def vy_interp_enroute(pa):
 
 # ====== Wind / variation ======
 def wind_triangle(tc_deg: float, tas_kt: float, wind_from_deg: float, wind_kt: float):
+    # vento FROM (padrão). Fórmula usa FROM diretamente.
     if tas_kt <= 0: return 0.0, wrap360(tc_deg), 0.0
     delta = radians(angle_diff(wind_from_deg, tc_deg))
     cross = wind_kt * sin(delta)
@@ -260,8 +263,8 @@ with st.form("hdr"):
         var_deg = st.number_input("Mag Variation (°)", 0, 30, 1, step=1)
         var_is_e = (st.selectbox("Variação E/W", ["W","E"], index=0)=="E")
     with c6:
-        # Toggle de vento geral
-        use_global_wind = st.checkbox("Usar vento geral", value=True)
+        # Toggles
+        use_global_wind = st.checkbox("Usar vento geral (FROM)", value=True)
         wind_from_global = st.number_input("Wind FROM (°TRUE)", 0, 360, 0, step=1, disabled=not use_global_wind)
         wind_kt_global   = st.number_input("Wind (kt)", 0, 120, 17, step=1, disabled=not use_global_wind)
     c7,c8,c9 = st.columns(3)
@@ -273,6 +276,9 @@ with st.form("hdr"):
     with c9:
         rod_fpm = st.number_input("ROD (ft/min)", 200, 1500, 700, step=10)
         start_fuel = st.number_input("Fuel inicial (EFOB_START) [L]", 0.0, 1000.0, 85.0, step=0.1)
+
+    st.markdown("##### Opções avançadas")
+    use_navaids = st.checkbox("Usar navaids", value=True)
     cruise_ref_kt  = st.number_input("Cruise speed (kt)", 40, 140, 90, step=1)
     descent_ref_kt = st.number_input("Descent speed (kt)", 40, 120, 65, step=1)
 
@@ -304,14 +310,16 @@ if hdr_submit:
     if len(pts)>=2: pts[-1]=arr
     st.session_state.points = pts
     st.session_state["use_global_wind"] = use_global_wind
+    st.session_state["use_navaids"] = use_navaids
 
 points = st.session_state.points
-use_global_wind = st.session_state.get("use_global_wind", True) if "use_global_wind" in st.session_state else True
+use_global_wind = st.session_state.get("use_global_wind", True)
+use_navaids = st.session_state.get("use_navaids", True)
 
 # ====== Tabela única de planeamento ======
-def make_default_plan_rows(points: List[str], cruise_alt:int, wind_dir:int, wind_kt:int, use_global:bool) -> List[dict]:
+def make_default_plan_rows(points: List[str], cruise_alt:int, wind_dir:int, wind_kt:int) -> List[dict]:
     rows=[]
-    dep_elev=aero_elev(points[0]); arr_elev=aero_elev(points[-1])
+    arr_elev=aero_elev(points[-1])
     for i in range(1,len(points)):
         to_is_last = (i == len(points)-1)
         rows.append({
@@ -320,16 +328,17 @@ def make_default_plan_rows(points: List[str], cruise_alt:int, wind_dir:int, wind
             "TC": 0.0,
             "Dist": 0.0,
             "ALT_to_ft": float(arr_elev if to_is_last else cruise_alt),
-            # vento por waypoint (To): se usar global, guardo também (para manter estrutura), mas não mostro
-            "Wind_TO_deg": int(wind_dir),
-            "Wind_TO_kt":  int(wind_kt),
+            # vento por waypoint (To) — FROM (só usado se toggle desativar “vento geral”)
+            "Wind_FROM_deg": int(wind_dir),
+            "Wind_FROM_kt":  int(wind_kt),
+            # navaids por waypoint (To) — só usados se toggle navaids ON
             "UseNavaid": False,
             "Navaid_IDENT": "",
             "Navaid_FREQ": "",
         })
     return rows
 
-def preserve_merge(old: List[dict], new_points: List[str], cruise_alt:int, wdir:int, wkt:int, use_global:bool) -> List[dict]:
+def preserve_merge(old: List[dict], new_points: List[str], cruise_alt:int, wdir:int, wkt:int) -> List[dict]:
     idx = {(r.get("From"), r.get("To")): r for r in old}
     merged=[]
     arr_elev=aero_elev(new_points[-1])
@@ -342,8 +351,8 @@ def preserve_merge(old: List[dict], new_points: List[str], cruise_alt:int, wdir:
             "TC": float(base.get("TC", 0.0)),
             "Dist": float(base.get("Dist", 0.0)),
             "ALT_to_ft": float(base.get("ALT_to_ft", (arr_elev if to_is_last else cruise_alt))),
-            "Wind_TO_deg": int(base.get("Wind_TO_deg", wdir)),
-            "Wind_TO_kt":  int(base.get("Wind_TO_kt",  wkt)),
+            "Wind_FROM_deg": int(base.get("Wind_FROM_deg", wdir)),
+            "Wind_FROM_kt":  int(base.get("Wind_FROM_kt",  wkt)),
             "UseNavaid": bool(base.get("UseNavaid", False)),
             "Navaid_IDENT": base.get("Navaid_IDENT",""),
             "Navaid_FREQ":  base.get("Navaid_FREQ",""),
@@ -352,27 +361,30 @@ def preserve_merge(old: List[dict], new_points: List[str], cruise_alt:int, wdir:
 
 if "plan_rows" not in st.session_state or hdr_submit:
     if "plan_rows" in st.session_state:
-        st.session_state.plan_rows = preserve_merge(st.session_state.plan_rows, points, cruise_alt, wind_from_global, wind_kt_global, use_global_wind)
+        st.session_state.plan_rows = preserve_merge(st.session_state.plan_rows, points, cruise_alt, wind_from_global, wind_kt_global)
     else:
-        st.session_state.plan_rows = make_default_plan_rows(points, cruise_alt, wind_from_global, wind_kt_global, use_global_wind)
+        st.session_state.plan_rows = make_default_plan_rows(points, cruise_alt, wind_from_global, wind_kt_global)
 
 st.markdown("### Planeamento (uma só tabela)")
-# Config de colunas (vento por waypoint só se toggle OFF)
 base_cfg = {
     "From": st.column_config.TextColumn("From", disabled=True),
     "To":   st.column_config.TextColumn("To", disabled=True),
     "TC":   st.column_config.NumberColumn("TC (°T)", step=0.1, min_value=0.0, max_value=359.9),
     "Dist": st.column_config.NumberColumn("Dist (nm)", step=0.1, min_value=0.0),
     "ALT_to_ft": st.column_config.NumberColumn("ALT alvo no To (ft)", step=50, min_value=0.0),
+}
+wind_cfg = {
+    "Wind_FROM_deg": st.column_config.NumberColumn("Wind FROM Dir (°T)", step=1, min_value=0, max_value=360),
+    "Wind_FROM_kt":  st.column_config.NumberColumn("Wind FROM (kt)", step=1, min_value=0, max_value=200),
+}
+nav_cfg = {
     "UseNavaid": st.column_config.CheckboxColumn("Usar navaid?"),
     "Navaid_IDENT": st.column_config.TextColumn("Navaid IDENT"),
     "Navaid_FREQ":  st.column_config.TextColumn("Navaid FREQ"),
 }
-wind_cfg = {
-    "Wind_TO_deg": st.column_config.NumberColumn("Wind_TO Dir (°T)", step=1, min_value=0, max_value=360),
-    "Wind_TO_kt":  st.column_config.NumberColumn("Wind_TO (kt)", step=1, min_value=0, max_value=200),
-}
-column_config = (base_cfg | wind_cfg) if not use_global_wind else base_cfg
+column_config = base_cfg.copy()
+if not use_global_wind: column_config |= wind_cfg
+if use_navaids: column_config |= nav_cfg
 
 with st.form("plan_form"):
     plan_edit = st.data_editor(
@@ -389,7 +401,8 @@ N = len(legs)
 
 # ====== Import / Export JSON v2 ======
 def export_json_v2():
-    dep_elev=aero_elev(points[0]); arr_elev=aero_elev(points[-1])
+    dep = points[0]; arrp = points[-1]
+    dep_elev=aero_elev(dep); arr_elev=aero_elev(arrp)
     alt_targets = [float(dep_elev)] + [float(legs[i].get("ALT_to_ft", arr_elev if i==N-1 else cruise_alt)) for i in range(N)]
     data = {
         "version": 2,
@@ -400,8 +413,9 @@ def export_json_v2():
     return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
 if export_now:
+    dep = ascii_safe(points[0]); arrp = ascii_safe(points[-1])
     st.download_button("💾 Download rota (JSON v2)", data=export_json_v2(),
-                       file_name=f"route_{ascii_safe(registration)}.json", mime="application/json")
+                       file_name=f"route_{dep}_{arrp}.json", mime="application/json")
 
 if uploaded is not None and not hdr_submit and not export_now:
     try:
@@ -413,7 +427,7 @@ if uploaded is not None and not hdr_submit and not export_now:
         st.session_state.points = pts
 
         # rebuild rows
-        new_rows = make_default_plan_rows(st.session_state.points, cruise_alt, wind_from_global, wind_kt_global, use_global_wind)
+        new_rows = make_default_plan_rows(st.session_state.points, cruise_alt, wind_from_global, wind_kt_global)
         L = len(new_rows)
         legs_in = data.get("legs") or []
         for i in range(min(L, len(legs_in))):
@@ -447,26 +461,25 @@ _, ff_climb  = cruise_lookup(pa_mid_climb, int(rpm_climb),  temp_c)
 _, ff_cruise = cruise_lookup(pa_cruise,   int(rpm_cruise),  temp_c)
 ff_descent   = float(descent_ff)
 
-# Ventos por waypoint
+# Ventos por waypoint: lista de len(points), sempre FROM
 wp_winds = []
 if use_global_wind:
-    # global em todos
     for _ in range(len(points)):
         wp_winds.append({"from_deg": int(wind_from_global), "kt": int(wind_kt_global)})
 else:
-    # wp0 = global como fallback; restantes da tabela (To de cada perna)
-    wp_winds.append({"from_deg": int(wind_from_global), "kt": int(wind_kt_global)})
-    for i in range(N):
-        wp_winds.append({
-            "from_deg": int(legs[i].get("Wind_TO_deg", wind_from_global)),
-            "kt":       int(legs[i].get("Wind_TO_kt",  wind_kt_global)),
-        })
-    # garantir tamanho
-    if len(wp_winds) > len(points): wp_winds = wp_winds[:len(points)]
-    while len(wp_winds) < len(points): wp_winds.append({"from_deg": int(wind_from_global), "kt": int(wind_kt_global)})
+    for j in range(len(points)):
+        if j == 0:
+            wp_winds.append({"from_deg": int(wind_from_global), "kt": int(wind_kt_global)})  # fallback no DEP
+        else:
+            leg = legs[j-1]
+            wp_winds.append({
+                "from_deg": int(leg.get("Wind_FROM_deg", wind_from_global)),
+                "kt":       int(leg.get("Wind_FROM_kt",  wind_kt_global)),
+            })
 
 def wind_vec_from(dir_from_deg:int, kt:int) -> Tuple[float,float]:
-    th = radians((dir_from_deg + 180) % 360)  # sopro
+    # vetor de sopro (para GS)
+    th = radians((dir_from_deg + 180) % 360)
     u = kt * math.sin(th)  # leste
     v = kt * math.cos(th)  # norte
     return (u,v)
@@ -479,7 +492,6 @@ def vec_to_from(u:float,v:float) -> Tuple[float,float]:
     return (th_from, speed)
 
 def leg_wind(j_from:int, j_to:int) -> Tuple[float,float]:
-    # média vetorial From/To
     u1,v1 = wind_vec_from(wp_winds[j_from]["from_deg"], wp_winds[j_from]["kt"])
     u2,v2 = wind_vec_from(wp_winds[j_to]["from_deg"],   wp_winds[j_to]["kt"])
     u=(u1+u2)/2.0; v=(v1+v2)/2.0
@@ -492,7 +504,7 @@ tcs  = [float(legs[i]["TC"]   or 0.0) for i in range(N)]
 # Alt targets [DEP] + ALT_to (To de cada perna)
 alt_targets = [start_alt] + [float(legs[i].get("ALT_to_ft", arr_elev if i==N-1 else cruise_alt)) for i in range(N)]
 
-# Alocação climb/descent (para trás)
+# Alocação climb/descent
 front_used_dist = [0.0]*N
 back_used_dist  = [0.0]*N
 climb_time_alloc   = [0.0]*N
@@ -554,7 +566,7 @@ calc_rows=[]; calc_details=[]
 PH_ICON = {"CLIMB":"↑","CRUISE":"→","DESCENT":"↓"}
 efob=float(start_fuel)
 
-# DEP
+# DEP (elevação sem arredondar no relatório/PDF cabeçalho; aqui seguimos regra de display para célula alt)
 seq_points.append({"name": points[0], "alt": _round_alt(alt_targets[0]),
                    "tc":"", "th":"", "mc":"", "mh":"", "tas":"", "gs":"", "dist":"",
                    "ete":"", "eto": (takeoff.strftime("%H:%M") if takeoff else ""),
@@ -622,6 +634,10 @@ cur_alt = alt_targets[0]
 for i in range(N):
     frm, to = legs[i]["From"], legs[i]["To"]
     d_total  = dist[i]
+    d_cl = 0.0
+    d_ds = 0.0
+    # quanto de climb/descent foi alocado nesta perna
+    # (front_used_dist / back_used_dist foram calculados por tempo; converter em dist)
     d_cl = front_used_dist[i]
     d_ds = back_used_dist[i]
     d_cr = max(0.0, d_total - d_cl - d_ds)
@@ -692,7 +708,7 @@ def H(names, v): put_any(named, fieldset, maxlens, names, v)
 
 if fieldset:
     etd = (add_minutes(parse_hhmm(startup_str),15).strftime("%H:%M") if startup_str else "")
-    # Cabeçalho (elevs SEM arredondar)
+    # Cabeçalho (elevações sem arredondar)
     H(["AIRCRAFT"], aircraft)
     H(["REGISTRATION"], registration)
     H(["CALLSIGN"], callsign)
@@ -711,15 +727,19 @@ if fieldset:
     H(["DEPT","DEPARTURE FREQ"], aero_freq(points[0]))
     H(["ENROUTE","EN-ROUTE"], "123.755")
     H(["ARRIVAL","ARRIVAL FREQ"], aero_freq(points[-1]))
-    # Alternate completo (elevação SEM arredondar)
+    # Alternate completo — elevação SEM arredondar
     H(["Alternate_Airfield","ALTN","ALTERNATE"], altn)
+    # campo explicitamente pedido:
+    H(["TextField_7"], str(altn_elev))
+    # manter compat com outros nomes se existirem
     H(["Alt_Alternate","ALTN_ELEV","ALTERNATE_ELEVATION"], str(altn_elev))
     H(["ALTN_FREQ","Alternate_Freq","Alternate Frequency"], aero_freq(altn))
     H(["CLEARANCES"], "")
     H(["Departure_Airfield"], points[0])
     H(["Arrival_Airfield"], points[-1])
     H(["Leg_Number"], str(len(seq_points)))
-    H(["WIND"], f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}")
+    # string WIND (FROM)
+    H(["WIND"], f"{int(round(wp_winds[0]['from_deg'])):03d}/{int(round(wp_winds[0]['kt'])):02d}")
     H(["MAG  VAR","MAG VAR","MAGVAR"], f"{int(round(var_deg))}{'E' if var_is_e else 'W'}")
     H(["TEMP / ISA DEV","TEMP / ISA DEV.","TEMP ISA DEV"], f"{int(round(temp_c))} / {int(round(temp_c - isa_temp(pressure_alt(aero_elev(points[0]), qnh))))}")
 
@@ -730,7 +750,7 @@ if fieldset:
         tag = f"Leg{idx:02d}_"
         is_seg = (idx>1)
         H([tag+"Waypoint"], p["name"])
-        if is_seg:
+        if is_seg and use_navaids:
             leg = legs[idx-2]
             if leg.get("UseNavaid", False):
                 H([tag+"Navaid_Identifier"], leg.get("Navaid_IDENT",""))
@@ -868,7 +888,7 @@ if st.button("Gerar Relatório (PDF legível)"):
             # Elevações sem arredondar
             "elev_dep": str(dep_elev), "elev_arr": str(arr_elev), "elev_altn": str(altn_elev),
             "qnh": str(int(round(qnh))),
-            "wind": f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}",
+            "wind": f"{int(round(wp_winds[0]['from_deg'])):03d}/{int(round(wp_winds[0]['kt'])):02d}",
             "var": f"{int(round(var_deg))}{'E' if var_is_e else 'W'}",
             "cruise_alt": fmt(cruise_alt,'alt'),
             "temp_isa": f"{int(round(temp_c))} / {int(round(temp_c - isa_temp(pressure_alt(aero_elev(points[0]), qnh))))}",
@@ -888,4 +908,3 @@ if st.button("Gerar Relatório (PDF legível)"):
         st.success("Relatório gerado.")
     except Exception as e:
         st.error(f"Erro ao gerar relatório: {e}")
-
