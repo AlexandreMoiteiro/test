@@ -1,5 +1,4 @@
 
-
 # app.py — NAVLOG (PDF + Relatório legível)
 # - Sem st.rerun(): nada de rebuild extra; usamos apenas o rerun natural do Streamlit
 # - JSON Import/Export ANTES da rota (upload aplica logo)
@@ -379,14 +378,48 @@ def parse_route_text(txt:str) -> List[str]:
     tokens = re.split(r"[,\s→\-]+", (txt or "").strip())
     return [t for t in tokens if t]
 
+# >>> NOVO: helper para reconstruir a tabela mantendo valores existentes
+def rebuild_plan_rows_from_points(points: List[str], existing_rows: Optional[List[dict]], cruise_alt: int) -> List[dict]:
+    """Reconstrói a tabela de legs a partir dos pontos,
+    preservando valores dos pares From→To que já existiam."""
+    if not points or len(points) < 2:
+        return []
+    arr_elev = _round_alt(aero_elev(points[-1]))
+    prev_by_pair = { (r.get("From"), r.get("To")): r for r in (existing_rows or []) }
+    new_rows = []
+    for i in range(1, len(points)):
+        frm, to = points[i-1], points[i]
+        base = {
+            "From": frm, "To": to,
+            "TC": 0.0, "Dist": 0.0,
+            "ALT_to_ft": float(arr_elev if i == len(points)-1 else _round_alt(cruise_alt)),
+            "UseNavaid": False, "Navaid_IDENT": "", "Navaid_FREQ": "",
+        }
+        prev = prev_by_pair.get((frm, to))
+        if prev:
+            for k in ("TC","Dist","ALT_to_ft","UseNavaid","Navaid_IDENT","Navaid_FREQ"):
+                if k in prev and prev[k] is not None:
+                    base[k] = prev[k]
+        new_rows.append(base)
+    return new_rows
+
 default_route = f"{st.session_state.dept} {st.session_state.arr}"
 route_text = st.text_area("Rota (DEP … ARR)", value=st.session_state.get("route_text", default_route))
+
 if st.button("Aplicar rota"):
     pts = parse_route_text(route_text) or [st.session_state.dept, st.session_state.arr]
+    # força DEP/ARR atuais
     pts[0] = st.session_state.dept
-    if len(pts)>=2: pts[-1] = st.session_state.arr
+    if len(pts) >= 2:
+        pts[-1] = st.session_state.arr
     st.session_state.points = pts
     st.session_state.route_text = " ".join(pts)
+    # >>> reconstrução imediata da tabela, preservando valores existentes
+    st.session_state.plan_rows = rebuild_plan_rows_from_points(
+        pts,
+        st.session_state.get("plan_rows"),
+        st.session_state.cruise_alt,
+    )
     st.success("Rota aplicada.")
 
 # ---------- tabela de planeamento ----------
