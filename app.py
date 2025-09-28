@@ -1,5 +1,8 @@
+
+
 # app.py — NAVLOG (PDF + Relatório legível)
-# - JSON Import/Export ANTES da rota (upload aplica logo) — usa st.rerun()
+# - Sem st.rerun(): nada de rebuild extra; usamos apenas o rerun natural do Streamlit
+# - JSON Import/Export ANTES da rota (upload aplica logo)
 # - PDF robusto (clone_document_from_reader + NeedAppearances)
 # - Campos topo SEM "/": FLIGHT_LEVEL_ALTITUDE, WIND, MAG_VAR, TEMP_ISA_DEV
 # - Arredondamentos: Dist 0.1 nm; Tempo ↑ 10s; Fuel 0.5 L; TAS/GS/FF/ângulos 1; Alt <1000→50, ≥1000→100
@@ -9,7 +12,7 @@
 
 import streamlit as st
 import datetime as dt
-import pytz, io, json, unicodedata, re, math
+import pytz, io, json, unicodedata, re, math, os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from math import sin, asin, radians, degrees, fmod
@@ -185,12 +188,14 @@ def aero_elev(icao): return int(AEROS.get(icao,{}).get("elev",0))
 def aero_freq(icao): return AEROS.get(icao,{}).get("freq","")
 
 # ---------- PDF helpers ----------
-def read_pdf_bytes(paths: List[str]) -> bytes:
+@st.cache_data(show_spinner=False)
+def read_pdf_bytes(paths: Tuple[str, ...]) -> bytes:
     for p in paths:
         if Path(p).exists():
             return Path(p).read_bytes()
     raise FileNotFoundError(paths)
 
+@st.cache_data(show_spinner=False)
 def get_form_fields(template_bytes: bytes):
     reader = PdfReader(io.BytesIO(template_bytes))
     fd = reader.get_fields() or {}
@@ -256,7 +261,7 @@ ensure("descent_ff",15.0); ensure("rod_fpm",700); ensure("start_fuel",85.0)
 ensure("cruise_ref_kt",90); ensure("descent_ref_kt",65)
 ensure("use_navaids",False)
 
-# ------------- Cabeçalho (form simples) -------------
+# ------------- Cabeçalho -------------
 with st.expander("Cabeçalho", expanded=True):
     c1,c2,c3 = st.columns(3)
     with c1:
@@ -366,7 +371,6 @@ with cJ2:
                         new_rows[i]["ALT_to_ft"] = float(at_in[i+1])
                 st.session_state.plan_rows = new_rows
                 st.success("Rota importada e aplicada.")
-                st.rerun()
         except Exception as e:
             st.error(f"Falha a importar JSON: {e}")
 
@@ -383,7 +387,7 @@ if st.button("Aplicar rota"):
     if len(pts)>=2: pts[-1] = st.session_state.arr
     st.session_state.points = pts
     st.session_state.route_text = " ".join(pts)
-    st.rerun()
+    st.success("Rota aplicada.")
 
 # ---------- tabela de planeamento ----------
 def make_default_plan_rows(points: List[str], cruise_alt:int) -> List[dict]:
@@ -510,7 +514,7 @@ startup = parse_hhmm(st.session_state.startup)
 takeoff = add_seconds(startup, 15*60) if startup else None
 clock = takeoff
 
-rows=[]; seq_points=[]; calc_rows=[]; calc_details=[]
+rows=[]; seq_points=[]; calc_details=[]
 PH_ICON = {"CLIMB":"↑","CRUISE":"→","DESCENT":"↓"}
 efob=float(st.session_state.start_fuel)
 
@@ -636,7 +640,7 @@ if impossible_notes: st.warning(" / ".join(impossible_notes))
 # =========================================================
 st.subheader("Gerar PDF NAVLOG")
 try:
-    template_bytes = read_pdf_bytes(PDF_TEMPLATE_PATHS)
+    template_bytes = read_pdf_bytes(tuple(PDF_TEMPLATE_PATHS))
     if not PYPDF_OK: raise RuntimeError("pypdf não disponível")
     fieldset, maxlens = get_form_fields(template_bytes)
 except Exception as e:
@@ -805,4 +809,3 @@ if st.button("Gerar Relatório (PDF)"):
         st.success("Relatório gerado.")
     except Exception as e:
         st.error(f"Erro ao gerar relatório: {e}")
-
