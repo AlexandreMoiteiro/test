@@ -1,3 +1,4 @@
+
 # app.py — NAVLOG (TOC/TOD dinâmicos, altitudes por fix, PDF + Relatório)
 # Reqs: streamlit, pypdf, reportlab, pytz
 
@@ -305,7 +306,8 @@ def export_json_v2():
     pts   = current_points()
     legs  = st.session_state.get("plan_rows") or []
     alts  = st.session_state.get("alt_rows")  or []
-    alt_set  = [ (r.get("Alt_ft") if r.get("Fix") else None) for r in alts ] if alts else [None]*len(pts)
+    alt_set  = [ (r.get("Alt_ft") if r.get("Fix") or i in (0, len(pts)-1) else None)
+                 for i,r in enumerate(alts) ] if alts else [None]*len(pts)
     alt_fix  = [ bool(r.get("Fix", False)) for r in alts ] if alts else [False]*len(pts)
     data = {
         "version": 2,
@@ -333,10 +335,8 @@ with cJ2:
             st.session_state.route_text = " ".join(pts)
             # legs
             def default_plan_rows(points: List[str]) -> List[dict]:
-                rows=[]
-                for i in range(1,len(points)):
-                    rows.append({"From":points[i-1],"To":points[i],"TC":0.0,"Dist":0.0})
-                return rows
+                return [{"From":points[i-1],"To":points[i],"TC":0.0,"Dist":0.0}
+                        for i in range(1,len(points))]
             rows = default_plan_rows(pts)
             legs_in = data.get("legs") or []
             for i in range(min(len(rows), len(legs_in))):
@@ -389,7 +389,6 @@ def rebuild_alt_rows(points: List[str], cruise:int, prev: Optional[List[dict]]):
     for i,p in enumerate(points):
         if p in prev_map:
             r=prev_map[p].copy()
-            # força DEP/ARR fixos às elevações
             if i==0: r["Fix"]=True;  r["Alt_ft"]=float(dep_e)
             elif i==len(points)-1: r["Fix"]=True; r["Alt_ft"]=float(arr_e)
             out.append(r); continue
@@ -447,10 +446,8 @@ st.session_state.alt_rows = st.data_editor(
 # NAVAIDs (mostrados só se toggle on)
 if st.session_state.use_navaids:
     st.subheader("NAVAIDs opcionais (por fix, só preenchido no PDF quando não vazio)")
-    # cria estrutura se ainda não existir
     if "nav_rows" not in st.session_state or len(st.session_state.nav_rows) != len(st.session_state.points):
         st.session_state.nav_rows = [{"Point":p,"IDENT":"","FREQ":""} for p in st.session_state.points]
-    # alinhar pontos se rota mudou
     if [r["Point"] for r in st.session_state.nav_rows] != st.session_state.points:
         old = {r["Point"]:r for r in st.session_state.nav_rows}
         st.session_state.nav_rows = [{"Point":p,"IDENT":old.get(p,{}).get("IDENT",""),
@@ -490,7 +487,6 @@ _, ff_climb = cruise_lookup(start_alt + 0.5*max(0.0, cruise_alt-start_alt), int(
 _, ff_cruise= cruise_lookup(pressure_alt(cruise_alt, st.session_state.qnh), int(st.session_state.rpm_cruise), st.session_state.temp_c)
 ff_descent  = float(st.session_state.descent_ff)
 
-# dist e TC
 dist = [float(legs[i]["Dist"] or 0.0) for i in range(N)]
 tcs  = [float(legs[i]["TC"]   or 0.0) for i in range(N)]
 
@@ -517,13 +513,11 @@ for i in range(N):
 # 2) descidas obrigatórias para *hard* (atrás)
 back_desc = [0.0]*N
 hard_map = {idx: float(r["Alt_ft"]) for idx,r in enumerate(alts) if bool(r.get("Fix"))}
-# garante DEP e ARR
 hard_map[0] = start_alt
 hard_map[len(points)-1] = float(arr_elev)
 
 def alloc_back_until(index_fix:int, drop_ft:float):
-    """aloca distância de descida antes de 'index_fix' para perder 'drop_ft' (ft)."""
-    if drop_ft <= 0: return
+    if drop_ft <= 0: return 0.0
     t_need = drop_ft / max(st.session_state.rod_fpm,1e-6)
     rem = t_need
     for j in range(index_fix-1, -1, -1):
@@ -533,9 +527,8 @@ def alloc_back_until(index_fix:int, drop_ft:float):
         d   = gs_for(j,"DESCENT") * use / 60.0
         back_desc[j] += d
         rem -= use
-    return rem  # se >0, impossível
+    return rem
 
-# Para cada hard que esteja ABAIXO de cruise, preplaneamos uma descida a partir de cruise
 impossible_notes=[]
 for fix_idx, alt_ft in sorted(hard_map.items()):
     if fix_idx==0: continue
@@ -544,11 +537,10 @@ for fix_idx, alt_ft in sorted(hard_map.items()):
         if miss and miss>1e-6:
             impossible_notes.append(f"Impossível descer para {int(alt_ft)} ft em {points[fix_idx]} (faltam {miss:.1f} min).")
 
-# 3) resolver sobreposição climb vs descent
+# 3) resolver overlap climb vs descent
 for i in range(N-1, -1, -1):
     overlap = max(0.0, front_climb[i] + back_desc[i] - dist[i])
     if overlap>1e-9:
-        # puxar TOC para trás
         take = min(overlap, front_climb[i])
         front_climb[i] -= take
         overlap -= take
@@ -559,9 +551,34 @@ for i in range(N-1, -1, -1):
             overlap-=can
             k-=1
 
-# 4) construir segmentos e TOC/TOD numerados
+# 4) detectar posições de TOC/TOD e decidir se numerar
+toc_positions=[]  # (leg_idx, pos_nm)
+tod_positions=[]
+for i in range(N):
+    d = dist[i]; d_cl = min(front_climb[i], d)
+    d_ds = min(back_desc[i],   d - d_cl)
+    d_cr = max(0.0, d - d_cl - d_ds)
+    if d_cl > 1e-9 and (d_cr>0 or d_ds>0):
+        toc_positions.append((i, d_cl))
+    if d_ds > 1e-9:
+        tod_positions.append((i, d_cl + d_cr))
+
+toc_labels={}
+if len(toc_positions)==1:
+    toc_labels[toc_positions[0]] = "TOC"
+else:
+    for n, key in enumerate(toc_positions, start=1):
+        toc_labels[key] = f"TOC-{n}"
+
+tod_labels={}
+if len(tod_positions)==1:
+    tod_labels[tod_positions[0]] = "TOD"
+else:
+    for n, key in enumerate(tod_positions, start=1):
+        tod_labels[key] = f"TOD-{n}"
+
+# 5) construir segmentos
 rows=[]; seq_points=[]
-toc_list=[]; tod_list=[]
 efob=float(st.session_state.start_fuel)
 
 startup = parse_hhmm(st.session_state.startup)
@@ -575,8 +592,7 @@ seq_points.append({"name": points[0], "alt": _round_alt(start_alt),
                    "burn":"", "efob": efob, "leg_idx": None})
 
 def add_seg(phase, frm, to, i_leg, d_nm, tas, ff_lph, alt_start_ft, rate_fpm):
-    """Adiciona segmento; devolve alt_final."""
-    nonlocal clock, efob
+    global clock, efob  # <<< corrigido: global (não nonlocal)
     if d_nm <= 1e-9: return alt_start_ft
     wdir,wkt = leg_wind(i_leg)
     tc=float(tcs[i_leg]); wca, th, gs = wind_triangle(tc, tas, wdir, wkt)
@@ -616,7 +632,7 @@ def add_seg(phase, frm, to, i_leg, d_nm, tas, ff_lph, alt_start_ft, rate_fpm):
     return alt_end
 
 cur_alt = start_alt
-toc_count=tod_count=0
+toc_list=[]; tod_list=[]
 
 for i in range(N):
     frm, to = legs[i]["From"], legs[i]["To"]
@@ -627,24 +643,27 @@ for i in range(N):
 
     # CLIMB
     if d_cl > 1e-9:
-        toc_count += 1 if d_cr>0 or d_ds>0 else 0
-        name_toc = f"TOC-{toc_count}" if (d_cr>0 or d_ds>0) else to
-        cur_alt = add_seg("CLIMB", frm, name_toc, i, d_cl, tas_climb, ff_climb, cur_alt, roc)
-        if name_toc.startswith("TOC-"):
-            toc_list.append((i, d_cl))
+        if (i, d_cl) in toc_labels:
+            name_toc = toc_labels[(i, d_cl)]
+            toc_list.append((i, d_cl, name_toc))
+        else:
+            name_toc = to
+        cur_alt = add_seg("CLIMB", frm, name_toc, i, d_cl, vy_kt, ff_climb, cur_alt, roc)
         frm = name_toc
+
     # CRUISE
     if d_cr > 1e-9:
-        tod_needed = d_ds > 1e-9
-        name_tod = f"TOD-{tod_count+1}" if tod_needed else to
-        cur_alt = add_seg("CRUISE", frm, name_tod, i, d_cr, tas_cruise, ff_cruise, cur_alt, 0.0)
-        if tod_needed:
-            tod_count += 1
-            tod_list.append((i, d_cl + d_cr))
+        if (i, d_cl + d_cr) in tod_labels:
+            name_tod = tod_labels[(i, d_cl + d_cr)]
+            tod_list.append((i, d_cl + d_cr, name_tod))
+        else:
+            name_tod = to
+        cur_alt = add_seg("CRUISE", frm, name_tod, i, d_cr, float(st.session_state.cruise_ref_kt), ff_cruise, cur_alt, 0.0)
         frm = name_tod
+
     # DESCENT
     if d_ds > 1e-9:
-        cur_alt = add_seg("DESCENT", frm, to, i, d_ds, tas_descent, ff_descent, cur_alt, st.session_state.rod_fpm)
+        cur_alt = add_seg("DESCENT", frm, to, i, d_ds, float(st.session_state.descent_ref_kt), ff_descent, cur_alt, st.session_state.rod_fpm)
 
 eta = clock
 shutdown = add_seconds(eta, 5*60) if eta else None
@@ -664,8 +683,8 @@ with cB:
 with cC:
     isa_dev = st.session_state.temp_c - isa_temp(pressure_alt(dep_elev, st.session_state.qnh))
     st.metric("ISA dev @ DEP (°C)", int(round(isa_dev)))
-    if toc_list: st.write("**TOC**: " + ", ".join([f"L{i+1}@{fmt(pos,'dist')} nm" for (i,pos) in toc_list]))
-    if tod_list: st.write("**TOD**: " + ", ".join([f"L{i+1}@{fmt(pos,'dist')} nm" for (i,pos) in tod_list]))
+    if toc_list: st.write("**TOC**: " + ", ".join([f"{name} L{leg+1}@{fmt(pos,'dist')} nm" for (leg,pos,name) in toc_list]))
+    if tod_list: st.write("**TOD**: " + ", ".join([f"{name} L{leg+1}@{fmt(pos,'dist')} nm" for (leg,pos,name) in tod_list]))
 
 st.dataframe(rows, use_container_width=True)
 
@@ -716,7 +735,10 @@ if fieldset:
 
     PAll(["FLT TIME","FLT_TIME","FLIGHT_TIME"], f"{(tot_ete_sec//3600):02d}:{((tot_ete_sec%3600)//60):02d}")
     PAll(["FLIGHT_LEVEL_ALTITUDE","LEVEL_FF","LEVEL F/F","Level_FF"], fmt(cruise_alt,'alt'))
-    climb_fuel_raw = (sum(front_climb)/0.0 if False else (sum([ (front_climb[i]/max(gs_for(i,'CLIMB'),1e-6))*60 for i in range(N) ])/60.0 * _round_unit(ff_climb)))
+
+    # CLIMB FUEL: tempo_horas = soma(d_climb / GS_climb)
+    climb_time_hours = sum((front_climb[i] / gs_for(i,"CLIMB")) for i in range(N) if front_climb[i] > 0.0)
+    climb_fuel_raw = ff_climb * max(0.0, climb_time_hours)
     PAll(["CLIMB FUEL","CLIMB_FUEL"], fmt(climb_fuel_raw,'fuel'))
 
     PAll(["QNH"], str(int(round(st.session_state.qnh))))
@@ -813,8 +835,8 @@ def build_report_pdf():
         ["FF (cl/cru/des)", f"{_round_unit(ff_climb)}/{_round_unit(ff_cruise)}/{_round_unit(ff_descent)} L/h"],
         ["ROCs/ROD", f"{_round_unit(roc)} ft/min / {_round_unit(st.session_state.rod_fpm)} ft/min"],
         ["Totais", f"Dist {fmt(tot_nm,'dist')} nm • ETE {hhmmss_from_seconds(int(tot_ete_sec))} • Burn {fmt(tot_bo,'fuel')} L • EFOB {fmt(seq_points[-1]['efob'],'fuel')} L"],
-        ["TOC/TOD", (", ".join([f'TOC-{i+1} L{leg+1}@{fmt(pos,"dist")}nm' for i,(leg,pos) in enumerate(toc_list)]) + ("; " if toc_list and tod_list else "") +
-                     ", ".join([f'TOD-{i+1} L{leg+1}@{fmt(pos,"dist")}nm' for i,(leg,pos) in enumerate(tod_list)])) or "—"],
+        ["TOC/TOD", (", ".join([f'{name} L{leg+1}@{fmt(pos,"dist")}nm' for (leg,pos,name) in toc_list]) + ("; " if toc_list and tod_list else "") +
+                     ", ".join([f'{name} L{leg+1}@{fmt(pos,"dist")}nm' for (leg,pos,name) in tod_list])) or "—"],
         ["Aproximações", "Tempo ceil 10s; Fuel 0.5 L; Alt <1000→50 / ≥1000→100; Ângulos/Speeds unidade; Dist 0.1 nm"],
         ["Notas", " ; ".join(impossible_notes) if impossible_notes else "—"],
     ]
@@ -836,7 +858,7 @@ def build_report_pdf():
     t2 = LongTable(tbl, colWidths=[10*mm,36*mm,26*mm,10*mm,10*mm,10*mm,10*mm,12*mm,12*mm,12*mm,16*mm,16*mm,16*mm,16*mm,16*mm], repeatRows=1)
     t2.setStyle(TableStyle([
         ("GRID",(0,0),(-1,-1),0.25,colors.lightgrey),
-        ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+        ("BACKGROUND",(0,0),(0,0),colors.whitesmoke),
         ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
         ("FONTSIZE",(0,0),(-1,-1),8.5),
     ]))
