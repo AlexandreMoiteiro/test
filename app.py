@@ -1,10 +1,8 @@
-
 # app.py — NAVLOG (PDF + Relatório legível)
-# - JSON Import/Export ANTES da rota (upload aplica logo)
+# - JSON Import/Export ANTES da rota (upload aplica logo) — usa st.rerun()
 # - PDF robusto (clone_document_from_reader + NeedAppearances)
 # - Campos topo SEM "/": FLIGHT_LEVEL_ALTITUDE, WIND, MAG_VAR, TEMP_ISA_DEV
-# - Arredondamentos (display):
-#   Dist 0.1 nm; Tempo ↑ 10s; Fuel 0.5 L; TAS/GS/FF/ângulos 1; Alt <1000→50, ≥1000→100
+# - Arredondamentos: Dist 0.1 nm; Tempo ↑ 10s; Fuel 0.5 L; TAS/GS/FF/ângulos 1; Alt <1000→50, ≥1000→100
 # - TOC/TOD por alvo de altitude; navaids opcionais; UI compacta
 #
 # Reqs: streamlit, pypdf, reportlab, pytz
@@ -18,13 +16,6 @@ from math import sin, asin, radians, degrees, fmod
 
 st.set_page_config(page_title="NAVLOG (PDF + Relatório)", layout="wide", initial_sidebar_state="collapsed")
 PDF_TEMPLATE_PATHS = ["NAVLOG_FORM.pdf", "/mnt/data/NAVLOG_FORM.pdf"]
-
-# ---------- safe rerun (compat Streamlit) ----------
-def safe_rerun():
-    if hasattr(st, "rerun"):
-        st.rerun()
-    elif hasattr(st, "experimental_rerun"):
-        st.experimental_rerun()
 
 # ---------- optional deps ----------
 try:
@@ -265,14 +256,13 @@ ensure("descent_ff",15.0); ensure("rod_fpm",700); ensure("start_fuel",85.0)
 ensure("cruise_ref_kt",90); ensure("descent_ref_kt",65)
 ensure("use_navaids",False)
 
-# ------------- Cabeçalho (form) -------------
+# ------------- Cabeçalho (form simples) -------------
 with st.expander("Cabeçalho", expanded=True):
     c1,c2,c3 = st.columns(3)
     with c1:
         st.session_state.aircraft = st.text_input("Aircraft", st.session_state.aircraft)
-        st.session_state.registration = st.selectbox("Registration",
-            ["CS-ECC","CS-ECD","CS-DHS","CS-DHT","CS-DHU","CS-DHV","CS-DHW"],
-            index=["CS-ECC","CS-ECD","CS-DHS","CS-DHT","CS-DHU","CS-DHV","CS-DHW"].index(st.session_state.registration))
+        st.session_state.registration = st.selectbox("Registration", ["CS-ECC","CS-ECD","CS-DHS","CS-DHT","CS-DHU","CS-DHV","CS-DHW"],
+                                                     index=["CS-ECC","CS-ECD","CS-DHS","CS-DHT","CS-DHU","CS-DHV","CS-DHW"].index(st.session_state.registration))
         st.session_state.callsign = st.text_input("Callsign", st.session_state.callsign)
     with c2:
         st.session_state.student = st.text_input("Student", st.session_state.student)
@@ -376,7 +366,7 @@ with cJ2:
                         new_rows[i]["ALT_to_ft"] = float(at_in[i+1])
                 st.session_state.plan_rows = new_rows
                 st.success("Rota importada e aplicada.")
-                safe_rerun()
+                st.rerun()
         except Exception as e:
             st.error(f"Falha a importar JSON: {e}")
 
@@ -393,7 +383,7 @@ if st.button("Aplicar rota"):
     if len(pts)>=2: pts[-1] = st.session_state.arr
     st.session_state.points = pts
     st.session_state.route_text = " ".join(pts)
-    safe_rerun()
+    st.rerun()
 
 # ---------- tabela de planeamento ----------
 def make_default_plan_rows(points: List[str], cruise_alt:int) -> List[dict]:
@@ -520,7 +510,7 @@ startup = parse_hhmm(st.session_state.startup)
 takeoff = add_seconds(startup, 15*60) if startup else None
 clock = takeoff
 
-rows=[]; seq_points=[]; calc_details=[]
+rows=[]; seq_points=[]; calc_rows=[]; calc_details=[]
 PH_ICON = {"CLIMB":"↑","CRUISE":"→","DESCENT":"↓"}
 efob=float(st.session_state.start_fuel)
 
@@ -694,7 +684,7 @@ if fieldset:
     PAll(["ALTERNATE_AIRFIELD","Alternate_Airfield"], st.session_state.altn)
     PAll(["ALTERNATE_ELEVATION","Alternate_Elevation","TextField_7"], fmt(altn_elev,'alt'))
 
-    PAll(["WIND","WIND_FROM"], f"{int(round(st.session_state.wind_from)):03d}/{int(round(st.session_state.wind_kt)):02d}")  # FROM
+    PAll(["WIND","WIND_FROM"], f"{int(round(st.session_state.wind_from)):03d}/{int(round(st.session_state.wind_kt)):02d}")
     isa_dev_i = int(round(st.session_state.temp_c - isa_temp(pressure_alt(dep_elev, st.session_state.qnh))))
     PAll(["TEMP_ISA_DEV","TEMP ISA DEV","TEMP/ISA_DEV"], f"{int(round(st.session_state.temp_c))} / {isa_dev_i}")
     PAll(["MAG_VAR","MAG VAR"], f"{int(round(st.session_state.var_deg))}{'E' if st.session_state.var_is_e else 'W'}")
@@ -795,9 +785,9 @@ def build_report_pdf(details: List[str]) -> bytes:
     story.append(t1)
     story.append(PageBreak())
 
-    # Explicação por segmento (sem tabela gigante)
+    # Explicação por segmento (passo a passo)
     story.append(Paragraph("Cálculo por segmento (passo a passo)", H2))
-    story.append(Paragraph("Para cada segmento: curso, efeito do vento, GS, tempos (com arredondamento), combustível e variação de altitude.", P))
+    story.append(Paragraph("Para cada segmento: curso, vento, GS, tempos (com arredondamento), combustível e variação de altitude.", P))
     story.append(Spacer(1,6))
     for s in details:
         story.append(Paragraph(s, P))
@@ -815,3 +805,4 @@ if st.button("Gerar Relatório (PDF)"):
         st.success("Relatório gerado.")
     except Exception as e:
         st.error(f"Erro ao gerar relatório: {e}")
+
