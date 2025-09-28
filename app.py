@@ -4,9 +4,6 @@
 #   Dist 0.1 nm; Tempo arredondado ↑ ao próximo múltiplo de 10 s (ETE em mm:ss; totais em HH:MM:SS);
 #   Fuel 0.5 L; TAS/GS/FF/ângulos 1;
 #   Alt (incl. elevações DEP/ARR/ALTN) <1000→50 ft; ≥1000→100 ft.
-# Observações:
-#   - Aba 📄 PDF contém apenas a geração do PDF (sem JSON).
-#   - Campos mapeados exatamente como no PDF: FLIGHT_LEVEL/ALTITUDE, TEMP/ISA_DEV, MAG_VAR, WIND, etc.
 #
 # Reqs: streamlit, pypdf, reportlab, pytz
 
@@ -618,12 +615,23 @@ with tab_pdf:
     st.markdown("### Gerar PDF NAVLOG (formulário)")
     try:
         template_bytes = read_pdf_bytes(PDF_TEMPLATE_PATHS)
-        fieldset, maxlens = get_form_fields(template_bytes) if PYPDF_OK else (set(), {})
+        if not PYPDF_OK:
+            raise RuntimeError("pypdf não disponível")
+        fieldset, maxlens = get_form_fields(template_bytes)
     except Exception as e:
         template_bytes=None; fieldset=set(); maxlens={}
         st.error(f"Não foi possível ler o PDF: {e}")
 
     named: Dict[str,str] = {}
+
+    # helpers que **sempre passam maxlens** (corrige o TypeError)
+    def P(key: str, value: str):
+        put(named, fieldset, key, value, maxlens)
+    def PAliases(aliases: List[str], value: str):
+        for k in aliases:
+            if k in fieldset:
+                put(named, fieldset, k, value, maxlens)
+                return
 
     if fieldset:
         # Horas
@@ -631,58 +639,52 @@ with tab_pdf:
         eta_txt = (eta.strftime("%H:%M") if eta else "")
         shutdown_txt = (shutdown.strftime("%H:%M") if shutdown else "")
 
-        # Cabeçalho (nomes exatos do PDF novo)
-        put(named, fieldset, "AIRCRAFT", aircraft)
-        put(named, fieldset, "REGISTRATION", registration)
-        put(named, fieldset, "CALLSIGN", callsign)
-        put(named, fieldset, "ETD/ETA", f"{etd} / {eta_txt}")
-        put(named, fieldset, "STARTUP", startup_str)
-        put(named, fieldset, "TAKEOFF", etd)
-        put(named, fieldset, "LANDING", eta_txt)
-        put(named, fieldset, "SHUTDOWN", shutdown_txt)
-        put(named, fieldset, "LESSON", lesson)
-        put(named, fieldset, "INSTRUTOR", instrutor)
-        put(named, fieldset, "STUDENT", student)
-        # INSTRUMENT / LOGBOOK / LANDINGS — deixo como no template (não mexo)
+        # Cabeçalho (nomes exatos do PDF novo; usa P/PAliases)
+        P("AIRCRAFT", aircraft)
+        P("REGISTRATION", registration)
+        P("CALLSIGN", callsign)
+        P("ETD/ETA", f"{etd} / {eta_txt}")
+        P("STARTUP", startup_str)
+        P("TAKEOFF", etd)
+        P("LANDING", eta_txt)
+        P("SHUTDOWN", shutdown_txt)
+        P("LESSON", lesson)
+        P("INSTRUTOR", instrutor)
+        P("STUDENT", student)
 
         # Totais
         tot_ete_sec = sum(int(p.get('ete_sec',0)) for p in seq_points if isinstance(p.get('ete_sec'), (int,float)))
-        put(named, fieldset, "FLT TIME", f"{(tot_ete_sec//3600):02d}:{((tot_ete_sec%3600)//60):02d}")
+        P("FLT TIME", f"{(tot_ete_sec//3600):02d}:{((tot_ete_sec%3600)//60):02d}")
 
         # Flight level / Level F/F
-        put(named, fieldset, "FLIGHT_LEVEL/ALTITUDE", fmt(cruise_alt,'alt'))
-        put(named, fieldset, "LEVEL F/F", fmt(cruise_alt,'alt'))  # se existir também
+        PAliases(["FLIGHT_LEVEL/ALTITUDE","LEVEL F/F"], fmt(cruise_alt,'alt'))
 
-        # Climb fuel
-        put(named, fieldset, "CLIMB FUEL", fmt((sum([t for t in []]) if False else (sum([]))), 'fuel'))  # placeholder se não quiseres cálculo — vamos pôr cálculo real abaixo
-        # (cálculo real:)
-        climb_fuel_raw = (sum([]) if False else 0.0)  # será atualizado mais abaixo, após alocação
-        # Como já calculámos climb_time_alloc acima:
+        # Climb fuel (tempo contínuo de climb alocado)
         climb_fuel_raw = (sum(climb_time_alloc)/60.0) * ff_climb
-        put(named, fieldset, "CLIMB FUEL", fmt(climb_fuel_raw,'fuel'))
+        P("CLIMB FUEL", fmt(climb_fuel_raw,'fuel'))
 
         # QNH / Freqs
-        put(named, fieldset, "QNH", str(int(round(qnh))))
-        put(named, fieldset, "DEPT", aero_freq(points[0]))
-        put(named, fieldset, "ENROUTE", "123.755")
-        put(named, fieldset, "ARRIVAL", aero_freq(points[-1]))
+        P("QNH", str(int(round(qnh))))
+        P("DEPT", aero_freq(points[0]))
+        P("ENROUTE", "123.755")
+        P("ARRIVAL", aero_freq(points[-1]))
 
         # Airfields
-        put(named, fieldset, "Departure_Airfield", points[0])
-        put(named, fieldset, "Arrival_Airfield", points[-1])
-        put(named, fieldset, "Alternate_Airfield", altn)
-        put(named, fieldset, "Alternate_Elevation", fmt(altn_elev,'alt'))
+        P("Departure_Airfield", points[0])
+        P("Arrival_Airfield", points[-1])
+        P("Alternate_Airfield", altn)
+        PAliases(["Alternate_Elevation","TextField_7"], fmt(altn_elev,'alt'))
 
         # Vento / Var / Temp-ISA — nomes exatos
-        put(named, fieldset, "WIND", f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}")  # FROM
+        P("WIND", f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}")  # FROM
         isa_dev = int(round(temp_c - isa_temp(pressure_alt(dep_elev, qnh))))
-        put(named, fieldset, "TEMP/ISA_DEV", f"{int(round(temp_c))} / {isa_dev}")
-        put(named, fieldset, "MAG_VAR", f"{int(round(var_deg))}{'E' if var_is_e else 'W'}")
+        PAliases(["TEMP/ISA_DEV","TEMP / ISA DEV"], f"{int(round(temp_c))} / {isa_dev}")
+        PAliases(["MAG_VAR","MAG  VAR","MAG VAR"], f"{int(round(var_deg))}{'E' if var_is_e else 'W'}")
 
         # Leg_Number
-        put(named, fieldset, "Leg_Number", str(len(seq_points)))
+        P("Leg_Number", str(len(seq_points)))
 
-        # Linhas Leg01..Leg22 (segue nomes exatos)
+        # Linhas Leg01..Leg22
         acc_dist = 0.0
         acc_sec  = 0
         max_lines = 22
@@ -690,8 +692,9 @@ with tab_pdf:
             tag = f"Leg{idx:02d}_"
             is_seg = (idx>1)
 
-            put(named, fieldset, tag+"Waypoint", p["name"])
-            put(named, fieldset, tag+"Altitude_FL", (fmt(p["alt"], 'alt') if p["alt"]!="" else ""))
+            P(tag+"Waypoint", p["name"])
+            if p["alt"] != "":
+                P(tag+"Altitude_FL", fmt(p["alt"], 'alt'))
 
             # navaid por leg_idx (só se toggle + marcado)
             if is_seg and use_navaids:
@@ -699,30 +702,27 @@ with tab_pdf:
                 if isinstance(leg_idx, int) and 0 <= leg_idx < len(legs):
                     leg = legs[leg_idx]
                     if leg.get("UseNavaid", False):
-                        put(named, fieldset, tag+"Navaid_Identifier", leg.get("Navaid_IDENT",""))
-                        put(named, fieldset, tag+"Navaid_Frequency",  leg.get("Navaid_FREQ",""))
+                        P(tag+"Navaid_Identifier", leg.get("Navaid_IDENT",""))
+                        P(tag+"Navaid_Frequency",  leg.get("Navaid_FREQ",""))
 
             if is_seg:
                 acc_dist += float(p["dist"] or 0.0)
                 acc_sec  += int(p.get("ete_sec",0) or 0)
-                put(named, fieldset, tag+"True_Course",      fmt(p["tc"], 'angle'))
-                put(named, fieldset, tag+"True_Heading",     fmt(p["th"], 'angle'))
-                put(named, fieldset, tag+"Magnetic_Heading", fmt(p["mh"], 'angle'))
-                put(named, fieldset, tag+"True_Airspeed",    fmt(p["tas"], 'speed'))
-                put(named, fieldset, tag+"Ground_Speed",     fmt(p["gs"], 'speed'))
-                put(named, fieldset, tag+"Leg_Distance",     fmt(p["dist"], 'dist'))
-                put(named, fieldset, tag+"Leg_ETE",          mmss_from_seconds(int(p.get("ete_sec",0))))
-                put(named, fieldset, tag+"ETO",              p["eto"])
-                put(named, fieldset, tag+"Planned_Burnoff",  fmt(p["burn"], 'fuel'))
-                put(named, fieldset, tag+"Estimated_FOB",    fmt(p["efob"], 'fuel'))
-                put(named, fieldset, tag+"Cumulative_Distance", fmt(acc_dist,'dist'))
-                put(named, fieldset, tag+"Cumulative_ETE",      mmss_from_seconds(acc_sec))
+                P(tag+"True_Course",      fmt(p["tc"], 'angle'))
+                P(tag+"True_Heading",     fmt(p["th"], 'angle'))
+                P(tag+"Magnetic_Heading", fmt(p["mh"], 'angle'))
+                P(tag+"True_Airspeed",    fmt(p["tas"], 'speed'))
+                P(tag+"Ground_Speed",     fmt(p["gs"], 'speed'))
+                P(tag+"Leg_Distance",     fmt(p["dist"], 'dist'))
+                P(tag+"Leg_ETE",          mmss_from_seconds(int(p.get("ete_sec",0))))
+                P(tag+"ETO",              p["eto"])
+                P(tag+"Planned_Burnoff",  fmt(p["burn"], 'fuel'))
+                P(tag+"Estimated_FOB",    fmt(p["efob"], 'fuel'))
+                P(tag+"Cumulative_Distance", fmt(acc_dist,'dist'))
+                P(tag+"Cumulative_ETE",      mmss_from_seconds(acc_sec))
             else:
-                put(named, fieldset, tag+"ETO", p["eto"])
-                put(named, fieldset, tag+"Estimated_FOB", fmt(p["efob"], 'fuel'))
-
-        # Se houver mais do que 22 pontos e o PDF tiver Leg23_*, podes somar ali (opcional):
-        # (mantemos em branco por compatibilidade)
+                P(tag+"ETO", p["eto"])
+                P(tag+"Estimated_FOB", fmt(p["efob"], 'fuel'))
 
         # Botão
         if st.button("Gerar PDF NAVLOG", type="primary"):
@@ -886,3 +886,4 @@ with tab_report:
             st.success("Relatório gerado.")
         except Exception as e:
             st.error(f"Erro ao gerar relatório: {e}")
+
