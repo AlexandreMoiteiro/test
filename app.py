@@ -1,4 +1,3 @@
-
 # app.py — NAVLOG (PDF + Relatório) — versão para o novo NAVLOG_FORM.pdf
 # Regras (display):
 #   Dist 0.1 nm; Tempo arredondado ↑ ao próximo múltiplo de 10 s (ETE em mm:ss; totais em HH:MM:SS);
@@ -812,3 +811,4 @@ with tab_report:
             st.success("Relatório gerado.")
         except Exception as e:
             st.error(f"Erro ao gerar relatório: {e}")
+
