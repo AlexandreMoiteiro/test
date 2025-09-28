@@ -613,7 +613,11 @@ def add_seg(phase, frm, to, i_leg, d_nm, tas, ff_lph, alt_start_ft, rate_fpm):
     burn_raw = ff_lph * (ete_sec_raw/3600.0)
     alt_end = alt_start_ft + (rate_fpm*(ete_sec_raw/60.0) if phase=="CLIMB" else (-rate_fpm*(ete_sec_raw/60.0) if phase=="DESCENT" else 0.0))
 
-    eto=""; if clock: clock = add_seconds(clock, int(ete_sec)); eto = clock.strftime("%H:%M")
+    eto = ""
+    if clock:
+        clock = add_seconds(clock, int(ete_sec))
+        eto = clock.strftime("%H:%M")
+
     efob = max(0.0, _round_half(efob - burn_raw))
 
     rows.append({
@@ -847,7 +851,7 @@ def build_report_pdf():
 
     story.append(Paragraph("Cálculos por segmento (explicado)", H2))
     for i, p in enumerate(seq_points):
-        if i==0:  # DEP line (sem segmento anterior)
+        if i==0:  # DEP line
             continue
         prev = seq_points[i-1]
         seg = p
@@ -879,4 +883,3 @@ if st.button("Gerar Relatório (PDF)"):
         st.success("Relatório gerado.")
     except Exception as e:
         st.error(f"Erro ao gerar relatório: {e}")
-
