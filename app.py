@@ -312,6 +312,23 @@ with st.form("hdr_perf_form", clear_on_submit=False):
         st.session_state.descent_ff=f_ff_ds; st.session_state.rod_fpm=f_rod; st.session_state.start_fuel=f_fuel0
         st.session_state.cruise_ref_kt=f_spd_cr; st.session_state.descent_ref_kt=f_spd_ds
         st.session_state.use_navaids=f_use_nav
+        # Propagar cruise para a tabela de altitudes (não fixados) e DEP/ARR = elevação
+        def sync_alt_rows_to_cruise():
+            pts = st.session_state.get("points") or [st.session_state.dept, st.session_state.arr]
+            rows = st.session_state.get("alt_rows")
+            if not rows:
+                rows = [{"Fix": (i in (0,len(pts)-1)),
+                         "Point": p,
+                         "Alt_ft": float(_round_alt(aero_elev(p) if i in (0,len(pts)-1) else st.session_state.cruise_alt))}
+                        for i,p in enumerate(pts)]
+            dep_e = _round_alt(aero_elev(pts[0])); arr_e = _round_alt(aero_elev(pts[-1])); crz=_round_alt(st.session_state.cruise_alt)
+            for i,r in enumerate(rows):
+                if i==0: r["Fix"]=True; r["Alt_ft"]=float(dep_e)
+                elif i==len(rows)-1: r["Fix"]=True; r["Alt_ft"]=float(arr_e)
+                else:
+                    if not bool(r.get("Fix", False)): r["Alt_ft"]=float(crz)
+            st.session_state.alt_rows = rows
+        sync_alt_rows_to_cruise()
         st.success("Parâmetros aplicados.")
 
 # =========================================================
