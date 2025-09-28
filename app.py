@@ -1,5 +1,5 @@
 # app.py — NAVLOG (PDF + Relatório) — alinhado ao NAVLOG_FORM.pdf (nomes SEM '/')
-# UI: Planeamento | Resultados | PDF | Relatório
+# UI: JSON (antes da rota) | Planeamento | Resultados | PDF | Relatório
 # Regras (display):
 #   Dist 0.1 nm; Tempo arredondado ↑ ao próximo múltiplo de 10 s (ETE mm:ss; totais HH:MM:SS)
 #   Fuel 0.5 L; TAS/GS/FF/ângulos 1; Alt <1000→50 ft; ≥1000→100 ft
@@ -249,10 +249,105 @@ def put(out: dict, fieldset: set, key: str, value: str, maxlens: Dict[str,int]):
             s = s[:maxlens[key]]
         out[key] = s
 
-# =============== UI ===============
-st.title("Navigation Plan & Inflight Log — Tecnam P2008")
+# =============== Estado inicial + JSON (ANTES da rota) ===============
+# defaults para cabeçalho
+if "dept" not in st.session_state:
+    ks = list(AEROS.keys())
+    st.session_state.dept = ks[0]
+    st.session_state.arr  = ks[1] if len(ks)>1 else ks[0]
+    st.session_state.altn = ks[2] if len(ks)>2 else ks[0]
 
-# --- Cabeçalho ---
+st.header("📦 JSON v2 — Importar / Exportar (antes da rota)")
+cJ1, cJ2 = st.columns(2)
+
+def ensure_points_and_rows():
+    # cria defaults suaves caso ainda não exista rota
+    if "points" not in st.session_state:
+        st.session_state.points = [st.session_state.dept, st.session_state.arr]
+        st.session_state.route_text = " ".join(st.session_state.points)
+    if "plan_rows" not in st.session_state:
+        st.session_state.plan_rows = []
+
+def make_default_plan_rows(points: List[str], cruise_alt:int) -> List[dict]:
+    rows=[]
+    arr_elev=_round_alt(aero_elev(points[-1]))
+    for i in range(1,len(points)):
+        to_is_last = (i == len(points)-1)
+        rows.append({
+            "From": points[i-1],
+            "To": points[i],
+            "TC": 0.0,
+            "Dist": 0.0,
+            "ALT_to_ft": float(arr_elev if to_is_last else _round_alt(cruise_alt)),
+            "UseNavaid": False,
+            "Navaid_IDENT": "",
+            "Navaid_FREQ": "",
+        })
+    return rows
+
+def export_json_v2(points: List[str], rows: List[dict]) -> bytes:
+    if not points: points=[st.session_state.dept, st.session_state.arr]
+    alt_targets = [_round_alt(aero_elev(points[0]))] + \
+                  [float(rows[i].get("ALT_to_ft", _round_alt(aero_elev(points[-1]) if i==len(rows)-1 else 4000)))
+                   for i in range(len(rows))]
+    data = {
+        "version": 2,
+        "route_points": points,
+        "legs": [{"TC": float(rows[i].get("TC",0.0)), "Dist": float(rows[i].get("Dist",0.0))}
+                 for i in range(len(rows))],
+        "alt_targets_ft": alt_targets
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+with cJ1:
+    ensure_points_and_rows()
+    dep_code = ascii_safe(st.session_state.dept)
+    arr_code = ascii_safe(st.session_state.arr)
+    st.download_button("💾 Download rota (JSON v2)",
+                       data=export_json_v2(st.session_state.get("points", []),
+                                           st.session_state.get("plan_rows", [])),
+                       file_name=f"route_{dep_code}_{arr_code}.json",
+                       mime="application/json")
+
+with cJ2:
+    uploaded_json = st.file_uploader("📤 Import JSON v2", type=["json"], key="route_upl_json_top")
+    if uploaded_json is not None:
+        try:
+            data = json.loads(uploaded_json.read().decode("utf-8"))
+            pts = data.get("route_points")
+            if not pts or len(pts) < 2:
+                st.error("JSON sem route_points válidos.")
+            else:
+                # aplicar DEP/ARR do ficheiro — e refletir no cabeçalho
+                st.session_state.dept = pts[0]
+                st.session_state.arr  = pts[-1]
+                st.session_state.points = pts
+                st.session_state.route_text = " ".join(pts)
+
+                # construir plan_rows com valores do JSON
+                new_rows = make_default_plan_rows(pts, 4000)
+                L = len(new_rows)
+                legs_in = data.get("legs") or []
+                for i in range(min(L, len(legs_in))):
+                    new_rows[i]["TC"]   = float(legs_in[i].get("TC", 0.0))
+                    new_rows[i]["Dist"] = float(legs_in[i].get("Dist", 0.0))
+                at_in = data.get("alt_targets_ft")
+                if at_in and len(at_in) == len(pts):
+                    for i in range(L):
+                        new_rows[i]["ALT_to_ft"] = float(at_in[i+1])
+                st.session_state.plan_rows = new_rows
+                st.success("Rota importada e aplicada.")
+                st.experimental_rerun()
+        except Exception as e:
+            st.error(f"Falha a importar JSON: {e}")
+
+# =============== Cabeçalho + Rota ===============
+st.header("🛫 Cabeçalho & Rota")
+
+def parse_route_text(txt:str) -> List[str]:
+    tokens = re.split(r"[,\s→\-]+", (txt or "").strip())
+    return [t for t in tokens if t]
+
 with st.form("hdr"):
     c1,c2,c3 = st.columns(3)
     with c1:
@@ -264,9 +359,10 @@ with st.form("hdr"):
         lesson  = st.text_input("Lesson (ex: 12)", "")
         instrutor = st.text_input("Instrutor","")
     with c3:
-        dept = st.selectbox("Departure", list(AEROS.keys()), index=0)
-        arr  = st.selectbox("Arrival",  list(AEROS.keys()), index=1)
-        altn = st.selectbox("Alternate",list(AEROS.keys()), index=2)
+        ks = list(AEROS.keys())
+        dept = st.selectbox("Departure", ks, index=ks.index(st.session_state.dept))
+        arr  = st.selectbox("Arrival",  ks, index=ks.index(st.session_state.arr))
+        altn = st.selectbox("Alternate", ks, index=ks.index(st.session_state.altn))
     startup_str = st.text_input("Startup (HH:MM ou HH:MM:SS)", "")
 
     with st.expander("Atmosfera / Performance / Opções", expanded=False):
@@ -296,49 +392,30 @@ with st.form("hdr"):
         descent_ref_kt = st.number_input("Descent speed (kt)", 40, 120, 65, step=1)
 
     # Rota
-    st.markdown("##### Rota")
-    default_route = f"{dept} {arr}"
-    route_text = st.text_area("Pontos (separados por espaço, vírgulas ou '->')",
-                              value=(st.session_state.get("route_text") or default_route))
+    st.markdown("##### Rota (DEP … ARR)")
+    default_route = st.session_state.get("route_text") or f"{dept} {arr}"
+    route_text = st.text_area("Pontos (separados por espaço, vírgulas ou '->')", value=default_route)
+
     hdr_submit = st.form_submit_button("Aplicar cabeçalho & rota", type="primary")
 
-def parse_route_text(txt:str) -> List[str]:
-    tokens = re.split(r"[,\s→\-]+", (txt or "").strip())
-    return [t for t in tokens if t]
-
-# estado inicial / ao clicar aplicar
-if "points" not in st.session_state:
-    st.session_state.points = parse_route_text(route_text) if route_text else [dept,arr]
 if hdr_submit:
+    st.session_state.dept = dept
+    st.session_state.arr  = arr
+    st.session_state.altn = altn
     st.session_state["route_text"] = route_text
     pts = parse_route_text(route_text) or [dept,arr]
-    if not pts: pts=[dept,arr]
     pts[0]=dept
     if len(pts)>=2: pts[-1]=arr
     st.session_state.points = pts
+    # refaz plan_rows se ainda não existir
+    if "plan_rows" not in st.session_state or not st.session_state.plan_rows:
+        st.session_state.plan_rows = make_default_plan_rows(pts, cruise_alt)
     st.session_state["use_navaids"] = use_navaids
 
 points = st.session_state.points
 use_navaids = st.session_state.get("use_navaids", False)
 
-# =============== Planeamento (tabela única + JSON no fim da aba) ===============
-def make_default_plan_rows(points: List[str], cruise_alt:int) -> List[dict]:
-    rows=[]
-    arr_elev=_round_alt(aero_elev(points[-1]))
-    for i in range(1,len(points)):
-        to_is_last = (i == len(points)-1)
-        rows.append({
-            "From": points[i-1],
-            "To": points[i],
-            "TC": 0.0,
-            "Dist": 0.0,
-            "ALT_to_ft": float(arr_elev if to_is_last else _round_alt(cruise_alt)),
-            "UseNavaid": False,
-            "Navaid_IDENT": "",
-            "Navaid_FREQ": "",
-        })
-    return rows
-
+# =============== Planeamento (tabela única) ===============
 def preserve_merge(old: List[dict], new_points: List[str], cruise_alt:int) -> List[dict]:
     idx = {(r.get("From"), r.get("To")): r for r in old}
     merged=[]
@@ -358,16 +435,15 @@ def preserve_merge(old: List[dict], new_points: List[str], cruise_alt:int) -> Li
         })
     return merged
 
-if "plan_rows" not in st.session_state or hdr_submit:
-    if "plan_rows" in st.session_state:
-        st.session_state.plan_rows = preserve_merge(st.session_state.plan_rows, points, cruise_alt)
-    else:
-        st.session_state.plan_rows = make_default_plan_rows(points, cruise_alt)
+if "plan_rows" not in st.session_state:
+    st.session_state.plan_rows = make_default_plan_rows(points, 4000)
+else:
+    st.session_state.plan_rows = preserve_merge(st.session_state.plan_rows, points, 4000)
 
 tab_plan, tab_results, tab_pdf, tab_report = st.tabs(["📝 Planeamento", "📊 Resultados", "📄 PDF", "📑 Relatório"])
 
 with tab_plan:
-    st.markdown("### Planeamento & Legs")
+    st.markdown("### Legs / Altitudes alvo / Navaids")
     column_config = {
         "From": st.column_config.TextColumn("From", disabled=True),
         "To":   st.column_config.TextColumn("To", disabled=True),
@@ -378,9 +454,6 @@ with tab_plan:
         "Navaid_IDENT": st.column_config.TextColumn("Navaid IDENT"),
         "Navaid_FREQ":  st.column_config.TextColumn("Navaid FREQ"),
     }
-    cols = list(column_config.keys())
-
-    # editor SEM form (guarda de imediato)
     plan_edit = st.data_editor(
         st.session_state.plan_rows,
         key="plan_table",
@@ -388,67 +461,11 @@ with tab_plan:
         use_container_width=True,
         num_rows="fixed",
         column_config=column_config,
-        column_order=cols
+        column_order=list(column_config.keys())
     )
     st.session_state.plan_rows = plan_edit
 
-    st.markdown("#### Export / Import JSON v2 (rota, TCs/Dist, ALT targets)")
-    cJ1, cJ2 = st.columns(2)
-
-    def export_json_v2():
-        alt_targets = [float(_round_alt(aero_elev(points[0])))] + \
-                      [float(st.session_state.plan_rows[i].get("ALT_to_ft", _round_alt(cruise_alt) if i<len(st.session_state.plan_rows)-1 else _round_alt(aero_elev(points[-1]))))
-                       for i in range(len(st.session_state.plan_rows))]
-        data = {
-            "version": 2,
-            "route_points": points,
-            "legs": [{"TC": float(st.session_state.plan_rows[i].get("TC",0.0)),
-                      "Dist": float(st.session_state.plan_rows[i].get("Dist",0.0))}
-                     for i in range(len(st.session_state.plan_rows))],
-            "alt_targets_ft": alt_targets
-        }
-        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-
-    with cJ1:
-        dep_code = ascii_safe(points[0]); arr_code = ascii_safe(points[-1])
-        st.download_button("💾 Download rota (JSON v2)",
-                           data=export_json_v2(),
-                           file_name=f"route_{dep_code}_{arr_code}.json",
-                           mime="application/json")
-
-    with cJ2:
-        uploaded_json = st.file_uploader("📤 Import JSON v2", type=["json"], key="route_upl_json")
-        if uploaded_json is not None:
-            try:
-                data = json.loads(uploaded_json.read().decode("utf-8"))
-                pts = data.get("route_points") or points
-                if not pts or len(pts) < 2:
-                    st.warning("JSON sem route_points válidos.")
-                else:
-                    # fixa DEP/ARR atuais (se quiseres, comenta isto)
-                    pts[0] = dept
-                    pts[-1] = arr
-                    st.session_state.points = pts
-                    st.session_state["route_text"] = " ".join(pts)
-
-                    # construir linhas com merge dos valores do JSON
-                    new_rows = make_default_plan_rows(pts, cruise_alt)
-                    L = len(new_rows)
-                    legs_in = data.get("legs") or []
-                    for i in range(min(L, len(legs_in))):
-                        new_rows[i]["TC"]   = float(legs_in[i].get("TC", 0.0))
-                        new_rows[i]["Dist"] = float(legs_in[i].get("Dist", 0.0))
-                    at_in = data.get("alt_targets_ft")
-                    if at_in and len(at_in) == len(pts):
-                        for i in range(L):
-                            new_rows[i]["ALT_to_ft"] = float(at_in[i+1])
-                    st.session_state.plan_rows = new_rows
-                    st.success("Rota importada e aplicada.")
-                    st.experimental_rerun()
-            except Exception as e:
-                st.error(f"Falha a importar JSON: {e}")
-
-# =============== Cálculo comum ===============
+# =============== Cálculo comum (a partir de plan_rows) ===============
 legs = st.session_state.plan_rows
 N = len(legs)
 
@@ -461,24 +478,23 @@ start_alt = float(dep_elev)
 end_alt   = float(arr_elev)
 
 pa_start  = pressure_alt(start_alt, qnh)
-pa_cruise = pressure_alt(cruise_alt, qnh)
+pa_cruise = pressure_alt(4000, qnh)  # usado só para lookup; a TAS real vem do input cruise_ref_kt
 vy_kt = vy_interp_enroute(pa_start)
 tas_climb, tas_cruise, tas_descent = vy_kt, float(cruise_ref_kt), float(descent_ref_kt)
 roc = roc_interp_enroute(pa_start, temp_c)
 
-pa_mid_climb = start_alt + 0.5*max(0.0, cruise_alt - start_alt)
-pa_mid_desc  = end_alt   + 0.5*max(0.0, cruise_alt - end_alt)
+pa_mid_climb = start_alt + 0.5*max(0.0, 4000 - start_alt)
+pa_mid_desc  = end_alt   + 0.5*max(0.0, 4000 - end_alt)
 _, ff_climb  = cruise_lookup(pa_mid_climb, int(rpm_climb),  temp_c)
 _, ff_cruise = cruise_lookup(pa_cruise,   int(rpm_cruise),  temp_c)
 ff_descent   = float(descent_ff)
 
-# Vento: global (FROM)
 def leg_wind(_j_from:int, _j_to:int) -> Tuple[float,float]:
     return (int(wind_from_global), int(wind_kt_global))
 
 dist = [float(legs[i]["Dist"] or 0.0) for i in range(N)]
 tcs  = [float(legs[i]["TC"]   or 0.0) for i in range(N)]
-alt_targets = [start_alt] + [float(legs[i].get("ALT_to_ft", arr_elev if i==N-1 else _round_alt(cruise_alt))) for i in range(N)]
+alt_targets = [start_alt] + [float(legs[i].get("ALT_to_ft", arr_elev if i==N-1 else _round_alt(4000))) for i in range(N)]
 
 front_used_dist = [0.0]*N
 back_used_dist  = [0.0]*N
@@ -551,22 +567,18 @@ def add_seg(phase, frm, to, i_leg, d_nm, tas, ff_lph, alt_start_ft, rate_fpm, wd
     wca, th, gs = wind_triangle(tc, tas, wdir, wkt)
     mc = apply_var(tc, var_deg, var_is_e); mh = apply_var(th, var_deg, var_is_e)
 
-    # ETE (↑ 10 s)
     ete_min_raw = 60.0 * d_nm / max(gs,1e-6)
     ete_sec_raw = ete_min_raw * 60.0
     ete_sec     = ceil_to_10s(ete_sec_raw)
     ete_disp    = mmss_from_seconds(ete_sec)
 
-    # Burn com tempo contínuo
     burn_raw = ff_lph * (ete_sec_raw / 3600.0)
     burn = _round_half(burn_raw)
 
-    # Altitude (tempo contínuo)
     if phase == "CLIMB":   alt_end_ft = alt_start_ft + rate_fpm * (ete_sec_raw/60.0)
     elif phase == "DESCENT": alt_end_ft = alt_start_ft - rate_fpm * (ete_sec_raw/60.0)
     else: alt_end_ft = alt_start_ft
 
-    # ETO HH:MM
     eto = ""
     if clock:
         clock = add_seconds(clock, ete_sec)
@@ -613,14 +625,13 @@ def add_seg(phase, frm, to, i_leg, d_nm, tas, ff_lph, alt_start_ft, rate_fpm, wd
     )
     return alt_end_ft
 
-# Construção dos segmentos c/ TOC/TOD
 cur_alt = alt_targets[0]
 toc_markers = []; tod_markers = []
 for i in range(N):
     frm, to = legs[i]["From"], legs[i]["To"]
     d_total  = dist[i]
-    d_cl = front_used_dist[i]
-    d_ds = back_used_dist[i]
+    d_cl = min(front_used_dist[i], d_total)
+    d_ds = min(back_used_dist[i], d_total - d_cl)
     d_cr = max(0.0, d_total - d_cl - d_ds)
 
     wdir_leg, wkt_leg = leg_wind(i, i+1)
@@ -678,34 +689,27 @@ with tab_results:
 # =============== PDF (aba — só PDF) ===============
 with tab_pdf:
     st.markdown("### Gerar PDF NAVLOG (formulário)")
-    show_fields = st.checkbox("🔎 Mostrar nomes de campos do PDF")
     try:
         template_bytes = read_pdf_bytes(PDF_TEMPLATE_PATHS)
         if not PYPDF_OK:
             raise RuntimeError("pypdf não disponível")
         fieldset, maxlens = get_form_fields(template_bytes)
-        if show_fields:
-            st.code("\n".join(sorted(fieldset)))
     except Exception as e:
         template_bytes=None; fieldset=set(); maxlens={}
         st.error(f"Não foi possível ler o PDF: {e}")
 
     named: Dict[str,str] = {}
-    def P(key: str, value: str):
-        put(named, fieldset, key, value, maxlens)
+    def P(key: str, value: str): put(named, fieldset, key, value, maxlens)
     def PAll(keys: List[str], value: str):
         for k in keys:
-            if k in fieldset:
-                put(named, fieldset, k, value, maxlens)
+            if k in fieldset: put(named, fieldset, k, value, maxlens)
 
     if fieldset:
-        # Horas
         etd = (add_seconds(parse_hhmm(startup_str), 15*60).strftime("%H:%M") if startup_str else "")
         eta_txt = (eta.strftime("%H:%M") if eta else "")
         shutdown_txt = (shutdown.strftime("%H:%M") if shutdown else "")
 
-        # Cabeçalho (aliases por segurança)
-        PAll(["AIRCRAFT","Aircraft"], aircraft)
+        PAll(["AIRCRAFT","Aircraft"], "P208")
         PAll(["REGISTRATION","Registration"], registration)
         PAll(["CALLSIGN","Callsign"], callsign)
         PAll(["ETD/ETA","ETD_ETA"], f"{etd} / {eta_txt}")
@@ -717,39 +721,31 @@ with tab_pdf:
         PAll(["INSTRUTOR","Instructor","INSTRUCTOR"], instrutor)
         PAll(["STUDENT","Student"], student)
 
-        # Totais
         tot_ete_sec = sum(int(p.get('ete_sec',0)) for p in seq_points if isinstance(p.get('ete_sec'), (int,float)))
         PAll(["FLT TIME","FLT_TIME","FLIGHT_TIME"], f"{(tot_ete_sec//3600):02d}:{((tot_ete_sec%3600)//60):02d}")
 
-        # Flight level / topo
-        PAll(["FLIGHT_LEVEL_ALTITUDE","LEVEL_FF","LEVEL F/F","Level_FF"], fmt(cruise_alt,'alt'))
-
-        # Climb fuel (tempo contínuo alocado)
+        # topo
+        PAll(["FLIGHT_LEVEL_ALTITUDE","LEVEL_FF","LEVEL F/F","Level_FF"], fmt(4000,'alt'))
         climb_fuel_raw = (sum(climb_time_alloc)/60.0) * (_round_unit(ff_climb))
         PAll(["CLIMB FUEL","CLIMB_FUEL"], fmt(climb_fuel_raw,'fuel'))
-
-        # QNH / Frequências
         PAll(["QNH"], str(int(round(qnh))))
         PAll(["DEPT","DEPARTURE_FREQ","DEPT_FREQ"], aero_freq(points[0]))
         PAll(["ENROUTE","ENROUTE_FREQ"], "123.755")
         PAll(["ARRIVAL","ARRIVAL_FREQ","ARR_FREQ"], aero_freq(points[-1]))
-
-        # Aeródromos
         PAll(["DEPARTURE_AIRFIELD","Departure_Airfield"], points[0])
         PAll(["ARRIVAL_AIRFIELD","Arrival_Airfield"], points[-1])
-        PAll(["Leg_Number","LEG_NUMBER"], str(len(seq_points)))
         PAll(["ALTERNATE_AIRFIELD","Alternate_Airfield"], altn)
         PAll(["ALTERNATE_ELEVATION","Alternate_Elevation","TextField_7"], fmt(altn_elev,'alt'))
+        PAll(["Leg_Number","LEG_NUMBER"], str(len(seq_points)))
 
-        # Topo: vento/var/temp (sem '/')
-        PAll(["WIND","WIND_FROM"], f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}")  # FROM
+        # vento/var/temp
+        PAll(["WIND","WIND_FROM"], f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}")
         isa_dev = int(round(temp_c - isa_temp(pressure_alt(dep_elev, qnh))))
         PAll(["TEMP_ISA_DEV","TEMP ISA DEV","TEMP/ISA_DEV"], f"{int(round(temp_c))} / {isa_dev}")
         PAll(["MAG_VAR","MAG VAR"], f"{int(round(var_deg))}{'E' if var_is_e else 'W'}")
 
-        # Linhas Leg01..Leg22
-        acc_dist = 0.0
-        acc_sec  = 0
+        # linhas Leg01..Leg22
+        acc_dist = 0.0; acc_sec = 0
         max_lines = 22
         for idx, p in enumerate(seq_points[:max_lines], start=1):
             tag = f"Leg{idx:02d}_"
@@ -758,7 +754,6 @@ with tab_pdf:
             P(tag+"Waypoint", p["name"])
             if p["alt"] != "": P(tag+"Altitude_FL", fmt(p["alt"], 'alt'))
 
-            # navaid (só se toggle + marcado)
             if is_seg and use_navaids:
                 leg_idx = p.get("leg_idx", None)
                 if isinstance(leg_idx, int) and 0 <= leg_idx < len(legs):
@@ -794,7 +789,7 @@ with tab_pdf:
                 safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
                 filename = f"{safe_date}_LESSON-{lesson_num}_NAVLOG.pdf"
                 st.download_button("📄 Download PDF", data=out, file_name=filename, mime="application/pdf")
-                st.success("PDF gerado (sem perder campos do topo).")
+                st.success("PDF gerado.")
             except Exception as e:
                 st.error(f"Erro ao gerar PDF: {e}")
     else:
@@ -805,6 +800,7 @@ with tab_report:
     def build_report_pdf(calc_rows: List[List], details: List[str], params: Dict[str,str]) -> bytes:
         if not REPORTLAB_OK: raise RuntimeError("reportlab missing")
         bio = io.BytesIO()
+        from reportlab.lib.pagesizes import A4, landscape
         doc = SimpleDocTemplate(bio, pagesize=landscape(A4),
                                 leftMargin=16*mm, rightMargin=16*mm,
                                 topMargin=12*mm, bottomMargin=12*mm)
@@ -877,13 +873,13 @@ with tab_report:
         try:
             tot_ete_sec = sum(int(p.get('ete_sec',0)) for p in seq_points if isinstance(p.get('ete_sec'), (int,float)))
             params = {
-                "aircraft": aircraft, "registration": registration, "callsign": callsign,
+                "aircraft": "P208", "registration": registration, "callsign": callsign,
                 "lesson": lesson, "dept": points[0], "arr": points[-1], "altn": altn,
                 "elev_dep": dep_elev, "elev_arr": arr_elev, "elev_altn": altn_elev,
                 "qnh": str(int(round(qnh))),
                 "wind": f"{int(round(wind_from_global)):03d}/{int(round(wind_kt_global)):02d}",
                 "var": f"{int(round(var_deg))}{'E' if var_is_e else 'W'}",
-                "cruise_alt": _round_alt(cruise_alt),
+                "cruise_alt": _round_alt(4000),
                 "temp_isa": f"{int(round(temp_c))} / {int(round(temp_c - isa_temp(pressure_alt(dep_elev, qnh))))}",
                 "startup": startup_str,
                 "etd": (add_seconds(parse_hhmm(startup_str),15*60).strftime("%H:%M") if startup_str else ""),
