@@ -229,6 +229,135 @@ def put(out: dict, fieldset: set, key: str, value: str, maxlens: Dict[str,int]):
             s = s[:maxlens[key]]
         out[key] = s
 
+# ===== NEW: Fonted flattening overlay helpers =====
+def _field_widgets_by_page(reader):
+    """Return {page_index: [(field_name, rect_llx, rect_lly, rect_urx, rect_ury)]}."""
+    pages = {}
+    for p_idx, page in enumerate(reader.pages):
+        annots = page.get("/Annots", [])
+        if not annots:
+            continue
+        items = []
+        for a_ref in annots:
+            try:
+                a = a_ref.get_object()
+            except Exception:
+                continue
+            if a.get("/Subtype") != "/Widget":
+                continue
+            name = a.get("/T")
+            rect = a.get("/Rect")
+            if not name or not rect or len(rect) != 4:
+                continue
+            llx, lly, urx, ury = [float(x) for x in rect]
+            items.append((str(name), llx, lly, urx, ury))
+        if items:
+            pages[p_idx] = items
+    return pages
+
+def _fit_text_size(canvas, text, max_w, max_h, font_name, start_pt=11, min_pt=6):
+    """Return a font size that fits width/height; prioritizes width."""
+    from reportlab.pdfbase import pdfmetrics
+    w = lambda fs: pdfmetrics.stringWidth(text, font_name, fs)
+    fs = start_pt
+    while fs > min_pt and (w(fs) > max_w or fs > max_h):
+        fs -= 0.5
+    return max(min_pt, fs)
+
+def build_overlay_pages_with_font(reader, fields: dict, ttf_path: str, default_pt: float = 10.0, v_pad: float = 1.5):
+    """
+    Creates one in-memory PDF per page drawing field values with the TTF.
+    Returns a list of bytes (one overlay PDF per page index).
+    """
+    if not REPORTLAB_OK:
+        raise RuntimeError("reportlab missing")
+
+    # Register font
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    pdfmetrics.registerFont(TTFont("NAVLOG_BODY", ttf_path))
+
+    overlays = []
+    widgets_by_page = _field_widgets_by_page(reader)
+
+    # Build empty overlays per page (size from template)
+    for p_idx, page in enumerate(reader.pages):
+        w = float(page.mediabox.width)
+        h = float(page.mediabox.height)
+        bio = io.BytesIO()
+
+        from reportlab.pdfgen import canvas as rl_canvas
+        c = rl_canvas.Canvas(bio, pagesize=(w, h))
+
+        if p_idx in widgets_by_page:
+            for (fname, llx, lly, urx, ury) in widgets_by_page[p_idx]:
+                val = str(fields.get(fname, ""))
+                if not val:
+                    continue
+                box_w = max(0.0, urx - llx - 2.0)  # small padding
+                box_h = max(0.0, ury - lly - 2.0)
+                fs = _fit_text_size(c, val, box_w, box_h - v_pad, "NAVLOG_BODY", start_pt=default_pt)
+
+                c.setFont("NAVLOG_BODY", fs)
+                x = llx + 1.0
+                y = lly + (box_h - fs) / 2.0  # vertical centering
+                c.drawString(x, y, val)
+
+        c.showPage()
+        c.save()
+        overlays.append(bio.getvalue())
+
+    return overlays
+
+def fill_pdf_with_font(template_bytes: bytes, fields: dict, ttf_path: str, remove_widgets: bool = True) -> bytes:
+    """
+    Flatten form by drawing values using the provided TTF and merging onto template pages.
+    Optionally removes the original widgets so the PDF is truly flattened.
+    """
+    if not PYPDF_OK:
+        raise RuntimeError("pypdf missing")
+
+    reader = PdfReader(io.BytesIO(template_bytes))
+    overlays = build_overlay_pages_with_font(reader, fields, ttf_path)
+
+    writer = PdfWriter()
+    for p_idx, page in enumerate(reader.pages):
+        if p_idx < len(overlays) and overlays[p_idx]:
+            ov_reader = PdfReader(io.BytesIO(overlays[p_idx]))
+            ov_page = ov_reader.pages[0]
+            page.merge_page(ov_page)
+
+        if remove_widgets and "/Annots" in page:
+            try:
+                annots = page["/Annots"]
+                new_annots = []
+                for a_ref in annots:
+                    try:
+                        a = a_ref.get_object()
+                        if a.get("/Subtype") != "/Widget":
+                            new_annots.append(a_ref)
+                    except Exception:
+                        continue
+                if new_annots:
+                    page["/Annots"] = new_annots
+                else:
+                    del page["/Annots"]
+            except Exception:
+                pass
+
+        writer.add_page(page)
+
+    try:
+        root = writer._root_object
+        if "/AcroForm" in root:
+            del root["/AcroForm"]
+    except Exception:
+        pass
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
 # =========================================================
 # Estado inicial
 # =========================================================
@@ -810,16 +939,20 @@ if fieldset:
             P(tag+"ETO", p["eto"])
             P(tag+"Estimated_FOB", fmt(p["efob"], 'fuel'))
 
+# ===== BUTTON: generate PDF using embedded TTF overlay & flatten =====
 if st.button("Gerar PDF NAVLOG", type="primary"):
     try:
         if not template_bytes: raise RuntimeError("Template PDF não carregado")
-        out = fill_pdf(template_bytes, named)
+        # Old (kept for reference):
+        # out = fill_pdf(template_bytes, named)
+        # New: flatten with custom font at /mnt/data/Arm-Regular.ttf
+        out = fill_pdf_with_font(template_bytes, named, "/mnt/data/Arm-Regular.ttf")
         m = re.search(r'(\d+)', st.session_state.lesson or "")
         lesson_num = m.group(1) if m else "00"
         safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
         filename = f"{safe_date}_LESSON-{lesson_num}_NAVLOG.pdf"
         st.download_button("📄 Download PDF", data=out, file_name=filename, mime="application/pdf")
-        st.success("PDF gerado.")
+        st.success("PDF gerado (flattened com Arm-Regular.ttf).")
     except Exception as e:
         st.error(f"Erro ao gerar PDF: {e}")
 
@@ -847,7 +980,7 @@ def build_report_pdf():
         ["Cruise Alt (ft)", fmt(cruise_alt,'alt')],
         ["Startup / Taxi / ETD", f"{st.session_state.startup} / 10 min / {(add_seconds(parse_hhmm(st.session_state.startup),10*60).strftime('%H:%M') if st.session_state.startup else '')}"],
         ["QNH / OAT / ISA dev", f"{int(st.session_state.qnh)} / {int(st.session_state.temp_c)} / {int(round(st.session_state.temp_c - isa_temp(pressure_alt(dep_elev, st.session_state.qnh))))}"],
-        ["Vento FROM / Var", f"{int(round(st.session_state.wind_from)):03d}/{int(round(st.session_state.wind_kt)):02d} / {int(round(st.session_state.var_deg))}{'E' if st.session_state.var_is_e else 'W'}"],
+        ["Vento FROM / Var", f"{int(round(st.session_state.wind_from)):03d}/{int(round(st.session_state.wind_kt)):02d} kt / {int(round(st.session_state.var_deg))}{'E' if st.session_state.var_is_e else 'W'}"],
         ["TAS (cl/cru/des)", f"{_round_unit(tas_climb)}/{_round_unit(tas_cruise)}/{_round_unit(tas_descent)} kt"],
         ["FF (cl/cru/des)", f"{_round_unit(ff_climb)}/{_round_unit(ff_cruise)}/{_round_unit(ff_descent)} L/h"],
         ["ROCs/ROD", f"{_round_unit(roc)} ft/min / {_round_unit(st.session_state.rod_fpm)} ft/min"],
@@ -900,3 +1033,4 @@ if st.button("Gerar Relatório (PDF)"):
         st.success("Relatório gerado.")
     except Exception as e:
         st.error(f"Erro ao gerar relatório: {e}")
+
