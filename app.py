@@ -946,7 +946,7 @@ if st.button("Gerar PDF NAVLOG", type="primary"):
         # Old (kept for reference):
         # out = fill_pdf(template_bytes, named)
         # New: flatten with custom font at /mnt/data/Arm-Regular.ttf
-        out = fill_pdf_with_font(template_bytes, named, "/mnt/data/Arm-Regular.ttf")
+        out = fill_pdf_with_font(template_bytes, named, "Arm-Regular.ttf")
         m = re.search(r'(\d+)', st.session_state.lesson or "")
         lesson_num = m.group(1) if m else "00"
         safe_date = dt.datetime.now(pytz.timezone("Europe/Lisbon")).strftime("%Y-%m-%d")
