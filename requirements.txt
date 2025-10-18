@@ -1,6 +1,5 @@
-streamlit
-pypdf
-pymupdf
-reportlab
-pytz
-st_folium
+streamlit>=1.33,<2
+folium>=0.15
+streamlit-folium>=0.20
+pandas>=2.2
+numpy>=1.26
