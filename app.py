@@ -1,20 +1,20 @@
-# app.py — NAVLOG v10 (AFM) — PyDeck + riscas 2min + TOC/TOD
-# - Mapa com PyDeck (deck.gl), rápido e estável no Streamlit
-# - Leg “ticks” (riscas pretas) A CADA 2 MINUTOS ao longo da perna (tempo real por fase)
-# - Dog-house (texto) no meio de cada leg
-# - Construção de legs a partir de waypoints (CSV/localidades ou manual)
-# - Inputs de leg com RPM de cruise por leg; fases logo abaixo do cartão; TOC/TOD preservados
-# - Nada de tabelas; cartões claros
+# app.py — NAVLOG v11 (AFM) — PyDeck + Triângulos (“dog houses”) + riscas 2 min + TOC/TOD
+# - Lê AD/HEL/ULM e Localidades a partir de CSVs locais (sem upload)
+# - Constrói legs a partir de WPs, calcula fases (Climb/Descent/Cruise/Hold) com TOC/TOD
+# - Mapa PyDeck com:
+#     • linha da rota
+#     • riscas pretas a cada 2 minutos (tempo real com GS por fase)
+#     • “dog houses” triangulares orientadas com TC + rótulo de texto
+# - UI por leg (inputs) seguido dos cartões de fases (sem tabelas). Cruise RPM por leg.
 
 import streamlit as st
 import pydeck as pdk
-import datetime as dt
-import math, re
 import pandas as pd
+import math, re, datetime as dt
 from math import sin, asin, radians, degrees
 
 # ===================== PAGE / STYLE =====================
-st.set_page_config(page_title="NAVLOG v10 — PyDeck + TOC/TOD", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NAVLOG v11 — PyDeck + Triângulos", layout="wide", initial_sidebar_state="collapsed")
 
 CSS = """
 <style>
@@ -36,7 +36,7 @@ CSS = """
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-# ===================== UTILS GERAIS =====================
+# ===================== UTILS =====================
 rt10   = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
 mmss   = lambda t: f"{t//60:02d}:{t%60:02d}"
 hhmmss = lambda t: f"{t//3600:02d}:{(t%3600)//60:02d}:{t%60:02d}"
@@ -58,9 +58,8 @@ def wind_triangle(tc, tas, wdir, wkt):
 
 apply_var = lambda th, var, east_is_neg=False: wrap360(th - var if east_is_neg else th + var)
 
-# ===== geodesia (NM) =====
+# geodesia (NM)
 EARTH_NM = 3440.065
-
 def gc_dist_nm(lat1, lon1, lat2, lon2):
     φ1, λ1, φ2, λ2 = map(math.radians, [lat1, lon1, lat2, lon2])
     dφ, dλ = φ2-φ1, λ2-λ1
@@ -93,7 +92,7 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
-# ===================== AFM (Tecnam P2008 resumido) =====================
+# ===================== AFM (Tecnam P2008 — resumo) =====================
 ROC_ENR = {
     0:{-25:981,0:835,25:704,50:586}, 2000:{-25:870,0:726,25:597,50:481},
     4000:{-25:759,0:617,25:491,50:377}, 6000:{-25:648,0:509,25:385,50:273},
@@ -112,11 +111,11 @@ CRUISE = {
 }
 isa_temp   = lambda pa: 15.0 - 2.0*(pa/1000.0)
 press_alt  = lambda alt, qnh: float(alt) + (1013.0 - float(qnh)) * 30.0
-
-def interp1(x, x0, x1, y0, y1):
+def interp1(x, x0, x1, y0, y1):  # linear
     if x1 == x0: return y0
     t = (x - x0) / (x1 - x0)
     return y0 + t * (y1 - y0)
+def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 def cruise_lookup(pa, rpm, oat, weight):
     rpm = min(int(rpm), 2265)
@@ -152,7 +151,7 @@ def roc_interp(pa, temp):
     v00, v01 = ROC_ENR[p0][t0], ROC_ENR[p0][t1]
     v10, v11 = ROC_ENR[p1][t0], ROC_ENR[p1][t1]
     v0 = interp1(t, t0, t1, v00, v01); v1 = interp1(t, t0, t1, v10, v11)
-    return max(1.0, interp1(pa_c, p0, p1, v0, v1) * 0.90)
+    return max(1.0, interp1(pa_c, p0, p1, v0, v1) * ROC_FACTOR)
 
 def vy_interp(pa):
     pas = sorted(VY.keys()); pa_c = clamp(pa, pas[0], pas[-1])
@@ -161,35 +160,25 @@ def vy_interp(pa):
 
 # ===================== STATE =====================
 def ens(k, v): return st.session_state.setdefault(k, v)
-
 ens("qnh", 1013); ens("oat", 15); ens("mag_var", 1); ens("mag_is_e", False)
 ens("weight", 650.0)
 ens("rpm_climb", 2250); ens("rpm_desc", 1800)
 ens("desc_angle", 3.0)
 ens("start_clock", ""); ens("start_efob", 85.0)
-ens("ck_default", 2)
-ens("show_timeline", False)
+ens("ck_default", 2); ens("show_timeline", False)
 ens("wind_from", 0); ens("wind_kt", 0)
+ens("wps", []); ens("legs", []); ens("computed_by_leg", [])
 
-# waypoints [{name,lat,lon,alt}]
-ens("wps", [])
-# legs (derivadas de WPs)
-ens("legs", [])
-# fases por leg
-ens("computed_by_leg", [])
-
-# ===================== TIMELINE RENDER (texto) =====================
+# ===================== TIMELINE (texto) =====================
 def timeline(seg, cps, start_label, end_label, toc_tod=None):
     total = max(1, int(seg['time']))
     html = "<div class='tl'><div class='bar'></div>"
     parts = []
     for cp in cps:
         pct = (cp['t']/total)*100.0
-        parts += [
-            f"<div class='tick' style='left:{pct:.2f}%;'></div>",
-            f"<div class='cp-lbl' style='left:{pct:.2f}%;'><div>T+{cp['min']}m</div><div>{cp['nm']} nm</div>" +
-            (f"<div>{cp['eto']}</div>" if cp['eto'] else "") + f"<div>EFOB {cp['efob']:.1f}</div></div>"
-        ]
+        parts += [f"<div class='tick' style='left:{pct:.2f}%;'></div>",
+                  f"<div class='cp-lbl' style='left:{pct:.2f}%;'><div>T+{cp['min']}m</div><div>{cp['nm']} nm</div>" +
+                  (f"<div>{cp['eto']}</div>" if cp['eto'] else "") + f"<div>EFOB {cp['efob']:.1f}</div></div>"]
     if toc_tod is not None and 0 < toc_tod['t'] < total:
         pct = (toc_tod['t']/total)*100.0
         cls = 'tocdot' if toc_tod['type'] == 'TOC' else 'toddot'
@@ -205,7 +194,7 @@ def phase_label(name):
     if "hold" in n:    return "Hold"
     return "Cruise/Level"
 
-# ===================== CÁLCULO DAS FASES =====================
+# ===================== CÁLCULO POR LEG (fases) =====================
 def build_segments(tc, dist, alt0, alt1, wfrom, wkt, ck_min, params, rpm_cruise_leg, hold_min=0.0, hold_ff_input=0.0):
     qnh, oat, mag_var, mag_is_e = params['qnh'], params['oat'], params['mag_var'], params['mag_is_e']
     rpm_climb, rpm_desc, desc_angle, weight = params['rpm_climb'], params['rpm_desc'], params['desc_angle'], params['weight']
@@ -232,7 +221,7 @@ def build_segments(tc, dist, alt0, alt1, wfrom, wkt, ck_min, params, rpm_cruise_
     segs, toc_tod_marker = [], None
 
     if profile == "CLIMB":
-        t_need = (alt1 - alt0) / max(ROC, 1e-6)  # min
+        t_need = (alt1 - alt0) / max(ROC, 1e-6)
         d_need = GScl * (t_need / 60.0)
         if d_need <= dist:
             tA = rt10(t_need * 60)
@@ -301,7 +290,7 @@ def build_segments(tc, dist, alt0, alt1, wfrom, wkt, ck_min, params, rpm_cruise_
         "tot_sec": tot_sec,
         "tot_burn": tot_burn,
         "roc": roc_interp(pa0, oat),
-        "rod": max(100.0, (wind_triangle(tc, cruise_lookup((pa0+pa1)/2.0, int(rpm_desc), oat, params['weight'])[0], 0, 0)[2]) * 5.0 * (params['desc_angle']/3.0)),
+        "rod": max(100.0, (wind_triangle(tc, cruise_lookup((pa0+pa1)/2.0, int(rpm_desc), oat, weight)[0], 0, 0)[2]) * 5.0 * (params['desc_angle']/3.0)),
         "toc_tod": toc_tod_marker,
         "ck_func": cps
     }
@@ -356,32 +345,30 @@ def recompute_all_by_leg():
                 "toc_tod": (res["toc_tod"] if idx_seg==0 and ("Climb" in seg["name"] or "Descent" in seg["name"]) else None),
                 "roc": res["roc"], "rod": res["rod"], "rpm_cruise_leg": leg["RPMcru"], "ck": leg["CK"]
             })
-
-            t_cursor += seg["time"]
-            carry_efob = efob_end
+            t_cursor += seg['time']; carry_efob = efob_end
 
         if clock: clock = clock + dt.timedelta(seconds=sum(s['time'] for s in res["segments"]))
-
         st.session_state.computed_by_leg.append({
             "leg_ref": leg, "phases": phases,
             "tot_sec": sum(p["time"] for p in phases),
             "tot_burn": r10f(sum(p["burn"] for p in phases))
         })
 
-# ===================== CRUD LEGS / WAYPOINTS =====================
+# ===================== CRUD / BUILD LEGS =====================
 def add_leg_from_points(pA, pB, altA, altB, rpm_cru, wfrom, wkt, ck):
     tc = gc_course_tc(pA["lat"], pA["lon"], pB["lat"], pB["lon"])
     dist = gc_dist_nm(pA["lat"], pA["lon"], pB["lat"], pB["lon"])
     st.session_state.legs.append(dict(
         TC=float(tc), Dist=float(dist), Alt0=float(altA), Alt1=float(altB),
-        Wfrom=int(wfrom), Wkt=int(wkt), CK=int(ck),
-        HoldMin=0.0, HoldFF=0.0, RPMcru=int(rpm_cru)
+        Wfrom=int(wfrom), Wkt=int(wkt), CK=int(ck), HoldMin=0.0, HoldFF=0.0, RPMcru=int(rpm_cru)
     ))
-
 def update_leg(leg_ref, **vals): leg_ref.update(vals)
 def delete_leg(idx): st.session_state.legs.pop(idx)
 
-# ===================== PARSE AD/LOCALIDADES (opcional) =====================
+# ===================== PARSE AD/LOCALIDADES (CSV locais) =====================
+AD_CSV  = "AD-HEL-ULM.csv"
+LOC_CSV = "Localidades-Nova-versao-230223.csv"
+
 def dms_to_dd(token: str, is_lon=False):
     token = str(token).strip()
     m = re.match(r"^(\d+(?:\.\d+)?)([NSEW])$", token, re.I)
@@ -408,14 +395,10 @@ def parse_ad_df(df: pd.DataFrame) -> pd.DataFrame:
             lat_tok = coord_toks[-2]; lon_tok = coord_toks[-1]
             lat = dms_to_dd(lat_tok, is_lon=False); lon = dms_to_dd(lon_tok, is_lon=True)
             ident = tokens[0] if re.match(r"^[A-Z0-9]{4,}$", tokens[0]) else None
-            try:
-                name = " ".join(tokens[1:tokens.index(coord_toks[0])]).strip()
-            except ValueError:
-                name = " ".join(tokens[1:]).strip()
-            try:
-                lon_idx = tokens.index(lon_tok); city = " ".join(tokens[lon_idx+1:]) or None
-            except ValueError:
-                city = None
+            try:    name = " ".join(tokens[1:tokens.index(coord_toks[0])]).strip()
+            except: name = " ".join(tokens[1:]).strip()
+            try:    lon_idx = tokens.index(lon_tok); city = " ".join(tokens[lon_idx+1:]) or None
+            except: city = None
             rows.append({"type":"AD","code":ident or name, "name":name, "city":city,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
@@ -440,7 +423,7 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
 # ===================== HEADER =====================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 h1, h2, h3, h4 = st.columns([3,2,3,2])
-with h1: st.title("NAVLOG — v10 (AFM)")
+with h1: st.title("NAVLOG — v11 (AFM)")
 with h2: st.toggle("Mostrar TIMELINE/CPs", key="show_timeline", value=st.session_state.show_timeline)
 with h3:
     if st.button("➕ Novo waypoint manual", use_container_width=True):
@@ -476,14 +459,19 @@ if submitted and st.session_state.legs:
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ===================== DATASETS (opcional) + pesquisa =====================
-ad_file = st.file_uploader("CSV AD/HEL/ULM (opcional)", type=["csv"], key="adcsv")
-loc_file = st.file_uploader("CSV Localidades (opcional)", type=["csv"], key="loccsv")
-ad_df = parse_ad_df(pd.read_csv(ad_file)) if ad_file else pd.DataFrame(columns=["type","code","name","city","lat","lon","alt"])
-loc_df = parse_loc_df(pd.read_csv(loc_file)) if loc_file else pd.DataFrame(columns=["type","code","name","sector","lat","lon","alt"])
+# ===================== LER CSVs LOCAIS + ADICIONAR WPs POR PESQUISA =====================
+try:
+    ad_raw  = pd.read_csv(AD_CSV)
+    loc_raw = pd.read_csv(LOC_CSV)
+    ad_df  = parse_ad_df(ad_raw)
+    loc_df = parse_loc_df(loc_raw)
+except Exception as e:
+    ad_df  = pd.DataFrame(columns=["type","code","name","city","lat","lon","alt"])
+    loc_df = pd.DataFrame(columns=["type","code","name","sector","lat","lon","alt"])
+    st.warning("Não foi possível ler os CSVs locais. Verifica os nomes de ficheiro.")
 
 cflt1, cflt2, cbtn = st.columns([3,3,1.5])
-with cflt1: qtxt = st.text_input("🔎 Procurar AD/Localidade", "", placeholder="Ex: LPPT, ABRANTES, LP0078…")
+with cflt1: qtxt = st.text_input("🔎 Procurar AD/Localidade (CSV local)", "", placeholder="Ex: LPPT, ABRANTES, LP0078…")
 with cflt2: alt_wp = st.number_input("Altitude para WPs adicionados (ft)", 0.0, 18000.0, 3000.0, step=100.0)
 with cbtn: add_sel = st.button("Adicionar resultados")
 
@@ -492,14 +480,14 @@ def filter_df(df, q):
     tq = q.lower().strip()
     return df[df.apply(lambda r: any(tq in str(v).lower() for v in r.values), axis=1)]
 
-ad_f = filter_df(ad_df, qtxt)
+ad_f  = filter_df(ad_df, qtxt)
 loc_f = filter_df(loc_df, qtxt)
 if add_sel:
     for _, r in pd.concat([ad_f, loc_f]).iterrows():
         st.session_state.wps.append({"name": str(r["code"]), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
     st.success(f"Adicionados {len(ad_f)+len(loc_f)} WPs.")
 
-# ===================== EDITOR DE WAYPOINTS =====================
+# ===================== EDITOR DE WPs =====================
 if st.session_state.wps:
     st.subheader("Rota (Waypoints)")
     for i, w in enumerate(st.session_state.wps):
@@ -525,7 +513,7 @@ if st.session_state.wps:
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ===================== GERAR LEGS A PARTIR DOS WPs =====================
-cgl1, cgl2, cgl3 = st.columns([2,2,6])
+cgl1, cgl2, _ = st.columns([2,2,6])
 with cgl1: rpm_default = st.number_input("Cruise RPM default p/ legs", 1800, 2265, 2100, step=5)
 with cgl2: gen = st.button("Gerar/Atualizar legs a partir dos WAYPOINTS", type="primary", use_container_width=True)
 
@@ -619,7 +607,6 @@ if st.session_state.legs:
             st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-
         total_sec_all  += comp_leg["tot_sec"]
         total_burn_all += comp_leg["tot_burn"]
         if phases: efob_final = phases[-1]["efob_end"]
@@ -632,41 +619,40 @@ if st.session_state.legs:
         + "</div>", unsafe_allow_html=True
     )
 
-# ===================== MAPA (PYDECK) — rota, riscas 2min, dog-house =====================
-# Só faz sentido se houver pairs de WPs e legs calculadas
+# ===================== MAPA (PYDECK) — rota, riscas 2min, triângulos =====================
+def triangle_coords(lat, lon, heading_deg, h_nm=0.8, w_nm=0.55):
+    """
+    Triângulo isósceles orientado por 'heading_deg':
+      - apex à frente (+h/2), base center atrás (-h/2)
+      - base width = w_nm (cada lado w/2)
+    Devolve lista [[lon,lat], ...] no sentido horário, fechado.
+    """
+    base_c_lat, base_c_lon = dest_point(lat, lon, heading_deg, -h_nm/2.0)
+    apex_lat, apex_lon      = dest_point(lat, lon, heading_deg,  h_nm/2.0)
+    bl_lat, bl_lon = dest_point(base_c_lat, base_c_lon, heading_deg-90.0, w_nm/2.0)
+    br_lat, br_lon = dest_point(base_c_lat, base_c_lon, heading_deg+90.0, w_nm/2.0)
+    return [[bl_lon, bl_lat], [apex_lon, apex_lat], [br_lon, br_lat], [bl_lon, bl_lat]]
+
 if len(st.session_state.wps) >= 2 and st.session_state.legs and st.session_state.computed_by_leg:
-    # 1) Caminho principal (magenta)
-    path_data = []
-    tick_data = []   # riscas (pequenos segmentos)
-    label_data = []  # dog-house (TextLayer)
+    path_data, tick_data, tri_data, label_data = [], [], [], []
 
     for i in range(len(st.session_state.wps)-1):
         A = st.session_state.wps[i]; B = st.session_state.wps[i+1]
         leg = st.session_state.legs[i]
         phases = st.session_state.computed_by_leg[i]["phases"]
 
-        path_data.append({
-            "path": [[A["lon"], A["lat"]], [B["lon"], B["lat"]]],
-            "name": f"L{i+1}"
-        })
+        # rota (linha)
+        path_data.append({"path": [[A["lon"], A["lat"]], [B["lon"], B["lat"]]], "name": f"L{i+1}"})
 
-        # -------- RISCA CADA 2 MIN: acumula pela timeline real (fases e GS por fase) -------
-        # construir sequência de (dur_s, GS_kt) só para segmentos com GS>0
+        # -------- RISCA A CADA 2 MIN COM GS REAL ----------
         segments = [(p["time"], p["GS"]) for p in phases if p["GS"]>0]
-        if not segments:
-            segments = [(st.session_state.computed_by_leg[i]["tot_sec"], 0)]
-
-        t_elapsed = 0
-        dist_elapsed = 0.0
+        if not segments: segments = [(st.session_state.computed_by_leg[i]["tot_sec"], 0)]
         total_leg_dist = leg["Dist"]
-        interval_s = 120  # 2 minutos
+        interval_s = 120
         k = 1
-        # gerar marcas até ETE total
         while k*interval_s <= sum(s[0] for s in segments):
             target_t = k*interval_s
-            # avança dos segmentos até chegar ao target_t
-            dist_target = 0.0
-            t_acc = 0
+            dist_target = 0.0; t_acc = 0
             for dur, gs in segments:
                 if t_acc + dur >= target_t:
                     dt_here = target_t - t_acc
@@ -675,69 +661,56 @@ if len(st.session_state.wps) >= 2 and st.session_state.legs and st.session_state
                 else:
                     dist_target += gs * (dur / 3600.0)
                     t_acc += dur
-            # clampa à distância total geodésica
             dist_target = min(dist_target, total_leg_dist)
-            # ponto no grande círculo nessa distância
             latm, lonm = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], dist_target)
-            # direção local aprox (usar TC inicial — excelente aproximação para dist curtas)
             tc = leg["TC"]
-            # cria risca perpendicular centrada no ponto; comprimento: 0.30 nm (0.15 p/ cada lado)
             half_nm = 0.15
             left_lat, left_lon   = dest_point(latm, lonm, tc-90, half_nm)
             right_lat, right_lon = dest_point(latm, lonm, tc+90, half_nm)
             tick_data.append({"path": [[left_lon, left_lat], [right_lon, right_lat]]})
             k += 1
 
-        # -------- DOG-HOUSE (texto) ----------
-        # ponto médio do GC:
-        lat_mid, lon_mid = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], total_leg_dist/2.0)
-        # desloca ligeiramente para o lado para não tapar a linha
-        off_lat, off_lon = dest_point(lat_mid, lon_mid, leg["TC"]+90, 0.3)
-        # escolhe uma fase com GS>0 para métricas
+        # -------- DOG HOUSE TRIANGULAR + TEXTO ----------
+        # centro levemente deslocado para a direita da perna (não tapar)
+        mid_lat, mid_lon = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], total_leg_dist/2.0)
+        off_lat, off_lon = dest_point(mid_lat, mid_lon, leg["TC"]+90, 0.3)
+        tri = triangle_coords(off_lat, off_lon, leg["TC"], h_nm=0.9, w_nm=0.65)
+        tri_data.append({"polygon": tri})
+
+        # rótulo (texto) ao lado do triângulo
         ref = next((p for p in phases if p["GS"]>0), phases[0])
-        text = f"L{i+1}  {rang(ref['TH'])}T/{rang(ref['MH'])}M  {r10f(leg['Dist'])}nm  GS {rint(ref['GS'])}kt  ETE {hhmmss(st.session_state.computed_by_leg[i]['tot_sec'])}"
-        label_data.append({"position":[off_lon, off_lat], "text": text})
+        label_text = f"{rang(ref['TH'])}T/{rang(ref['MH'])}M • {r10f(leg['Dist'])}nm • GS {rint(ref['GS'])} • ETE {mmss(st.session_state.computed_by_leg[i]['tot_sec'])}"
+        label_pos = dest_point(off_lat, off_lon, leg["TC"]+90, 0.35)  # um pouco mais para o lado
+        label_data.append({"position":[label_pos[1], label_pos[0]], "text": label_text})
 
     # LAYERS
-    route_layer = pdk.Layer(
-        "PathLayer",
-        data=path_data,
-        get_path="path",
-        get_color=[180, 0, 255, 220],
-        width_scale=1,
-        width_min_pixels=4,
+    route_layer = pdk.Layer("PathLayer", data=path_data, get_path="path", get_color=[180, 0, 255, 220], width_min_pixels=4)
+    ticks_layer = pdk.Layer("PathLayer", data=tick_data, get_path="path", get_color=[0, 0, 0, 255], width_min_pixels=2)
+    tri_layer   = pdk.Layer(
+        "PolygonLayer",
+        data=tri_data,
+        get_polygon="polygon",
+        get_fill_color=[255,255,255,230],   # branco
+        get_line_color=[0,0,0,255],        # contorno preto
+        line_width_min_pixels=2,
+        stroked=True,
+        filled=True
     )
-    ticks_layer = pdk.Layer(
-        "PathLayer",
-        data=tick_data,
-        get_path="path",
-        get_color=[0, 0, 0, 255],   # pretas
-        width_scale=1,
-        width_min_pixels=2,
-    )
-    text_layer = pdk.Layer(
-        "TextLayer",
-        data=label_data,
-        get_position="position",
-        get_text="text",
-        get_size=14,
-        get_color=[0,0,0],
-        get_alignment_baseline="'bottom'",
-        get_angle=0,
-        pickable=False,
-    )
+    text_layer  = pdk.Layer("TextLayer", data=label_data, get_position="position", get_text="text",
+                            get_size=14, get_color=[0,0,0], get_alignment_baseline="'center'")
 
-    # vista (centra na média dos WPs)
     mean_lat = sum([w["lat"] for w in st.session_state.wps])/len(st.session_state.wps)
     mean_lon = sum([w["lon"] for w in st.session_state.wps])/len(st.session_state.wps)
-    view_state = pdk.ViewState(latitude=mean_lat, longitude=mean_lon, zoom=7, pitch=0)
 
+    # usar estilo Positron (sem token)
+    view_state = pdk.ViewState(latitude=mean_lat, longitude=mean_lon, zoom=7, pitch=0)
     deck = pdk.Deck(
-        map_style="light",
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
         initial_view_state=view_state,
-        layers=[route_layer, ticks_layer, text_layer],
+        layers=[route_layer, ticks_layer, tri_layer, text_layer],
         tooltip={"text": "{name}"}
     )
     st.pydeck_chart(deck)
 else:
-    st.info("Adiciona pelo menos 2 waypoints e gera as legs para ver o mapa com a rota, as riscas e as dog-houses.")
+    st.info("Adiciona pelo menos 2 waypoints e gera as legs para ver a rota, riscas e triângulos.")
+
