@@ -471,4 +471,3 @@ with tab3:
                 if warns: st.warning(" | ".join(warns))
                 
                 st.markdown("</div>", unsafe_allow_html=True)
-```
