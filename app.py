@@ -1,15 +1,15 @@
-# app.py — NAVLOG v10 (AFM) — UI Moderna & Intuitiva
-# Objetivo: Interface mais limpa, editor de legs em tabela interativa, cartões de fase aprimorados,
-# resumo global destacado, atualizações eficientes, sem perder TOC/TOD ou funcionalidades.
+# app.py — NAVLOG v10 (AFM) — UI Otimizada & Intuitiva
+# Objetivo: Interface moderna, fluida e focada no usuário. Inputs agrupados logicamente,
+# navegação por tabs para legs, cartões interativos por fase, visualizações aprimoradas,
+# validações e feedback em tempo real. Mantém todas as funcionalidades originais.
 
 import streamlit as st
 import datetime as dt
 import math
 from math import sin, asin, radians, degrees
-import pandas as pd
 
 # ====== CONFIG ======
-st.set_page_config(page_title="NAVLOG v10 (AFM) — UI Moderna", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NAVLOG v10 (AFM) — UI Otimizada", layout="wide", initial_sidebar_state="collapsed")
 
 # ====== UTILS ======
 rt10   = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
@@ -113,35 +113,49 @@ ens("weight", 650.0)
 ens("rpm_climb", 2250); ens("rpm_desc", 1800)
 ens("desc_angle", 3.0)
 ens("start_clock", ""); ens("start_efob", 85.0)
-ens("legs", [])  # cada leg: {'TC':0.0, 'Dist':0.0, 'Alt0':0.0, 'Alt1':0.0, 'Wfrom':0, 'Wkt':0, 'CK':2, 'HoldMin':0.0, 'HoldFF':0.0, 'RPMcru':2100}
+ens("legs", [])  # cada leg: {TC, Dist, Alt0, Alt1, Wfrom, Wkt, CK, HoldMin, HoldFF, RPMcru}
 ens("computed", [])
 ens("ck_default", 2)
-ens("show_timeline", False)
+ens("show_timeline", True)  # Ativado por default para melhor UX
+ens("selected_leg", None)  # Para edição
 
-# ====== ESTILO (aprimorado para melhor visual) ======
+# ====== ESTILO APRIMORADO (mais moderno, com cores e transições) ======
 CSS = """
 <style>
-:root{--line:#d1d5db;--chip:#f3f4f6;--muted:#4b5563;--accent:#3b82f6;--warning:#ef4444;--success:#10b981}
-*{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial}
-.card{border:1px solid var(--line);border-radius:12px;padding:16px;margin:16px 0;background:#fff;box-shadow:0 2px 4px rgba(0,0,0,.05)}
-.kvrow{display:flex;flex-wrap:wrap;gap:8px}
-.kv{background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:13px;font-weight:500}
-.badge{background:var(--accent);color:white;border-radius:999px;padding:2px 8px;font-size:12px;margin-left:8px}
-.sep{height:1px;background:var(--line);margin:16px 0}
-.sticky{position:sticky;top:0;background:#ffffffee;backdrop-filter:saturate(180%) blur(8px);z-index:100;border-bottom:1px solid var(--line);padding:8px 0}
-.tl{position:relative;margin:12px 0 24px 0;padding-bottom:48px}
-.tl .bar{height:8px;background:#e5e7eb;border-radius:4px}
-.tl .tick{position:absolute;top:12px;width:2px;height:16px;background:var(--muted)}
-.tl .cp-lbl{position:absolute;top:36px;transform:translateX(-50%);text-align:center;font-size:12px;color:var(--muted);white-space:nowrap}
-.tl .tocdot,.tl .toddot{position:absolute;top:-8px;width:16px;height:16px;border-radius:50%;transform:translateX(-50%);border:3px solid #fff;box-shadow:0 0 0 3px rgba(0,0,0,0.1)}
-.tl .tocdot{background:var(--accent)}.tl .toddot{background:var(--warning)}
-.stAlert {border-radius:8px;padding:12px}
-.stMetric {border-left:4px solid var(--accent);padding-left:8px}
+:root {
+    --primary: #1f77b4; /* Azul principal */
+    --secondary: #d62728; /* Vermelho para destaques */
+    --bg: #f9fafb; /* Fundo claro */
+    --card-bg: #ffffff; /* Fundo cartão */
+    --line: #d1d5db; /* Bordas */
+    --text: #111827; /* Texto principal */
+    --muted: #6b7280; /* Texto muted */
+    --chip: #f3f4f6; /* Chips */
+    --shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+}
+body { background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial; }
+.card { background: var(--card-bg); border: 1px solid var(--line); border-radius: 16px; padding: 20px; margin: 16px 0; box-shadow: var(--shadow); transition: box-shadow 0.3s; }
+.card:hover { box-shadow: 0 6px 12px -2px rgba(0,0,0,0.15); }
+.kvrow { display: flex; gap: 12px; flex-wrap: wrap; }
+.kv { background: var(--chip); border: 1px solid var(--line); border-radius: 12px; padding: 8px 12px; font-size: 13px; font-weight: 500; }
+.badge { background: var(--chip); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 12px; margin-left: 8px; }
+.sep { height: 1px; background: var(--line); margin: 16px 0; }
+.sticky { position: sticky; top: 0; background: #ffffffee; backdrop-filter: saturate(150%) blur(8px); z-index: 50; border-bottom: 1px solid var(--line); padding: 12px 0; }
+.tl { position: relative; margin: 12px 0 24px 0; padding-bottom: 50px; }
+.tl .bar { height: 8px; background: #e5e7eb; border-radius: 4px; }
+.tl .tick { position: absolute; top: 12px; width: 2px; height: 16px; background: var(--muted); }
+.tl .cp-lbl { position: absolute; top: 36px; transform: translateX(-50%); text-align: center; font-size: 12px; color: var(--text); white-space: nowrap; }
+.tl .tocdot, .tl .toddot { position: absolute; top: -8px; width: 16px; height: 16px; border-radius: 50%; transform: translateX(-50%); border: 3px solid #fff; box-shadow: 0 0 0 2px rgba(0,0,0,0.2); transition: transform 0.3s; }
+.tl .tocdot { background: var(--primary); }
+.tl .toddot { background: var(--secondary); }
+.tl .tocdot:hover, .tl .toddot:hover { transform: translateX(-50%) scale(1.2); }
+.stButton button { border-radius: 8px; transition: background 0.3s; }
+.stButton button:hover { background: var(--primary); color: white; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-# ====== TIMELINE (aprimorada com tooltips) ======
+# ====== TIMELINE APRIMORADA (com hover e mais info) ======
 def timeline(seg, cps, start_label, end_label, toc_tod=None):
     total = max(1, int(seg['time']))
     html = "<div class='tl'><div class='bar'></div>"
@@ -155,7 +169,8 @@ def timeline(seg, cps, start_label, end_label, toc_tod=None):
     if toc_tod is not None and 0 < toc_tod['t'] < total:
         pct = (toc_tod['t']/total)*100.0
         cls = 'tocdot' if toc_tod['type'] == 'TOC' else 'toddot'
-        parts.append(f"<div class='{cls}' title='{toc_tod['type']} em T+{mmss(toc_tod['t'])}' style='left:{pct:.2f}%;'></div>")
+        title = f"{toc_tod['type']} em T+{mmss(toc_tod['t'])}"
+        parts.append(f"<div class='{cls}' title='{title}' style='left:{pct:.2f}%;'></div>")
     html += ''.join(parts) + "</div>"
     st.markdown(html, unsafe_allow_html=True)
     st.caption(f"GS {rint(seg['GS'])} kt · TAS {rint(seg['TAS'])} kt · FF {rint(seg['ff'])} L/h  |  {start_label} → {end_label}")
@@ -168,10 +183,17 @@ def phase_label(name):
     if "hold" in n:    return "Hold"
     return "Cruise/Level"
 
-# ====== CÁLCULO (mantido, com RPM por leg) ======
+# ====== CÁLCULO (mantido, com validações extras) ======
 def build_segments(tc, dist, alt0, alt1, wfrom, wkt, ck_min, params, rpm_cruise_leg, hold_min=0.0, hold_ff_input=0.0):
     qnh, oat, mag_var, mag_is_e = params['qnh'], params['oat'], params['mag_var'], params['mag_is_e']
     rpm_climb, rpm_desc, desc_angle, weight = params['rpm_climb'], params['rpm_desc'], params['desc_angle'], params['weight']
+
+    # Validações
+    if dist < 0: dist = 0
+    if alt0 < 0: alt0 = 0
+    if alt1 < 0: alt1 = 0
+    tc = wrap360(tc)
+    wfrom = wrap360(wfrom)
 
     pa0 = press_alt(alt0, qnh); pa1 = press_alt(alt1, qnh); pa_avg = (pa0 + pa1)/2.0
     Vy  = vy_interp(pa0)
@@ -275,7 +297,7 @@ def build_segments(tc, dist, alt0, alt1, wfrom, wkt, ck_min, params, rpm_cruise_
         "ck_func": cps
     }
 
-# ====== RECOMPUTE ======
+# ====== RECOMPUTE (com feedback de erros) ======
 def recompute_all():
     st.session_state.computed = []
     params = dict(
@@ -290,8 +312,9 @@ def recompute_all():
         try:
             h,m = map(int, st.session_state.start_clock.split(":"))
             base_time = dt.datetime.combine(dt.date.today(), dt.time(h,m))
-        except:
-            base_time = None
+        except ValueError:
+            st.error("Hora off-blocks inválida. Use formato HH:MM.")
+            return
 
     carry_efob = float(st.session_state.start_efob)
     clock = base_time
@@ -342,120 +365,161 @@ def recompute_all():
         cum_sec += sum(s['time'] for s in segs)
         cum_burn = r10f(cum_burn + sum(s['burn'] for s in segs))
 
-# ====== HEADER ======
+# ====== CRUD APRIMORADO ======
+def add_leg():
+    d = dict(TC=0.0, Dist=0.0, Alt0=0.0, Alt1=0.0, Wfrom=0, Wkt=0,
+             CK=int(st.session_state.ck_default),
+             HoldMin=0.0, HoldFF=0.0,
+             RPMcru=2100)
+    st.session_state.legs.append(d)
+    st.session_state.selected_leg = len(st.session_state.legs) - 1
+    recompute_all()
+
+def update_leg(idx, **vals):
+    st.session_state.legs[idx].update(vals)
+    recompute_all()
+
+def delete_leg(idx):
+    del st.session_state.legs[idx]
+    if st.session_state.selected_leg == idx:
+        st.session_state.selected_leg = None
+    recompute_all()
+
+# ====== HEADER STICKY (com toggle e botões) ======
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
-h1, h2, h3 = st.columns([4,2,2])
-with h1: st.title("NAVLOG v10 (AFM) — Planejador de Voo")
-with h2: st.toggle("Mostrar Timelines & CPs", key="show_timeline")
-with h3: 
-    if st.button("🗑️ Limpar Tudo", use_container_width=True):
-        st.session_state.legs = []
-        st.session_state.computed = []
+h1, h2, h3 = st.columns([4, 2, 2])
+with h1:
+    st.title("NAVLOG v10 — AFM Otimizado")
+with h2:
+    st.toggle("Mostrar Timeline/CPs", key="show_timeline")
+with h3:
+    if st.button("➕ Nova Leg", type="primary", use_container_width=True):
+        add_leg()
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ====== SEÇÕES: Parâmetros Globais, Legs, Resultados ======
-tab1, tab2, tab3 = st.tabs(["📊 Parâmetros Globais", "🛫 Legs (Editor Interativo)", "📈 Resultados & Fases"])
+# ====== TABS PRINCIPAIS: Parâmetros | Legs | Resultados ======
+tab1, tab2, tab3 = st.tabs(["⚙️ Parâmetros Globais", "🛫 Legs", "📊 Resultados"])
 
 with tab1:
     with st.form("params_form"):
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.session_state.qnh = st.number_input("QNH (hPa)", 900, 1050, int(st.session_state.qnh))
-            st.session_state.oat = st.number_input("OAT (°C)", -40, 50, int(st.session_state.oat))
-            st.session_state.mag_var = st.number_input("Mag Var (°)", 0, 30, int(st.session_state.mag_var))
-            st.session_state.mag_is_e = st.selectbox("Var E/W", ["W", "E"], index=1 if st.session_state.mag_is_e else 0) == "E"
+            st.number_input("QNH (hPa)", 900, 1050, key="qnh", help="Pressão altimétrica")
+            st.number_input("OAT (°C)", -40, 50, key="oat", help="Temperatura exterior")
+            st.number_input("Peso (kg)", 450.0, 700.0, key="weight", step=1.0, help="Peso total")
         with col2:
-            st.session_state.start_efob = st.number_input("EFOB Inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
-            st.session_state.start_clock = st.text_input("Hora Off-Blocks (HH:MM)", st.session_state.start_clock)
-            st.session_state.weight = st.number_input("Peso (kg)", 450.0, 700.0, float(st.session_state.weight), step=1.0)
+            st.number_input("EFOB Inicial (L)", 0.0, 200.0, key="start_efob", step=0.5, help="Estimated Fuel On Board inicial")
+            st.text_input("Hora Off-Blocks (HH:MM)", key="start_clock", help="Hora de partida")
+            st.number_input("Ângulo de Descida (°)", 1.0, 6.0, key="desc_angle", step=0.1)
         with col3:
-            st.session_state.rpm_climb = st.number_input("Climb RPM", 1800, 2265, int(st.session_state.rpm_climb), step=5)
-            st.session_state.rpm_desc = st.number_input("Descent RPM", 1600, 2265, int(st.session_state.rpm_desc), step=5)
-            st.session_state.desc_angle = st.number_input("Ângulo Descida (°)", 1.0, 6.0, float(st.session_state.desc_angle), step=0.1)
-        if st.form_submit_button("Aplicar Parâmetros & Recomputar", type="primary"):
+            st.number_input("Climb RPM (Global)", 1800, 2265, key="rpm_climb", step=5)
+            st.number_input("Descent RPM (Global)", 1600, 2265, key="rpm_desc", step=5)
+            st.number_input("Mag Var (°)", 0, 30, key="mag_var")
+            st.selectbox("Var E/W", ["W", "E"], key="mag_is_e", index=1 if st.session_state.mag_is_e else 0)
+        if st.form_submit_button("Aplicar Parâmetros"):
             recompute_all()
+            st.success("Parâmetros aplicados com sucesso!")
 
 with tab2:
     if not st.session_state.legs:
-        st.info("Adicione legs usando o editor abaixo. Clique em '+' para nova linha. Preencha e aplique mudanças.")
-    
-    df_legs = pd.DataFrame(st.session_state.legs)
-    column_config = {
-        "TC": st.column_config.NumberColumn("True Course (°T)", min_value=0.0, max_value=359.9, step=0.1, required=True),
-        "Dist": st.column_config.NumberColumn("Distância (nm)", min_value=0.0, max_value=500.0, step=0.1, required=True),
-        "Alt0": st.column_config.NumberColumn("Alt Inicial (ft)", min_value=0.0, max_value=30000.0, step=50.0, required=True),
-        "Alt1": st.column_config.NumberColumn("Alt Final (ft)", min_value=0.0, max_value=30000.0, step=50.0, required=True),
-        "Wfrom": st.column_config.NumberColumn("Vento FROM (°T)", min_value=0, max_value=360, step=1, required=True),
-        "Wkt": st.column_config.NumberColumn("Vento (kt)", min_value=0, max_value=150, step=1, required=True),
-        "CK": st.column_config.NumberColumn("Checkpoints (min)", min_value=1, max_value=10, step=1, required=True),
-        "RPMcru": st.column_config.NumberColumn("Cruise RPM", min_value=1800, max_value=2265, step=5, required=True),
-        "HoldMin": st.column_config.NumberColumn("Espera (min)", min_value=0.0, max_value=180.0, step=0.5),
-        "HoldFF": st.column_config.NumberColumn("FF Espera (L/h, 0=auto)", min_value=0.0, max_value=60.0, step=0.1),
-    }
-    edited_df = st.data_editor(
-        df_legs,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=False,
-        column_config=column_config,
-        column_order=["TC", "Dist", "Alt0", "Alt1", "Wfrom", "Wkt", "CK", "RPMcru", "HoldMin", "HoldFF"]
-    )
-    if st.button("Aplicar Mudanças nas Legs & Recomputar", type="primary"):
-        st.session_state.legs = edited_df.to_dict('records')
-        recompute_all()
+        st.info("Adicione uma nova leg usando o botão acima para começar.")
+    else:
+        # Lista de legs à esquerda, editor à direita
+        left, right = st.columns([1, 3])
+        with left:
+            st.subheader("Lista de Legs")
+            for i, leg in enumerate(st.session_state.legs):
+                if st.button(f"Leg {i+1}: TC {leg['TC']}° / Dist {leg['Dist']} nm", key=f"select_leg_{i}", use_container_width=True):
+                    st.session_state.selected_leg = i
+            if st.button("🗑️ Limpar Todas as Legs", use_container_width=True):
+                st.session_state.legs = []
+                st.session_state.selected_leg = None
+                recompute_all()
+
+        with right:
+            if st.session_state.selected_leg is not None:
+                i = st.session_state.selected_leg
+                leg = st.session_state.legs[i]
+                st.subheader(f"Editando Leg {i+1}")
+                with st.form(f"leg_form_{i}"):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        TC = st.number_input("True Course (°T)", 0.0, 359.9, float(leg['TC']), step=0.1)
+                        Dist = st.number_input("Distância (nm)", 0.0, 500.0, float(leg['Dist']), step=0.1)
+                        Alt0 = st.number_input("Altitude INI (ft)", 0.0, 30000.0, float(leg['Alt0']), step=50.0)
+                        Alt1 = st.number_input("Altitude DEST (ft)", 0.0, 30000.0, float(leg['Alt1']), step=50.0)
+                    with c2:
+                        Wfrom = st.number_input("Vento FROM (°T)", 0, 360, int(leg['Wfrom']), step=1)
+                        Wkt = st.number_input("Vento (kt)", 0, 150, int(leg['Wkt']), step=1)
+                        CK = st.number_input("Checkpoints (min)", 1, 10, int(leg['CK']), step=1)
+                        RPMcru = st.number_input("Cruise RPM (leg)", 1800, 2265, int(leg['RPMcru']), step=5)
+                    with c3:
+                        HoldMin = st.number_input("Espera (min)", 0.0, 180.0, float(leg.get('HoldMin',0.0)), step=0.5)
+                        HoldFF = st.number_input("FF Espera (L/h) (0=auto)", 0.0, 60.0, float(leg.get('HoldFF',0.0)), step=0.1)
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        if st.form_submit_button("Salvar Alterações"):
+                            update_leg(i, TC=TC, Dist=Dist, Alt0=Alt0, Alt1=Alt1, Wfrom=Wfrom, Wkt=Wkt,
+                                       CK=CK, RPMcru=RPMcru, HoldMin=HoldMin, HoldFF=HoldFF)
+                            st.success("Leg atualizada!")
+                    with b2:
+                        if st.button("Apagar esta Leg"):
+                            delete_leg(i)
+                            st.success("Leg apagada!")
 
 with tab3:
     if not st.session_state.computed:
         st.info("Configure parâmetros e adicione legs para ver os resultados.")
     else:
+        # Resumo global
         total_sec = sum(c["time"] for c in st.session_state.computed)
         total_burn = r10f(sum(c["burn"] for c in st.session_state.computed))
         efob_end = st.session_state.computed[-1]["efob_end"]
-        
-        sum1, sum2, sum3 = st.columns(3)
-        sum1.metric("ETE Total", hhmmss(total_sec))
-        sum2.metric("Burn Total (L)", f"{total_burn:.1f}")
-        sum3.metric("EFOB Final (L)", f"{efob_end:.1f}", delta_color="inverse" if efob_end < 20 else "normal")
-        
+        st.markdown(
+            "<div class='kvrow'>"
+            + f"<div class='kv'>⏱️ ETE Total: <b>{hhmmss(total_sec)}</b></div>"
+            + f"<div class='kv'>⛽ Burn Total: <b>{total_burn:.1f} L</b></div>"
+            + f"<div class='kv'>🧯 EFOB Final: <b>{efob_end:.1f} L</b></div>"
+            + "</div>", unsafe_allow_html=True
+        )
         st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-        
+
+        # Cartões de fase
         for idx, c in enumerate(st.session_state.computed):
             with st.container():
                 st.markdown("<div class='card'>", unsafe_allow_html=True)
-                col_head1, col_head2 = st.columns([3,1])
-                with col_head1:
+                left, right = st.columns([3, 1])
+                with left:
                     st.subheader(f"Fase {idx+1}: {c['phase_label']}")
                     st.caption(c["phase_name"])
-                with col_head2:
-                    st.metric("Distância (nm)", f"{round(c['dist'],1)}")
-                
-                kv_html = "<div class='kvrow'>" + \
-                          f"<div class='kv'>Alt: <b>{int(round(c['alt0']))}→{int(round(c['alt1']))} ft</b></div>" + \
-                          f"<div class='kv'>TH/MH: <b>{rang(c['TH'])}T / {rang(c['MH'])}M</b></div>" + \
-                          f"<div class='kv'>GS/TAS: <b>{rint(c['GS'])}/{rint(c['TAS'])} kt</b></div>" + \
-                          f"<div class='kv'>FF: <b>{rint(c['ff'])} L/h</b></div>" + \
-                          "</div>"
-                st.markdown(kv_html, unsafe_allow_html=True)
-                
-                col_info1, col_info2, col_info3 = st.columns(3)
-                col_info1.metric("Tempo", mmss(c["time"]))
-                col_info2.metric("Burn (L)", f"{c['burn']:.1f}")
-                if "Climb" in c["phase_name"]:
-                    col_info3.metric("ROC ref. (ft/min)", rint(c['roc']))
-                elif "Descent" in c["phase_name"]:
-                    col_info3.metric("ROD ref. (ft/min)", rint(c['rod']))
-                else:
-                    col_info3.metric("Cruise RPM", int(c['rpm_cruise_leg']))
-                
-                col_eto, col_efob = st.columns(2)
-                with col_eto:
+                    st.markdown(
+                        "<div class='kvrow'>"
+                        + f"<div class='kv'>Alt: <b>{int(round(c['alt0']))}→{int(round(c['alt1']))} ft</b></div>"
+                        + f"<div class='kv'>TH/MH: <b>{rang(c['TH'])}T / {rang(c['MH'])}M</b></div>"
+                        + f"<div class='kv'>GS/TAS: <b>{rint(c['GS'])}/{rint(c['TAS'])} kt</b></div>"
+                        + f"<div class='kv'>FF: <b>{rint(c['ff'])} L/h</b></div>"
+                        + "</div>", unsafe_allow_html=True
+                    )
+                with right:
+                    st.metric("Tempo", mmss(c["time"]))
+                    st.metric("Burn (L)", f"{c['burn']:.1f}")
+
+                r1, r2, r3 = st.columns(3)
+                with r1:
                     st.markdown(f"**Relógio:** {c['clock_start']} → {c['clock_end']}")
-                with col_efob:
-                    st.markdown(f"**EFOB:** Start {c['efob_start']:.1f} L → End {c['efob_end']:.1f} L")
-                
+                with r2:
+                    st.markdown(f"**EFOB:** {c['efob_start']:.1f} L → {c['efob_end']:.1f} L")
+                with r3:
+                    if "Climb" in c["phase_name"]:
+                        st.markdown(f"**ROC:** {rint(c['roc'])} ft/min")
+                    elif "Descent" in c["phase_name"]:
+                        st.markdown(f"**ROD:** {rint(c['rod'])} ft/min")
+                    else:
+                        st.markdown(f"**RPM Cruise:** {int(c['rpm_cruise_leg'])}")
+
                 if c["toc_tod"] is not None:
-                    st.info(f"**{c['toc_tod']['type']}** em T+{mmss(c['toc_tod']['t'])}")
-                
+                    st.info(f"{c['toc_tod']['type']} em T+{mmss(c['toc_tod']['t'])}")
+
                 if st.session_state.show_timeline and c["GS"] > 0:
                     timeline(
                         {"GS":c["GS"],"TAS":c["TAS"],"ff":c["ff"],"time":c["time"]},
@@ -463,11 +527,11 @@ with tab3:
                         c["clock_start"], c["clock_end"],
                         toc_tod=c["toc_tod"]
                     )
-                
+
                 warns = []
                 if c["dist"] == 0 and abs(c["alt1"]-c["alt0"])>50: warns.append("Distância 0 com variação de altitude.")
-                if "não atinge" in c["phase_name"]: warns.append("Perfil não atinge a altitude-alvo.")
-                if c["efob_end"] <= 0: warns.append("EFOB no fim é 0 ou negativo.")
+                if "não atinge" in c["phase_name"]: warns.append("Perfil não atinge altitude-alvo.")
+                if c["efob_end"] <= 0: warns.append("EFOB final ≤ 0.")
                 if warns: st.warning(" | ".join(warns))
-                
+
                 st.markdown("</div>", unsafe_allow_html=True)
