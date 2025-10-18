@@ -1,7 +1,8 @@
-# app.py — NAVLOG v12 (AFM)
-# PyDeck + Dog-houses triangulares + riscas cada 2 min + TOC/TOD viram novos WPs/legs
-# Velocidades FIXAS: 70 kt (Climb), 90 kt (Cruise/Descent)
-# Mapa com labels (Carto Voyager GL)
+# NAVLOG v12 — PyDeck • Triângulos (“dog houses”) • Riscas 2 min • TOC/TOD como WPs
+# Espeeds fixos: 70 kt climb, 90 kt cruise/descida. Sem RPMs.
+# Mapa basemap CARTO Voyager (com estradas, rios, localidades).
+# Dog houses triangulares com MH grande colorido (+ TAS e ETO).
+# TOC/TOD inseridos como WPs "virtuais" e geram novas legs.
 
 import streamlit as st
 import pydeck as pdk
@@ -9,8 +10,8 @@ import pandas as pd
 import math, re, datetime as dt
 from math import sin, asin, radians, degrees
 
-# ===================== PAGE / STYLE =====================
-st.set_page_config(page_title="NAVLOG v12 — PyDeck + Triângulos", layout="wide", initial_sidebar_state="collapsed")
+# =============== PAGE / STYLE ===============
+st.set_page_config(page_title="NAVLOG v12 — TOC/TOD + Dog Houses", layout="wide", initial_sidebar_state="collapsed")
 
 CSS = """
 <style>
@@ -32,19 +33,14 @@ CSS = """
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-# ===================== CONSTANTES (velocidades fixas) =====================
-TAS_CLIMB = 70.0     # kt
-TAS_CRUISE = 90.0    # kt
-TAS_DESCENT = 90.0   # kt
-
-# ===================== UTILS =====================
-rt10   = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
-mmss   = lambda t: f"{t//60:02d}:{t%60:02d}"
+# =============== UTILS ===============
+rt10 = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
+mmss = lambda t: f"{t//60:02d}:{t%60:02d}"
 hhmmss = lambda t: f"{t//3600:02d}:{(t%3600)//60:02d}:{t%60:02d}"
-rang   = lambda x: int(round(float(x))) % 360
-rint   = lambda x: int(round(float(x)))
-r10f   = lambda x: round(float(x), 1)
-clamp  = lambda v, lo, hi: max(lo, min(hi, v))
+rang = lambda x: int(round(float(x))) % 360
+rint = lambda x: int(round(float(x)))
+r10f = lambda x: round(float(x), 1)
+clamp = lambda v, lo, hi: max(lo, min(hi, v))
 
 def wrap360(x): x = math.fmod(float(x), 360.0); return x + 360 if x < 0 else x
 def angdiff(a, b): return (a - b + 180) % 360 - 180
@@ -93,209 +89,77 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
-# ===================== AFM simplificado (apenas FF/ROC/ROD, TAS é fixo) =====================
+# AFM bits para ROC / ROD
 ROC_ENR = {
     0:{-25:981,0:835,25:704,50:586}, 2000:{-25:870,0:726,25:597,50:481},
     4000:{-25:759,0:617,25:491,50:377}, 6000:{-25:648,0:509,25:385,50:273},
     8000:{-25:538,0:401,25:279,50:170}, 10000:{-25:428,0:294,25:174,50:66},
     12000:{-25:319,0:187,25:69,50:-37}, 14000:{-25:210,0:80,25:-35,50:-139}
 }
-ROC_FACTOR = 0.90
-CRUISE = {
-    0:{1800:(82,15.3),1900:(89,17.0),2000:(95,18.7),2100:(101,20.7),2250:(110,24.6),2388:(118,27.7)},
-    2000:{1800:(81,15.5),1900:(87,17.0),2000:(93,18.8),2100:(99,20.9),2250:(108,25.0)},
-    4000:{1800:(79,15.2),1900:(86,16.5),2000:(92,18.1),2100:(98,19.2),2250:(106,23.9)},
-    6000:{1800:(78,14.9),1900:(85,16.1),2000:(91,17.5),2100:(97,19.2),2250:(105,22.7)},
-    8000:{1800:(78,14.9),1900:(84,15.7),2000:(90,17.0),2100:(96,18.5),2250:(104,21.5)},
-    10000:{1800:(78,15.5),1900:(82,15.5),2000:(89,16.6),2100:(95,17.9),2250:(103,20.5)},
-}
-isa_temp   = lambda pa: 15.0 - 2.0*(pa/1000.0)
-press_alt  = lambda alt, qnh: float(alt) + (1013.0 - float(qnh)) * 30.0
+isa_temp = lambda pa: 15.0 - 2.0*(pa/1000.0)
+press_alt = lambda alt, qnh: float(alt) + (1013.0 - float(qnh)) * 30.0
+
 def interp1(x, x0, x1, y0, y1):
     if x1 == x0: return y0
     t = (x - x0) / (x1 - x0)
     return y0 + t * (y1 - y0)
-def clamp(v, lo, hi): return max(lo, min(hi, v))
 
-def cruise_lookup_ff_only(pa, rpm, oat, weight):
-    """Devolve só FF; TAS é fixa e não usada."""
-    rpm = min(int(rpm), 2265)
-    pas = sorted(CRUISE.keys()); pa_c = clamp(pa, pas[0], pas[-1])
-    p0 = max([p for p in pas if p <= pa_c]); p1 = min([p for p in pas if p >= pa_c])
-    table0 = CRUISE[p0]; table1 = CRUISE[p1]
-    def v(tab):
-        rpms = sorted(tab.keys())
-        if rpm in tab: return tab[rpm][1]
-        if rpm < rpms[0]: lo, hi = rpms[0], rpms[1]
-        elif rpm > rpms[-1]: lo, hi = rpms[-2], rpms[-1]
-        else: lo = max([r for r in rpms if r <= rpm]); hi = min([r for r in rpms if r >= rpm])
-        ff_lo, ff_hi = tab[lo][1], tab[hi][1]
-        t = (rpm - lo) / (hi - lo) if hi != lo else 0
-        return ff_lo + t*(ff_hi - ff_lo)
-    ff0 = v(table0); ff1 = v(table1)
-    ff = interp1(pa_c, p0, p1, ff0, ff1)
-    # pequena correção com OAT (mantém comportamento prévio)
-    if oat is not None:
-        dev = float(oat) - isa_temp(pa_c)
-        if dev > 0:  ff *= 1 - 0.025*(dev/15.0)
-        elif dev < 0: ff *= 1 + 0.03*((-dev)/15.0)
-    return max(0.0, ff)
-
-def roc_interp(pa, temp):
+def roc_interp(pa, oat):
     pas = sorted(ROC_ENR.keys()); pa_c = clamp(pa, pas[0], pas[-1])
     p0 = max([p for p in pas if p <= pa_c]); p1 = min([p for p in pas if p >= pa_c])
-    temps = [-25,0,25,50]; t = clamp(temp, temps[0], temps[-1])
+    temps = [-25,0,25,50]; t = clamp(oat, temps[0], temps[-1])
     if t <= 0: t0, t1 = -25, 0
     elif t <= 25: t0, t1 = 0, 25
     else: t0, t1 = 25, 50
     v00, v01 = ROC_ENR[p0][t0], ROC_ENR[p0][t1]
     v10, v11 = ROC_ENR[p1][t0], ROC_ENR[p1][t1]
     v0 = interp1(t, t0, t1, v00, v01); v1 = interp1(t, t0, t1, v10, v11)
-    return max(1.0, interp1(pa_c, p0, p1, v0, v1) * ROC_FACTOR)
+    return max(1.0, interp1(pa_c, p0, p1, v0, v1) * 0.90)
 
-# ===================== STATE =====================
+# =============== STATE ===============
 def ens(k, v): return st.session_state.setdefault(k, v)
 ens("qnh", 1013); ens("oat", 15); ens("mag_var", 1); ens("mag_is_e", False)
 ens("weight", 650.0)
-ens("rpm_climb", 2250); ens("rpm_desc", 1800)
 ens("desc_angle", 3.0)
 ens("start_clock", ""); ens("start_efob", 85.0)
 ens("ck_default", 2); ens("show_timeline", False)
 ens("wind_from", 0); ens("wind_kt", 0)
-ens("wps", []); ens("legs", []); ens("computed_by_leg", [])
+ens("wps", []); ens("legs", []); ens("computed", [])
+# velocidades fixas
+ens("spd_climb", 70.0); ens("spd_cruise", 90.0); ens("spd_desc", 90.0)
+# consumos simples (ajustáveis)
+ens("ff_climb", 22.0); ens("ff_cruise", 20.0); ens("ff_desc", 12.0)
 
-# ===================== TIMELINE (texto) =====================
-def timeline(seg, cps, start_label, end_label, toc_tod=None):
-    total = max(1, int(seg['time']))
+# =============== TIMELINE ===============
+def timeline(seg_time_s, gs_kt, ff_lph, start_label, end_label, ck_min=2, efob_start=None):
+    total = max(1, int(seg_time_s))
     html = "<div class='tl'><div class='bar'></div>"
     parts = []
-    for cp in cps:
-        pct = (cp['t']/total)*100.0
-        parts += [f"<div class='tick' style='left:{pct:.2f}%;'></div>",
-                  f"<div class='cp-lbl' style='left:{pct:.2f}%;'><div>T+{cp['min']}m</div><div>{cp['nm']} nm</div>" +
-                  (f"<div>{cp['eto']}</div>" if cp['eto'] else "") + f"<div>EFOB {cp['efob']:.1f}</div></div>"]
-    if toc_tod is not None and 0 < toc_tod['t'] < total:
-        pct = (toc_tod['t']/total)*100.0
-        cls = 'tocdot' if toc_tod['type'] == 'TOC' else 'toddot'
-        parts.append(f"<div class='{cls}' title='{toc_tod['type']}' style='left:{pct:.2f}%;'></div>")
+    if ck_min > 0:
+        t=0
+        while t + ck_min*60 <= total:
+            t += ck_min*60
+            d = gs_kt*(t/3600.0)
+            burn = ff_lph*(t/3600.0)
+            eto = ""  # já mostramos fora, manter limpo
+            efob = (max(0.0, r10f(efob_start - burn)) if efob_start is not None else 0.0)
+            pct = (t/total)*100.0
+            parts += [f"<div class='tick' style='left:{pct:.2f}%;'></div>",
+                      f"<div class='cp-lbl' style='left:{pct:.2f}%;'><div>T+{t//60}m</div><div>{round(d,1)} nm</div>" +
+                      (f"<div>EFOB {efob:.1f}</div>" if efob_start is not None else "") + "</div>"]
     html += ''.join(parts) + "</div>"
     st.markdown(html, unsafe_allow_html=True)
-    st.caption(f"GS {rint(seg['GS'])} kt · TAS {rint(seg['TAS'])} kt · FF {rint(seg['ff'])} L/h  |  {start_label} → {end_label}")
+    st.caption(f"GS {rint(gs_kt)} kt · TAS {rint(gs_kt)} kt? → (TAS real: mostrado na dog house) · FF {rint(ff_lph)} L/h  |  {start_label} → {end_label}")
 
-def phase_label(name):
-    n = name.lower()
-    if "climb" in n:   return "Climb"
-    if "descent" in n: return "Descent"
-    if "hold" in n:    return "Hold"
-    return "Cruise/Level"
+# =============== DOG HOUSE (triângulo + textos) ===============
+def triangle_coords(lat, lon, heading_deg, h_nm=0.9, w_nm=0.65):
+    base_c_lat, base_c_lon = dest_point(lat, lon, heading_deg, -h_nm/2.0)
+    apex_lat, apex_lon      = dest_point(lat, lon, heading_deg,  h_nm/2.0)
+    bl_lat, bl_lon = dest_point(base_c_lat, base_c_lon, heading_deg-90.0, w_nm/2.0)
+    br_lat, br_lon = dest_point(base_c_lat, base_c_lon, heading_deg+90.0, w_nm/2.0)
+    return [[bl_lon, bl_lat], [apex_lon, apex_lat], [br_lon, br_lat], [bl_lon, bl_lat]]
 
-# ===================== CÁLCULO POR LEG (fases) =====================
-def build_segments(tc, dist, alt0, alt1, wfrom, wkt, ck_min, params, rpm_cruise_leg, hold_min=0.0, hold_ff_input=0.0):
-    """TAS são FIXAS (70/90/90)."""
-    qnh, oat, mag_var, mag_is_e = params['qnh'], params['oat'], params['mag_var'], params['mag_is_e']
-    rpm_climb, rpm_desc, desc_angle, weight = params['rpm_climb'], params['rpm_desc'], params['desc_angle'], params['weight']
-
-    pa0 = press_alt(alt0, qnh); pa1 = press_alt(alt1, qnh); pa_avg = (pa0 + pa1)/2.0
-
-    ROC = roc_interp(pa0, oat)  # ft/min
-    FF_climb = cruise_lookup_ff_only((pa0 + pa1)/2.0, int(rpm_climb), oat, weight)
-    FF_cru   = cruise_lookup_ff_only(pa1, int(rpm_cruise_leg), oat, weight)
-    FF_desc  = cruise_lookup_ff_only(pa_avg, int(rpm_desc), oat, weight)
-
-    # TAS fixas
-    TAS_climb, TAS_cru, TAS_desc = TAS_CLIMB, TAS_CRUISE, TAS_DESCENT
-
-    _, THc, GScl = wind_triangle(tc, TAS_climb, wfrom, wkt)
-    _, THr, GScr = wind_triangle(tc, TAS_cru,  wfrom, wkt)
-    _, THd, GSde = wind_triangle(tc, TAS_desc, wfrom, wkt)
-
-    MHc = apply_var(THc, mag_var, mag_is_e)
-    MHr = apply_var(THr, mag_var, mag_is_e)
-    MHd = apply_var(THd, mag_var, mag_is_e)
-
-    ROD = max(100.0, GSde * 5.0 * (desc_angle / 3.0))  # ft/min
-
-    profile = "LEVEL" if abs(alt1 - alt0) < 1e-6 else ("CLIMB" if alt1 > alt0 else "DESCENT")
-    segs, toc_tod_marker = [], None
-
-    if profile == "CLIMB":
-        t_need = (alt1 - alt0) / max(ROC, 1e-6)  # min
-        d_need = GScl * (t_need / 60.0)
-        if d_need <= dist + 1e-6:
-            # como já "explodimos" a leg com TOC em WP, esta leg deverá ser só Climb
-            tA = rt10((dist / max(GScl,1e-9)) * 3600)
-            segs.append({"name":"Climb","TH":THc,"MH":MHc,"GS":GScl,"TAS":TAS_climb,"ff":FF_climb,"time":tA,"dist":dist,"alt0":alt0,"alt1":alt1})
-            toc_tod_marker = {"type":"TOC","t": rt10(t_need*60)}  # informativo
-        else:
-            # não atinge
-            tA = rt10((dist / max(GScl,1e-9)) * 3600)
-            gained = ROC * (tA / 60.0)
-            segs.append({"name":"Climb (não atinge)","TH":THc,"MH":MHc,"GS":GScl,"TAS":TAS_climb,"ff":FF_climb,"time":tA,"dist":dist,"alt0":alt0,"alt1":alt0+gained})
-    elif profile == "DESCENT":
-        t_need = (alt0 - alt1) / max(ROD, 1e-6)
-        d_need = GSde * (t_need / 60.0)
-        if d_need <= dist + 1e-6:
-            tA = rt10((dist / max(GSde,1e-9)) * 3600)
-            segs.append({"name":"Descent","TH":THd,"MH":MHd,"GS":GSde,"TAS":TAS_desc,"ff":FF_desc,"time":tA,"dist":dist,"alt0":alt0,"alt1":alt1})
-            toc_tod_marker = {"type":"TOD","t": rt10(t_need*60)}  # informativo
-        else:
-            tA = rt10((dist / max(GSde,1e-9)) * 3600)
-            lost = ROD * (tA / 60.0)
-            segs.append({"name":"Descent (não atinge)","TH":THd,"MH":MHd,"GS":GSde,"TAS":TAS_desc,"ff":FF_desc,"time":tA,"dist":dist,"alt0":alt0,"alt1":max(0.0, alt0 - lost)})
-    else:
-        tA = rt10((dist / max(GScr,1e-9)) * 3600)
-        segs.append({"name":"Cruise","TH":THr,"MH":MHr,"GS":GScr,"TAS":TAS_cru,"ff":FF_cru,"time":tA,"dist":dist,"alt0":alt0,"alt1":alt0})
-
-    # HOLD opcional
-    hold_min = max(0.0, float(hold_min))
-    if hold_min > 0.0:
-        hold_ff = float(hold_ff_input)
-        if hold_ff <= 0:
-            hold_ff = cruise_lookup_ff_only(press_alt(alt1, qnh), int(rpm_cruise_leg), oat, weight)
-        hold_sec = rt10(hold_min * 60.0)
-        end_alt = segs[-1]["alt1"] if segs else alt1
-        segs.append({"name":"Hold/Espera","TH":segs[-1]["TH"] if segs else tc,"MH":segs[-1]["MH"] if segs else tc,
-                     "GS":0.0,"TAS":0.0,"ff":hold_ff,"time":hold_sec,"dist":0.0,"alt0":end_alt,"alt1":end_alt})
-
-    # burn por segmento
-    for s in segs:
-        s["burn"] = s["ff"] * (s["time"] / 3600.0)
-
-    tot_sec  = sum(s['time'] for s in segs)
-    tot_burn = r10f(sum(s['burn'] for s in segs))
-
-    def cps(seg, every_min, base_clk, efob_start):
-        out = []; t = 0
-        if every_min <= 0: return out
-        while t + every_min*60 <= seg['time']:
-            t += every_min*60
-            d = seg['GS']*(t/3600.0)
-            burn = seg['ff']*(t/3600.0)
-            eto = (base_clk + dt.timedelta(seconds=t)).strftime('%H:%M') if base_clk else ""
-            efob = max(0.0, r10f(efob_start - burn))
-            out.append({"t":t,"min":int(t/60),"nm":round(d,1),"eto":eto,"efob":efob})
-        return out
-
-    return {
-        "segments": segs,
-        "tot_sec": tot_sec,
-        "tot_burn": tot_burn,
-        "roc": roc_interp(pa0, oat),
-        "rod": max(100.0, wind_triangle(tc, TAS_DESCENT, 0, 0)[2] * 5.0 * (params['desc_angle']/3.0)),
-        "toc_tod": toc_tod_marker,
-        "ck_func": cps
-    }
-
-# ===================== CRUD / BUILD LEGS =====================
-def add_leg(TC, Dist, Alt0, Alt1, Wfrom, Wkt, CK, RPMcru):
-    st.session_state.legs.append(dict(
-        TC=float(TC), Dist=float(Dist), Alt0=float(Alt0), Alt1=float(Alt1),
-        Wfrom=int(Wfrom), Wkt=int(Wkt), CK=int(CK), HoldMin=0.0, HoldFF=0.0, RPMcru=int(RPMcru)
-    ))
-def update_leg(leg_ref, **vals): leg_ref.update(vals)
-def delete_leg(idx): st.session_state.legs.pop(idx)
-
-# ===================== PARSE AD/LOCALIDADES (CSV locais) =====================
+# =============== CSVs locais (AD/Localidades) ===============
 AD_CSV  = "AD-HEL-ULM.csv"
 LOC_CSV = "Localidades-Nova-versao-230223.csv"
 
@@ -315,169 +179,52 @@ def dms_to_dd(token: str, is_lon=False):
     return dd
 
 def parse_ad_df(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+    rows=[]
     for line in df.iloc[:,0].dropna().tolist():
-        s = str(line).strip()
-        if not s or s.startswith(("Ident", "DEP/")): continue
-        tokens = s.split()
-        coord_toks = [t for t in tokens if re.match(r"^\d+(?:\.\d+)?[NSEW]$", t)]
-        if len(coord_toks) >= 2:
-            lat_tok = coord_toks[-2]; lon_tok = coord_toks[-1]
-            lat = dms_to_dd(lat_tok, is_lon=False); lon = dms_to_dd(lon_tok, is_lon=True)
+        s=str(line).strip()
+        if not s or s.startswith(("Ident","DEP/")): continue
+        tokens=s.split()
+        coord=[t for t in tokens if re.match(r"^\d+(?:\.\d+)?[NSEW]$", t)]
+        if len(coord)>=2:
+            lat_tok, lon_tok = coord[-2], coord[-1]
+            lat = dms_to_dd(lat_tok, False); lon = dms_to_dd(lon_tok, True)
             ident = tokens[0] if re.match(r"^[A-Z0-9]{4,}$", tokens[0]) else None
-            try:    name = " ".join(tokens[1:tokens.index(coord_toks[0])]).strip()
-            except: name = " ".join(tokens[1:]).strip()
-            try:    lon_idx = tokens.index(lon_tok); city = " ".join(tokens[lon_idx+1:]) or None
-            except: city = None
-            rows.append({"type":"AD","code":ident or name, "name":name, "city":city,"lat":lat,"lon":lon,"alt":0.0})
+            try: name=" ".join(tokens[1:tokens.index(coord[0])]).strip()
+            except: name=" ".join(tokens[1:]).strip()
+            rows.append({"type":"AD","code":ident or name,"name":name,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
 def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+    rows=[]
     for line in df.iloc[:,0].dropna().tolist():
-        s = str(line).strip()
+        s=str(line).strip()
         if not s or "Total de registos" in s: continue
-        tokens = s.split()
-        coord_toks = [t for t in tokens if re.match(r"^\d{6,7}(?:\.\d+)?[NSEW]$", t)]
-        if len(coord_toks) >= 2:
-            lat_tok, lon_tok = coord_toks[0], coord_toks[1]
-            lat = dms_to_dd(lat_tok, is_lon=False); lon = dms_to_dd(lon_tok, is_lon=True)
-            try: lon_idx = tokens.index(lon_tok)
-            except ValueError: continue
-            code = tokens[lon_idx+1] if lon_idx+1 < len(tokens) else None
-            sector = " ".join(tokens[lon_idx+2:]) if lon_idx+2 < len(tokens) else None
-            name = " ".join(tokens[:tokens.index(lat_tok)]).strip()
-            rows.append({"type":"LOC","code":code or name, "name":name, "sector":sector,"lat":lat,"lon":lon,"alt":0.0})
+        tokens=s.split()
+        coord=[t for t in tokens if re.match(r"^\d{6,7}(?:\.\d+)?[NSEW]$", t)]
+        if len(coord)>=2:
+            lat_tok, lon_tok = coord[0], coord[1]
+            lat=dms_to_dd(lat_tok, False); lon=dms_to_dd(lon_tok, True)
+            try: lon_idx=tokens.index(lon_tok)
+            except: continue
+            code=tokens[lon_idx+1] if lon_idx+1<len(tokens) else None
+            name=" ".join(tokens[:tokens.index(lat_tok)]).strip()
+            rows.append({"type":"LOC","code":code or name,"name":name,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
-# ===================== TOC/TOD → inserção de WAYPOINTS e criação de LEGS =====================
-def explode_wps_with_toc_tod_and_build_legs(rpm_default, wind_from, wind_kt, ck_default, desc_angle):
-    """Analisa cada par de WPs; insere WP TOC/TOD quando aplicável e gera legs unitárias."""
-    if len(st.session_state.wps) < 2:
-        st.session_state.legs = []; return
-
-    # vamos trabalhar numa cópia, inserindo WPs toc/tod
-    wps = [dict(w) for w in st.session_state.wps]
-    i = 0
-    while i < len(wps) - 1:
-        A, B = wps[i], wps[i+1]
-        tc = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
-        dist_total = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
-
-        if dist_total < 1e-4:
-            i += 1
-            continue
-
-        # climb?
-        if B["alt"] > A["alt"] + 1:
-            _, _, GScl = wind_triangle(tc, TAS_CLIMB, wind_from, wind_kt)
-            pa0 = press_alt(A["alt"], st.session_state.qnh)
-            ROC = roc_interp(pa0, st.session_state.oat)
-            t_need_min = (B["alt"] - A["alt"]) / max(ROC, 1e-6)
-            d_need = GScl * (t_need_min / 60.0)
-            if d_need < dist_total - 0.1:
-                lat_toc, lon_toc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need)
-                wps.insert(i+1, {"name": f"TOC{i+1}", "lat": lat_toc, "lon": lon_toc, "alt": B["alt"]})
-                continue  # reavaliar par (A → TOC) antes de avançar
-
-        # descent?
-        if B["alt"] < A["alt"] - 1:
-            _, _, GSde = wind_triangle(tc, TAS_DESCENT, wind_from, wind_kt)
-            ROD = max(100.0, GSde * 5.0 * (desc_angle/3.0))
-            t_need_min = (A["alt"] - B["alt"]) / max(ROD, 1e-6)
-            d_need = GSde * (t_need_min / 60.0)
-            if d_need < dist_total - 0.1:
-                # TOD a dist_total - d_need a partir de A
-                lat_tod, lon_tod = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], dist_total - d_need)
-                wps.insert(i+1, {"name": f"TOD{i+1}", "lat": lat_tod, "lon": lon_tod, "alt": A["alt"]})
-                continue
-
-        i += 1  # nada a inserir -> avança
-
-    # construir legs sequenciais
-    st.session_state.legs = []
-    for j in range(len(wps)-1):
-        A, B = wps[j], wps[j+1]
-        tc = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
-        dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
-        add_leg(tc, dist, A["alt"], B["alt"], wind_from, wind_kt, ck_default, rpm_default)
-
-    # substituir rota pelos WPs “explodidos” (passam a incluir TOC/TOD)
-    st.session_state.wps = wps
-
-# ===================== RECOMPUTE POR LEG =====================
-def recompute_all_by_leg():
-    st.session_state.computed_by_leg = []
-    params = dict(
-        qnh=st.session_state.qnh, oat=st.session_state.oat,
-        mag_var=st.session_state.mag_var, mag_is_e=st.session_state.mag_is_e,
-        rpm_climb=st.session_state.rpm_climb, rpm_desc=st.session_state.rpm_desc,
-        desc_angle=st.session_state.desc_angle, weight=st.session_state.weight
-    )
-
-    base_time = None
-    if st.session_state.start_clock.strip():
-        try:
-            h,m = map(int, st.session_state.start_clock.split(":"))
-            base_time = dt.datetime.combine(dt.date.today(), dt.time(h,m))
-        except: base_time = None
-
-    carry_efob = float(st.session_state.start_efob)
-    clock = base_time
-
-    for leg in st.session_state.legs:
-        res = build_segments(
-            tc=leg['TC'], dist=leg['Dist'], alt0=leg['Alt0'], alt1=leg['Alt1'],
-            wfrom=leg['Wfrom'], wkt=leg['Wkt'], ck_min=leg['CK'],
-            params=params, rpm_cruise_leg=leg['RPMcru'],
-            hold_min=leg.get('HoldMin',0.0), hold_ff_input=leg.get('HoldFF',0.0)
-        )
-
-        phases = []
-        t_cursor = 0
-        for idx_seg, seg in enumerate(res["segments"]):
-            efob_start = carry_efob
-            efob_end   = max(0.0, r10f(efob_start - seg['burn']))
-            if clock:
-                c_start = (clock + dt.timedelta(seconds=t_cursor)).strftime('%H:%M')
-                c_end   = (clock + dt.timedelta(seconds=t_cursor + seg['time'])).strftime('%H:%M')
-            else:
-                c_start = f"T+{mmss(t_cursor)}"; c_end = f"T+{mmss(t_cursor + seg['time'])}"
-            base_k = (clock + dt.timedelta(seconds=t_cursor)) if clock else None
-            cps = res["ck_func"](seg, int(leg['CK']), base_k, efob_start) if seg['GS']>0 else []
-
-            phases.append({
-                "name": seg["name"], "label": phase_label(seg["name"]),
-                "TH": seg["TH"], "MH": seg["MH"], "GS": seg["GS"], "TAS": seg["TAS"], "ff": seg["ff"],
-                "time": seg["time"], "dist": seg["dist"], "alt0": seg["alt0"], "alt1": seg["alt1"],
-                "burn": r10f(seg["burn"]), "efob_start": efob_start, "efob_end": efob_end,
-                "clock_start": c_start, "clock_end": c_end, "cps": cps,
-                "toc_tod": (res["toc_tod"] if idx_seg==0 and ("Climb" in seg["name"] or "Descent" in seg["name"]) else None),
-                "roc": res["roc"], "rod": res["rod"], "rpm_cruise_leg": leg["RPMcru"], "ck": leg["CK"]
-            })
-            t_cursor += seg['time']; carry_efob = efob_end
-
-        if clock: clock = clock + dt.timedelta(seconds=sum(s['time'] for s in res["segments"]))
-        st.session_state.computed_by_leg.append({
-            "leg_ref": leg, "phases": phases,
-            "tot_sec": sum(p["time"] for p in phases),
-            "tot_burn": r10f(sum(p["burn"] for p in phases))
-        })
-
-# ===================== HEADER =====================
+# =============== HEADER ===============
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 h1, h2, h3, h4 = st.columns([3,2,3,2])
-with h1: st.title("NAVLOG — v12 (AFM)")
+with h1: st.title("NAVLOG — v12")
 with h2: st.toggle("Mostrar TIMELINE/CPs", key="show_timeline", value=st.session_state.show_timeline)
 with h3:
     if st.button("➕ Novo waypoint manual", use_container_width=True):
         st.session_state.wps.append({"name": f"WP{len(st.session_state.wps)+1}", "lat": 39.5, "lon": -8.0, "alt": 3000.0})
 with h4:
     if st.button("🗑️ Limpar rota/legs", use_container_width=True):
-        st.session_state.wps = []; st.session_state.legs = []; st.session_state.computed_by_leg = []
+        st.session_state.wps = []; st.session_state.legs = []; st.session_state.computed = []
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ===================== PARÂMETROS GLOBAIS =====================
+# =============== PARÂMETROS GLOBAIS ===============
 with st.form("globals"):
     p1, p2, p3, p4 = st.columns(4)
     with p1:
@@ -487,49 +234,55 @@ with st.form("globals"):
         st.session_state.start_efob = st.number_input("EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
         st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
     with p3:
-        st.session_state.weight = st.number_input("Peso (kg)", 450.0, 700.0, float(st.session_state.weight), step=1.0)
-        st.session_state.desc_angle = st.number_input("Ângulo de descida (°)", 1.0, 6.0, float(st.session_state.desc_angle), step=0.1)
+        st.session_state.desc_angle = st.number_input("Ângulo descida (°)", 1.0, 6.0, float(st.session_state.desc_angle), step=0.1)
+        st.session_state.mag_var = st.number_input("Mag Var (°)", 0, 30, int(st.session_state.mag_var))
+        st.session_state.mag_is_e = st.selectbox("Var E/W", ["W","E"], index=(1 if st.session_state.mag_is_e else 0)) == "E"
     with p4:
-        st.session_state.rpm_climb = st.number_input("Climb RPM (global)", 1800, 2265, int(st.session_state.rpm_climb), step=5)
-        st.session_state.rpm_desc  = st.number_input("Descent RPM (global)",1600, 2265, int(st.session_state.rpm_desc),  step=5)
-        st.session_state.ck_default = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default), step=1)
-    w1, w2 = st.columns(2)
-    with w1: st.session_state.wind_from = st.number_input("Vento FROM (°T)", 0, 360, int(st.session_state.wind_from), step=1)
-    with w2: st.session_state.wind_kt   = st.number_input("Vento (kt)", 0, 150, int(st.session_state.wind_kt), step=1)
-    submitted = st.form_submit_button("Aplicar parâmetros")
-if submitted and st.session_state.legs:
-    for L in st.session_state.legs:
-        L["Wfrom"] = int(st.session_state.wind_from); L["Wkt"] = int(st.session_state.wind_kt)
+        st.session_state.wind_from = st.number_input("Vento FROM (°T)", 0, 360, int(st.session_state.wind_from), step=1)
+        st.session_state.wind_kt   = st.number_input("Vento (kt)", 0, 150, int(st.session_state.wind_kt), step=1)
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.session_state.spd_climb  = st.number_input("TAS Climb (kt)", 30.0, 140.0, float(st.session_state.spd_climb), step=1.0)
+    with s2:
+        st.session_state.spd_cruise = st.number_input("TAS Cruise (kt)", 30.0, 160.0, float(st.session_state.spd_cruise), step=1.0)
+    with s3:
+        st.session_state.spd_desc   = st.number_input("TAS Descent (kt)", 30.0, 160.0, float(st.session_state.spd_desc), step=1.0)
+    f1, f2, f3 = st.columns(3)
+    with f1: st.session_state.ff_climb  = st.number_input("FF Climb (L/h)", 0.0, 60.0, float(st.session_state.ff_climb), step=0.5)
+    with f2: st.session_state.ff_cruise = st.number_input("FF Cruise (L/h)", 0.0, 60.0, float(st.session_state.ff_cruise), step=0.5)
+    with f3: st.session_state.ff_desc   = st.number_input("FF Descent (L/h)", 0.0, 60.0, float(st.session_state.ff_desc), step=0.5)
+    st.form_submit_button("Aplicar parâmetros")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ===================== LER CSVs LOCAIS + ADICIONAR WPs POR PESQUISA =====================
+# =============== LER CSVs LOCAIS + pesquisa rápida ===============
 try:
-    ad_raw  = pd.read_csv(AD_CSV);  loc_raw = pd.read_csv(LOC_CSV)
-    ad_df  = parse_ad_df(ad_raw);   loc_df  = parse_loc_df(loc_raw)
+    ad_raw  = pd.read_csv(AD_CSV)
+    loc_raw = pd.read_csv(LOC_CSV)
+    ad_df   = parse_ad_df(ad_raw)
+    loc_df  = parse_loc_df(loc_raw)
 except Exception:
-    ad_df  = pd.DataFrame(columns=["type","code","name","city","lat","lon","alt"])
-    loc_df = pd.DataFrame(columns=["type","code","name","sector","lat","lon","alt"])
-    st.warning("Não foi possível ler os CSVs locais. Verifica os nomes de ficheiro.")
+    ad_df  = pd.DataFrame(columns=["type","code","name","lat","lon","alt"])
+    loc_df = pd.DataFrame(columns=["type","code","name","lat","lon","alt"])
+    st.warning("Não consegui carregar os CSVs locais (AD/Localidades). Verifica os ficheiros.")
 
-cflt1, cflt2, cbtn = st.columns([3,3,1.5])
-with cflt1: qtxt = st.text_input("🔎 Procurar AD/Localidade (CSV local)", "", placeholder="Ex: LPPT, ABRANTES, LP0078…")
-with cflt2: alt_wp = st.number_input("Altitude para WPs adicionados (ft)", 0.0, 18000.0, 3000.0, step=100.0)
-with cbtn: add_sel = st.button("Adicionar resultados")
+flt1, flt2, btn = st.columns([4,2,1.5])
+with flt1: qtxt = st.text_input("🔎 Procurar AD/Localidade (dos CSVs locais)", "", placeholder="Ex: LPPT, ABRANTES, LP0078…")
+with flt2: alt_wp = st.number_input("Altitude para WPs adicionados (ft)", 0.0, 18000.0, 3000.0, step=100.0)
+with btn: add_sel = st.button("Adicionar resultados")
 
-def filter_df(df, q):
+def filter_df(df,q):
     if not q: return df
-    tq = q.lower().strip()
-    return df[df.apply(lambda r: any(tq in str(v).lower() for v in r.values), axis=1)]
+    t=q.lower().strip()
+    return df[df.apply(lambda r: any(t in str(v).lower() for v in r.values), axis=1)]
 
-ad_f  = filter_df(ad_df, qtxt)
-loc_f = filter_df(loc_df, qtxt)
+ad_f, loc_f = filter_df(ad_df,qtxt), filter_df(loc_df,qtxt)
 if add_sel:
     for _, r in pd.concat([ad_f, loc_f]).iterrows():
         st.session_state.wps.append({"name": str(r["code"]), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
     st.success(f"Adicionados {len(ad_f)+len(loc_f)} WPs.")
 
-# ===================== EDITOR DE WPs =====================
+# =============== EDITOR DE WPs ===============
 if st.session_state.wps:
     st.subheader("Rota (Waypoints)")
     for i, w in enumerate(st.session_state.wps):
@@ -541,8 +294,12 @@ if st.session_state.wps:
             with c4: alt  = st.number_input(f"Alt (ft) — WP{i+1}", 0.0, 18000.0, float(w["alt"]), step=50.0, key=f"wpalt_{i}")
             with c5:
                 up = st.button("↑", key=f"up{i}"); dn = st.button("↓", key=f"dn{i}")
-                if up and i>0: st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]; st.experimental_rerun()
-                if dn and i < len(st.session_state.wps)-1: st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]; st.experimental_rerun()
+                if up and i>0:
+                    st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]
+                    st.experimental_rerun()
+                if dn and i < len(st.session_state.wps)-1:
+                    st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]
+                    st.experimental_rerun()
             if (name,lat,lon,alt) != (w["name"],w["lat"],w["lon"],w["alt"]):
                 st.session_state.wps[i] = {"name":name,"lat":float(lat),"lon":float(lon),"alt":float(alt)}
             if st.button("Remover", key=f"delwp_{i}"):
@@ -550,217 +307,296 @@ if st.session_state.wps:
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ===================== GERAR LEGS A PARTIR DOS WPs (com TOC/TOD → novos WPs) =====================
-cgl1, cgl2, _ = st.columns([2,2,6])
-with cgl1: rpm_default = st.number_input("Cruise RPM default p/ legs", 1800, 2265, 2100, step=5)
-with cgl2: gen = st.button("Gerar/Atualizar legs a partir dos WAYPOINTS (com TOC/TOD)", type="primary", use_container_width=True)
+# =============== GERAR ROTA COM TOC/TOD INSERIDOS ===============
+def build_route_points_with_profile(wps):
+    """Devolve (route_pts, profile_markers)
+       route_pts inclui WPs originais + TOC/TOD (virtuais, name='TOC'/'TOD')"""
+    pts = []
+    markers = []  # para pôr no mapa
+    for i in range(len(wps)-1):
+        A, B = wps[i], wps[i+1]
+        if not pts: pts.append(A)
+        tc = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
+        dist_total = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
 
-if gen and len(st.session_state.wps) >= 2:
-    explode_wps_with_toc_tod_and_build_legs(
-        rpm_default=rpm_default,
-        wind_from=st.session_state.wind_from,
-        wind_kt=st.session_state.wind_kt,
-        ck_default=st.session_state.ck_default,
-        desc_angle=st.session_state.desc_angle
+        # velocidades TAS fixas
+        tas_climb  = float(st.session_state.spd_climb)
+        tas_desc   = float(st.session_state.spd_desc)
+        tas_cruise = float(st.session_state.spd_cruise)
+
+        # vento
+        _, _, gs_climb  = wind_triangle(tc, tas_climb,  st.session_state.wind_from, st.session_state.wind_kt)
+        _, _, gs_desc   = wind_triangle(tc, tas_desc,   st.session_state.wind_from, st.session_state.wind_kt)
+        _, _, gs_cruise = wind_triangle(tc, tas_cruise, st.session_state.wind_from, st.session_state.wind_kt)
+
+        # perfil: CLIMB, DESCENT, LEVEL
+        if abs(B["alt"] - A["alt"]) < 1e-6:
+            # level: não insere nada
+            pts.append(B); continue
+
+        if B["alt"] > A["alt"]:
+            # CLIMB → calcula TOC
+            pa0 = press_alt(A["alt"], st.session_state.qnh)
+            roc = roc_interp(pa0, st.session_state.oat)  # ft/min
+            t_need_min = (B["alt"] - A["alt"]) / max(roc, 1e-6)
+            d_need_nm  = gs_climb * (t_need_min/60.0)
+            if d_need_nm < dist_total:
+                # inserir TOC
+                latc, lonc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need_nm)
+                TOC = {"name":"TOC","lat":latc,"lon":lonc,"alt":B["alt"], "virtual":True}
+                pts.append(TOC); markers.append(dict(kind="TOC", lat=latc, lon=lonc))
+                pts.append(B)
+            else:
+                pts.append(B)  # não atinge — sem TOC
+        else:
+            # DESCENT → calcula TOD (usando regra: ROD ≈ GS*5*(angle/3))
+            ROD = max(100.0, gs_desc * 5.0 * (st.session_state.desc_angle/3.0))  # ft/min
+            t_need_min = (A["alt"] - B["alt"]) / max(ROD, 1e-6)
+            d_need_nm  = gs_desc * (t_need_min/60.0)
+            if d_need_nm < dist_total:
+                latd, lond = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need_nm)
+                TOD = {"name":"TOD","lat":latd,"lon":lond,"alt":B["alt"], "virtual":True}
+                pts.append(TOD); markers.append(dict(kind="TOD", lat=latd, lon=lond))
+                pts.append(B)
+            else:
+                pts.append(B)  # não atinge — sem TOD
+    return pts, markers
+
+def build_legs_from_route_points(rps):
+    legs=[]
+    for i in range(len(rps)-1):
+        A, B = rps[i], rps[i+1]
+        tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
+        dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
+        legs.append(dict(
+            A=A, B=B, TC=tc, Dist=dist, Alt0=A["alt"], Alt1=B["alt"],
+            Wfrom=st.session_state.wind_from, Wkt=st.session_state.wind_kt,
+            CK=st.session_state.ck_default, HoldMin=0.0, HoldFF=0.0
+        ))
+    return legs
+
+if st.button("Gerar/Atualizar LEGS (insere TOC/TOD)", type="primary"):
+    if len(st.session_state.wps) < 2:
+        st.warning("Precisas de pelo menos 2 WPs.")
+    else:
+        route_pts, markers = build_route_points_with_profile(st.session_state.wps)
+        st.session_state._route_pts = route_pts      # guardo para o mapa
+        st.session_state._profile_markers = markers
+        st.session_state.legs = build_legs_from_route_points(route_pts)
+        st.success(f"Foram criadas {len(st.session_state.legs)} legs (com TOC/TOD se aplicável).")
+
+# =============== COMPUTE POR LEG ===============
+def compute_leg(leg, base_clock=None, efob_start=None):
+    tc, dist = leg["TC"], leg["Dist"]
+    alt0, alt1 = leg["Alt0"], leg["Alt1"]
+
+    # tipo e TAS/FF
+    if alt1 > alt0:
+        tas = float(st.session_state.spd_climb);  ff = float(st.session_state.ff_climb);  phase="Climb"
+    elif alt1 < alt0:
+        tas = float(st.session_state.spd_desc);   ff = float(st.session_state.ff_desc);   phase="Descent"
+    else:
+        tas = float(st.session_state.spd_cruise); ff = float(st.session_state.ff_cruise); phase="Cruise/Level"
+
+    # vento → TH/MH/GS
+    _, TH, GS = wind_triangle(tc, tas, leg["Wfrom"], leg["Wkt"])
+    MH = apply_var(TH, st.session_state.mag_var, st.session_state.mag_is_e)
+
+    # tempo, burn
+    time_s = rt10((dist / max(GS,1e-9)) * 3600.0)
+    burn   = ff * (time_s/3600.0)
+    efob_end = (max(0.0, r10f(efob_start - burn)) if efob_start is not None else None)
+
+    # relógio leg
+    if base_clock:
+        start = base_clock
+        end   = base_clock + dt.timedelta(seconds=time_s)
+        start_lbl = start.strftime("%H:%M"); end_lbl = end.strftime("%H:%M")
+    else:
+        start_lbl = "T+00:00"; end_lbl = f"T+{mmss(time_s)}"
+
+    # ETO no MEIO da leg (para dog house)
+    if base_clock: eto_mid = (base_clock + dt.timedelta(seconds=time_s/2)).strftime("%H:%M")
+    else:          eto_mid = f"T+{mmss(int(time_s/2))}"
+
+    return dict(
+        phase=phase, TC=tc, Dist=dist, Alt0=alt0, Alt1=alt1,
+        TAS=tas, GS=GS, TH=TH, MH=MH, time_s=time_s, ff=ff, burn=burn,
+        start_lbl=start_lbl, end_lbl=end_lbl, eto_mid=eto_mid, efob_end=efob_end
     )
-    st.success(f"Criadas {len(st.session_state.legs)} legs (com WPs TOC/TOD quando aplicável).")
-    recompute_all_by_leg()
 
-# ===================== INPUTS + FASES POR LEG =====================
+def recompute_all():
+    st.session_state.computed = []
+    base_clock = None
+    if st.session_state.start_clock.strip():
+        try:
+            h,m = map(int, st.session_state.start_clock.split(":"))
+            base_clock = dt.datetime.combine(dt.date.today(), dt.time(h,m))
+        except: base_clock = None
+
+    carry_efob = float(st.session_state.start_efob)
+    cursor = base_clock
+    for leg in st.session_state.legs:
+        res = compute_leg(leg, base_clock=cursor, efob_start=carry_efob)
+        st.session_state.computed.append(res)
+        if cursor: cursor = cursor + dt.timedelta(seconds=res["time_s"])
+        if carry_efob is not None: carry_efob = res["efob_end"]
+
+# =============== INPUTS + FASES POR LEG ===============
 if st.session_state.legs:
-    recompute_all_by_leg()
+    recompute_all()
 
-    total_sec_all = 0; total_burn_all = 0.0; efob_final = None
+    total_sec_all = sum(c["time_s"] for c in st.session_state.computed)
+    total_burn_all = r10f(sum(c["burn"] for c in st.session_state.computed))
+    efob_final = st.session_state.computed[-1]["efob_end"] if st.session_state.computed and st.session_state.computed[-1]["efob_end"] is not None else None
 
-    for idx_leg, leg in enumerate(st.session_state.legs):
-        # === INPUTS LEG ===
-        with st.expander(f"Leg {idx_leg+1} — Inputs", expanded=True):
-            i1, i2, i3, i4 = st.columns(4)
+    for idx, (leg, comp) in enumerate(zip(st.session_state.legs, st.session_state.computed)):
+        with st.expander(f"Leg {idx+1} — Inputs", expanded=True):
+            i1,i2,i3,i4 = st.columns(4)
             with i1:
-                TC   = st.number_input(f"True Course (°T) — L{idx_leg+1}", 0.0, 359.9, float(leg['TC']), step=0.1, key=f"TC_{idx_leg}")
-                Dist = st.number_input(f"Distância (nm) — L{idx_leg+1}", 0.0, 500.0, float(leg['Dist']), step=0.1, key=f"Dist_{idx_leg}")
+                TC   = st.number_input(f"True Course (°T) — L{idx+1}", 0.0, 359.9, float(leg["TC"]), step=0.1, key=f"TC_{idx}")
+                Dist = st.number_input(f"Distância (nm) — L{idx+1}", 0.0, 500.0, float(leg["Dist"]), step=0.1, key=f"Dist_{idx}")
             with i2:
-                Alt0 = st.number_input(f"Altitude INI (ft) — L{idx_leg+1}", 0.0, 30000.0, float(leg['Alt0']), step=50.0, key=f"Alt0_{idx_leg}")
-                Alt1 = st.number_input(f"Altitude DEST (ft) — L{idx_leg+1}", 0.0, 30000.0, float(leg['Alt1']), step=50.0, key=f"Alt1_{idx_leg}")
+                Alt0 = st.number_input(f"Alt INI (ft) — L{idx+1}", 0.0, 30000.0, float(leg["Alt0"]), step=50.0, key=f"Alt0_{idx}")
+                Alt1 = st.number_input(f"Alt DEST (ft) — L{idx+1}",0.0, 30000.0, float(leg["Alt1"]), step=50.0, key=f"Alt1_{idx}")
             with i3:
-                Wfrom = st.number_input(f"Vento FROM (°T) — L{idx_leg+1}", 0, 360, int(leg['Wfrom']), step=1, key=f"Wfrom_{idx_leg}")
-                Wkt   = st.number_input(f"Vento (kt) — L{idx_leg+1}", 0, 150, int(leg['Wkt']), step=1, key=f"Wkt_{idx_leg}")
+                Wfrom = st.number_input(f"Vento FROM (°T) — L{idx+1}", 0, 360, int(leg["Wfrom"]), step=1, key=f"Wfrom_{idx}")
+                Wkt   = st.number_input(f"Vento (kt) — L{idx+1}", 0, 150, int(leg["Wkt"]), step=1, key=f"Wkt_{idx}")
             with i4:
-                CK     = st.number_input(f"Checkpoints (min) — L{idx_leg+1}", 1, 10, int(leg['CK']), step=1, key=f"CK_{idx_leg}")
-                RPMcru = st.number_input(f"Cruise RPM (leg) — L{idx_leg+1}", 1800, 2265, int(leg['RPMcru']), step=5, key=f"RPMcru_{idx_leg}")
-            j1, j2, j3 = st.columns([1.2,1.2,6])
-            with j1: HoldMin = st.number_input(f"Espera (min) — L{idx_leg+1}", 0.0, 180.0, float(leg.get('HoldMin',0.0)), step=0.5, key=f"HoldMin_{idx_leg}")
-            with j2: HoldFF  = st.number_input(f"FF espera (L/h) — L{idx_leg+1} (0=auto)", 0.0, 60.0, float(leg.get('HoldFF',0.0)), step=0.1, key=f"HoldFF_{idx_leg}")
-            with j3:
-                if st.button("Guardar leg", key=f"save_{idx_leg}", use_container_width=True):
-                    update_leg(leg, TC=TC, Dist=Dist, Alt0=Alt0, Alt1=Alt1, Wfrom=Wfrom, Wkt=Wkt, CK=CK, RPMcru=RPMcru, HoldMin=HoldMin, HoldFF=HoldFF)
-                    recompute_all_by_leg()
-                if st.button("Apagar leg", key=f"del_{idx_leg}", use_container_width=True):
-                    delete_leg(idx_leg); recompute_all_by_leg(); st.stop()
+                CK    = st.number_input(f"Checkpoints (min) — L{idx+1}", 1, 10, int(leg["CK"]), step=1, key=f"CK_{idx}")
+            if st.button("Guardar leg", key=f"save_{idx}", use_container_width=True):
+                leg.update(dict(TC=TC,Dist=Dist,Alt0=Alt0,Alt1=Alt1,Wfrom=Wfrom,Wkt=Wkt,CK=CK))
+                recompute_all()
 
-        # === FASES DA LEG ===
-        comp_leg = st.session_state.computed_by_leg[idx_leg]
-        phases = comp_leg["phases"]
-
-        st.markdown(
-            "<div class='kvrow'>"
-            + f"<div class='kv'>Leg {idx_leg+1} — Fases: <b>{len(phases)}</b></div>"
-            + f"<div class='kv'>ETE Leg: <b>{hhmmss(comp_leg['tot_sec'])}</b></div>"
-            + f"<div class='kv'>Burn Leg: <b>{comp_leg['tot_burn']:.1f} L</b></div>"
-            + "</div>", unsafe_allow_html=True
-        )
-
-        for pidx, c in enumerate(phases):
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            left, right = st.columns([3,2])
-            with left:
-                st.subheader(f"Fase {idx_leg+1}.{pidx+1}: {c['label']}")
-                st.caption(c["name"])
-                st.markdown(
-                    "<div class='kvrow'>"
-                    + f"<div class='kv'>Alt: <b>{int(round(c['alt0']))}→{int(round(c['alt1']))} ft</b></div>"
-                    + f"<div class='kv'>TH/MH: <b>{rang(c['TH'])}T / {rang(c['MH'])}M</b></div>"
-                    + f"<div class='kv'>GS/TAS: <b>{rint(c['GS'])}/{rint(c['TAS'])} kt</b></div>"
-                    + f"<div class='kv'>FF: <b>{rint(c['ff'])} L/h</b></div>"
-                    + "</div>", unsafe_allow_html=True
-                )
-            with right:
-                st.metric("Tempo", mmss(c["time"]))
-                st.metric("Fuel desta fase (L)", f"{c['burn']:.1f}")
-
-            r1, r2, r3 = st.columns(3)
-            with r1: st.markdown(f"**Relógio** — {c['clock_start']} → {c['clock_end']}")
-            with r2: st.markdown(f"**EFOB** — Start {c['efob_start']:.1f} L → End {c['efob_end']:.1f} L")
-            with r3:
-                if "Climb" in c["name"]:   st.markdown(f"**ROC ref.** — {rint(c['roc'])} ft/min")
-                elif "Descent" in c["name"]: st.markdown(f"**ROD ref.** — {rint(c['rod'])} ft/min")
-                else: st.markdown(f"**Cruise RPM (leg)** — {int(c['rpm_cruise_leg'])} RPM")
-
-            if c["toc_tod"] is not None: st.info(f"Marcador: **{c['toc_tod']['type']}** em T+{mmss(c['toc_tod']['t'])}")
-            if st.session_state.show_timeline and c["GS"] > 0:
-                timeline({"GS":c["GS"],"TAS":c["TAS"],"ff":c["ff"],"time":c["time"]}, c["cps"], c["clock_start"], c["clock_end"], c["toc_tod"])
-
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-        total_sec_all  += comp_leg["tot_sec"]; total_burn_all += comp_leg["tot_burn"]
-        if phases: efob_final = phases[-1]["efob_end"]
+        # ======= FASE (logo após inputs) =======
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        left, right = st.columns([3,2])
+        with left:
+            st.subheader(f"Fase {idx+1}: {comp['phase']}")
+            st.markdown(
+                "<div class='kvrow'>"
+                + f"<div class='kv'>Alt: <b>{int(round(comp['Alt0']))}→{int(round(comp['Alt1']))} ft</b></div>"
+                + f"<div class='kv'>TH/MH: <b>{rang(comp['TH'])}T / {rang(comp['MH'])}M</b></div>"
+                + f"<div class='kv'>TAS/GS: <b>{rint(comp['TAS'])}/{rint(comp['GS'])} kt</b></div>"
+                + f"<div class='kv'>FF: <b>{rint(comp['ff'])} L/h</b></div>"
+                + "</div>", unsafe_allow_html=True
+            )
+        with right:
+            st.metric("ETE desta leg", mmss(comp["time_s"]))
+            st.metric("Fuel desta leg (L)", f"{r10f(comp['burn']):.1f}")
+        r1,r2,r3 = st.columns(3)
+        with r1: st.markdown(f"**Relógio** — {comp['start_lbl']} → {comp['end_lbl']}")
+        with r2:
+            if comp["efob_end"] is not None:
+                start_efob = r10f(float(st.session_state.start_efob) - r10f(sum(x['burn'] for x in st.session_state.computed[:idx])))
+                st.markdown(f"**EFOB** — Start {start_efob:.1f} L → End {comp['efob_end']:.1f} L")
+            else:
+                st.markdown("**EFOB** — —")
+        with r3: st.markdown(f"**ETO (meio da leg)** — {comp['eto_mid']}")
+        if st.session_state.show_timeline:
+            timeline(comp["time_s"], comp["GS"], comp["ff"], comp["start_lbl"], comp["end_lbl"], ck_min=leg["CK"],
+                     efob_start=(r10f(float(st.session_state.start_efob) - r10f(sum(x['burn'] for x in st.session_state.computed[:idx])))))
+        st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(
         "<div class='kvrow'>"
         + f"<div class='kv'>⏱️ ETE Total: <b>{hhmmss(total_sec_all)}</b></div>"
-        + f"<div class='kv'>⛽ Burn Total: <b>{r10f(total_burn_all):.1f} L</b></div>"
+        + f"<div class='kv'>⛽ Burn Total: <b>{total_burn_all:.1f} L</b></div>"
         + (f"<div class='kv'>🧯 EFOB Final: <b>{efob_final:.1f} L</b></div>" if efob_final is not None else "")
         + "</div>", unsafe_allow_html=True
     )
 
-# ===================== MAPA (PYDECK) — rota, riscas 2min e DOG-HOUSES triangulares =====================
-def triangle_coords(lat, lon, heading_deg, h_nm=0.9, w_nm=0.65):
-    """Triângulo isósceles orientado por 'heading_deg'."""
-    base_c_lat, base_c_lon = dest_point(lat, lon, heading_deg, -h_nm/2.0)
-    apex_lat, apex_lon      = dest_point(lat, lon, heading_deg,  h_nm/2.0)
-    bl_lat, bl_lon = dest_point(base_c_lat, base_c_lon, heading_deg-90.0, w_nm/2.0)
-    br_lat, br_lon = dest_point(base_c_lat, base_c_lon, heading_deg+90.0, w_nm/2.0)
-    return [[bl_lon, bl_lat], [apex_lon, apex_lat], [br_lon, br_lat], [bl_lon, bl_lat]]
+# =============== MAPA (rota + riscas + dog houses + markers TOC/TOD) ===============
+if st.session_state.legs:
+    # dados p/ layers
+    path_data=[]; tick_data=[]; tri_data=[]; text_MH=[]; text_sub=[]; wp_markers=[]
 
-def triangle_hatching_paths(lat, lon, heading_deg, h_nm=0.9, w_nm=0.65, step_nm=0.18):
-    """Riscas internas diagonais como no exemplo (série de pequenos segmentos)."""
-    # percorre ao longo da base→apex e desenha linhas inclinadas
-    lines = []
-    base_c_lat, base_c_lon = dest_point(lat, lon, heading_deg, -h_nm/2.0)
-    # posição ao longo do eixo longitudinal
-    s = -h_nm/2.0 + step_nm
-    while s < h_nm/2.0:
-        mid_lat, mid_lon = dest_point(lat, lon, heading_deg, s)
-        # largura disponível na secção (linear – mais largo na base, mais estreito perto do apex)
-        frac = (s + h_nm/2.0) / h_nm  # 0 na base, 1 no apex
-        half_width = (1-frac) * (w_nm/2.0)
-        # desenha uma “barra” curta com leve inclinação (~30°) vs. perpendicular
-        left_lat, left_lon   = dest_point(mid_lat, mid_lon, heading_deg-90-30, half_width*0.85)
-        right_lat, right_lon = dest_point(mid_lat, mid_lon, heading_deg+90-30, half_width*0.85)
-        lines.append({"path": [[left_lon, left_lat], [right_lon, right_lat]]})
-        s += step_nm
-    return lines
+    # usar route_pts com TOC/TOD (se existir da geração); fallback a WPs
+    route_pts = st.session_state.get("_route_pts", None) or st.session_state.wps
+    prof_mark = st.session_state.get("_profile_markers", [])
 
-if len(st.session_state.wps) >= 2 and st.session_state.legs and st.session_state.computed_by_leg:
-    path_data, tick_data, tri_data, label_data, hatch_data, wp_labels = [], [], [], [], [], []
+    # percurso principal
+    for i in range(len(route_pts)-1):
+        A, B = route_pts[i], route_pts[i+1]
+        path_data.append({"path":[[A["lon"],A["lat"]],[B["lon"],B["lat"]]], "name":f"{A['name']}→{B['name']}"})
 
-    # etiquetas para WPs (inclui TOC/TOD)
-    for idx, W in enumerate(st.session_state.wps):
-        wp_labels.append({"position":[W["lon"], W["lat"]], "text": W["name"]})
+    # markers WPs (inclui virtuais)
+    for i, P in enumerate(route_pts):
+        wp_markers.append({"position":[P["lon"],P["lat"]], "label": P.get("name", f"WP{i+1}")})
 
-    for i in range(len(st.session_state.wps)-1):
-        A = st.session_state.wps[i]; B = st.session_state.wps[i+1]
-        leg = st.session_state.legs[i]
-        phases = st.session_state.computed_by_leg[i]["phases"]
+    # riscas + triângulos + textos por leg
+    cum_before = 0  # s, para ETO mid sem base clock
+    base_clock = None
+    if st.session_state.start_clock.strip():
+        try:
+            h,m = map(int, st.session_state.start_clock.split(":"))
+            base_clock = dt.datetime.combine(dt.date.today(), dt.time(h,m))
+        except: base_clock=None
 
-        # rota (linha)
-        path_data.append({"path": [[A["lon"], A["lat"]], [B["lon"], B["lat"]]], "name": f"L{i+1}"})
+    for i, (leg, comp) in enumerate(zip(st.session_state.legs, st.session_state.computed)):
+        A, B = leg["A"], leg["B"]
+        tc = leg["TC"]
 
-        # -------- RISCA A CADA 2 MIN COM GS REAL ----------
-        segments = [(p["time"], p["GS"]) for p in phases if p["GS"]>0]
-        if not segments: segments = [(st.session_state.computed_by_leg[i]["tot_sec"], 0)]
-        total_leg_dist = leg["Dist"]
-        interval_s = 120
-        k = 1
-        while k*interval_s <= sum(s[0] for s in segments):
-            target_t = k*interval_s
-            dist_target = 0.0; t_acc = 0
-            for dur, gs in segments:
-                if t_acc + dur >= target_t:
-                    dt_here = target_t - t_acc
-                    dist_target += gs * (dt_here / 3600.0)
-                    break
-                else:
-                    dist_target += gs * (dur / 3600.0)
-                    t_acc += dur
-            dist_target = min(dist_target, total_leg_dist)
-            latm, lonm = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], dist_target)
-            tc = leg["TC"]
-            half_nm = 0.15
-            left_lat, left_lon   = dest_point(latm, lonm, tc-90, half_nm)
-            right_lat, right_lon = dest_point(latm, lonm, tc+90, half_nm)
-            tick_data.append({"path": [[left_lon, left_lat], [right_lon, right_lat]]})
-            k += 1
+        # ---- riscas cada 2 min ----
+        interval = 120
+        k=1
+        while k*interval <= comp["time_s"]:
+            t=k*interval
+            d=comp["GS"]*(t/3600.0)
+            latm, lonm = point_along_gc(A["lat"],A["lon"],B["lat"],B["lon"], min(d, leg["Dist"]))
+            half=0.15
+            llat, llon = dest_point(latm, lonm, tc-90, half)
+            rlat, rlon = dest_point(latm, lonm, tc+90, half)
+            tick_data.append({"path":[[llon,llat],[rlon,rlat]]})
+            k+=1
 
-        # -------- DOG HOUSE TRIANGULAR + TEXTO + HATCH ----------
-        mid_lat, mid_lon = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], total_leg_dist/2.0)
-        off_lat, off_lon = dest_point(mid_lat, mid_lon, leg["TC"]+90, 0.35)
-        tri = triangle_coords(off_lat, off_lon, leg["TC"], h_nm=0.9, w_nm=0.65)
-        tri_data.append({"polygon": tri})
-        hatch_data.extend(triangle_hatching_paths(off_lat, off_lon, leg["TC"]))
+        # ---- dog house (centro da leg deslocada um pouco para o lado) ----
+        mid_lat, mid_lon = point_along_gc(A["lat"],A["lon"],B["lat"],B["lon"], leg["Dist"]/2.0)
+        off_lat, off_lon = dest_point(mid_lat, mid_lon, tc+90, 0.35)
+        tri = triangle_coords(off_lat, off_lon, tc, h_nm=0.95, w_nm=0.70)
+        tri_data.append({"polygon":tri})
 
-        ref = next((p for p in phases if p["GS"]>0), phases[0])
-        label_text = f"{rang(ref['TH'])}T/{rang(ref['MH'])}M • {r10f(leg['Dist'])}nm • GS {rint(ref['GS'])} • ETE {mmss(st.session_state.computed_by_leg[i]['tot_sec'])}"
-        label_pos = dest_point(off_lat, off_lon, leg["TC"]+90, 0.35)
-        label_data.append({"position":[label_pos[1], label_pos[0]], "text": label_text})
+        # textos: MH grande colorido; sub-linha com TAS e ETO
+        MH = rang(comp["MH"])
+        # ETO mid
+        if base_clock:
+            eto_mid = (base_clock + dt.timedelta(seconds=cum_before + comp["time_s"]/2)).strftime("%H:%M")
+        else:
+            eto_mid = f"T+{mmss(int(cum_before + comp['time_s']/2))}"
+        text_MH.append({"position":[off_lon, off_lat], "text": f"{MH}M"})
+        text_sub.append({"position":[off_lon, off_lat-0.03], "text": f"TAS {rint(comp['TAS'])} • ETO {eto_mid}"})
+        cum_before += comp["time_s"]
+
+    # TOC/TOD markers (se houver)
+    for m in prof_mark:
+        wp_markers.append({"position":[m["lon"], m["lat"]], "label": m["kind"]})
 
     # LAYERS
-    route_layer = pdk.Layer("PathLayer", data=path_data, get_path="path", get_color=[180, 0, 255, 220], width_min_pixels=4)
-    ticks_layer = pdk.Layer("PathLayer", data=tick_data, get_path="path", get_color=[0, 0, 0, 255], width_min_pixels=2)
+    route_layer = pdk.Layer("PathLayer", data=path_data, get_path="path", get_color=[199, 0, 255, 220], width_min_pixels=4)
+    ticks_layer = pdk.Layer("PathLayer", data=tick_data, get_path="path", get_color=[0,0,0,255], width_min_pixels=2)
     tri_layer   = pdk.Layer("PolygonLayer", data=tri_data, get_polygon="polygon",
                             get_fill_color=[255,255,255,230], get_line_color=[0,0,0,255],
                             line_width_min_pixels=2, stroked=True, filled=True)
-    hatch_layer = pdk.Layer("PathLayer", data=hatch_data, get_path="path", get_color=[0,0,0,200], width_min_pixels=1)
-    text_layer  = pdk.Layer("TextLayer", data=label_data, get_position="position", get_text="text",
-                            get_size=14, get_color=[0,0,0], get_alignment_baseline="'center'")
-    wp_text     = pdk.Layer("TextLayer", data=wp_labels, get_position="position", get_text="text",
-                            get_size=12, get_color=[60,60,60], get_alignment_baseline="'top'")
+    # MH grande e bem visível (ciano forte)
+    text_mh_layer = pdk.Layer("TextLayer", data=text_MH, get_position="position", get_text="text",
+                              get_size=22, get_color=[0,120,255], get_alignment_baseline="'center'", get_text_anchor="'middle'")
+    text_sub_layer = pdk.Layer("TextLayer", data=text_sub, get_position="position", get_text="text",
+                               get_size=14, get_color=[0,0,0], get_alignment_baseline="'top'", get_text_anchor="'middle'")
+    # WPs
+    wp_layer = pdk.Layer("TextLayer", data=wp_markers, get_position="position", get_text="label",
+                         get_size=12, get_color=[40,40,40], get_alignment_baseline="'bottom'", get_text_anchor="'middle'")
 
-    # vista (centro)
-    mean_lat = sum([w["lat"] for w in st.session_state.wps])/len(st.session_state.wps)
-    mean_lon = sum([w["lon"] for w in st.session_state.wps])/len(st.session_state.wps)
-    view_state = pdk.ViewState(latitude=mean_lat, longitude=mean_lon, zoom=7, pitch=0)
-
-    # estilo com nomes de terras e POIs
-    voyager = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
+    # vista
+    pts = route_pts if route_pts else st.session_state.wps
+    mean_lat = sum(p["lat"] for p in pts)/len(pts)
+    mean_lon = sum(p["lon"] for p in pts)/len(pts)
 
     deck = pdk.Deck(
-        map_style=voyager,
-        initial_view_state=view_state,
-        layers=[route_layer, ticks_layer, tri_layer, hatch_layer, text_layer, wp_text],
+        map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",  # muitos nomes e detalhes
+        initial_view_state=pdk.ViewState(latitude=mean_lat, longitude=mean_lon, zoom=7, pitch=0),
+        layers=[route_layer, ticks_layer, tri_layer, text_mh_layer, text_sub_layer, wp_layer],
         tooltip={"text": "{name}"}
     )
     st.pydeck_chart(deck)
 else:
-    st.info("Adiciona pelo menos 2 waypoints e gera as legs (TOC/TOD incluídos) para ver o mapa e as dog-houses.")
+    st.info("Adiciona WPs e gera as legs (o TOC/TOD é inserido automaticamente).")
