@@ -1,4 +1,3 @@
-```python
 # app.py — NAVLOG v10 (AFM) — UI Moderna & Intuitiva
 # Objetivo: Interface mais limpa, editor de legs em tabela interativa, cartões de fase aprimorados,
 # resumo global destacado, atualizações eficientes, sem perder TOC/TOD ou funcionalidades.
