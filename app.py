@@ -1,8 +1,8 @@
-# app.py — NAVLOG v12 — Velocidades fixas + TOC/TOD como novos WPs + Dog Houses triangulares
+# app.py — NAVLOG v12.1 — Velocidades fixas + TOC/TOD como novos WPs + Dog Houses triangulares
 # - Speeds: 70 kt climb, 90 kt cruise, 90 kt descent (constantes)
-# - TOC/TOD inseridos como waypoints intermédios; cada split gera uma NOVA leg
+# - TOC/TOD viram novos waypoints; cada split cria uma NOVA leg
 # - Mapa PyDeck (CARTO Voyager: características e nomes de terras)
-# - Riscas pretas a cada 2 min e Dog Houses triangulares; MH grande e colorido
+# - Riscas pretas a cada 2 min + Dog Houses triangulares; MH grande e colorido
 # - UI: cartão de inputs da leg -> cartões de fases (sem tabelas)
 
 import streamlit as st
@@ -12,7 +12,7 @@ import math, re, datetime as dt
 from math import sin, asin, radians, degrees
 
 # ===================== PAGE / STYLE =====================
-st.set_page_config(page_title="NAVLOG v12 — TOC/TOD + Dog Houses", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NAVLOG v12.1 — TOC/TOD + Dog Houses", layout="wide", initial_sidebar_state="collapsed")
 
 CSS = """
 <style>
@@ -39,7 +39,7 @@ TAS_CLIMB = 70.0
 TAS_CRUISE = 90.0
 TAS_DESC = 90.0
 
-# RPMs só para estimar FF (internos, sem UI)
+# RPMs apenas para estimar FF (internos, sem UI)
 RPM_CLIMB = 2250
 RPM_CRUISE = 2100
 RPM_DESC = 1800
@@ -141,7 +141,6 @@ def cruise_lookup(pa, rpm, oat, weight):
         return (tas_lo + t*(tas_hi - tas_lo), ff_lo + t*(ff_hi - ff_lo))
     tas0, ff0 = v(table0); tas1, ff1 = v(table1)
     tas = interp1(pa_c, p0, p1, tas0, tas1); ff = interp1(pa_c, p0, p1, ff0, ff1)
-    # ajuste grosseiro ISA dev/weight para FF (mantido do AFM)
     if oat is not None:
         dev = float(oat) - isa_temp(pa_c)
         if dev > 0:  ff *= 1 - 0.025*(dev/15.0)
@@ -158,7 +157,7 @@ def roc_interp(pa, temp):
     else: t0, t1 = 25, 50
     v00, v01 = ROC_ENR[p0][t0], ROC_ENR[p0][t1]
     v10, v11 = ROC_ENR[p1][t0], ROC_ENR[p1][t1]
-    v0 = interp1(t, t0, t1, v00, v01); v1 = interp1(t, t0, t1, v10, v11)
+    v0 = interp1(t, t0, t1, v00, v01); v1 = interp1(t, p0, p1, v10, v11)
     return max(1.0, interp1(pa_c, p0, p1, v0, v1)*0.90)
 
 # ===================== STATE =====================
@@ -204,9 +203,9 @@ def build_segments_fixed_speeds(tc, dist, alt0, alt1, wfrom, wkt, ck_min, qnh, o
     TAS_climb = TAS_CLIMB; TAS_cru = TAS_CRUISE; TAS_desc = TAS_DESC
 
     # FF por fase (usando AFM para rpm padrão internos)
-    FF_climb = cruise_lookup((pa0+pa1)/2.0, RPM_CLIMB, oat, weight)[1]
+    FF_climb = cruise_lookup((pa0+pa1)/2.0, RPM_CLIMB,  oat, weight)[1]
     FF_cru   = cruise_lookup(pa1,            RPM_CRUISE, oat, weight)[1]
-    FF_desc  = cruise_lookup(pa_avg,         RPM_DESC,  oat, weight)[1]
+    FF_desc  = cruise_lookup(pa_avg,         RPM_DESC,   oat, weight)[1]
 
     _, THc, GScl = wind_triangle(tc, TAS_climb, wfrom, wkt)
     _, THr, GScr = wind_triangle(tc, TAS_cru,  wfrom, wkt)
@@ -277,76 +276,99 @@ def build_segments_fixed_speeds(tc, dist, alt0, alt1, wfrom, wkt, ck_min, qnh, o
         "rod": max(100.0, (wind_triangle(tc, TAS_DESC, 0, 0)[2]) * 5.0 * (desc_angle/3.0)),
     }
 
-# ===================== SPLIT EM TOC/TOD (gera NOVAS LEGS + route_points) =====================
+# ===================== SPLIT EM TOC/TOD (gera NOVAS LEGS + route_points) — PATCH ROBUSTO =====================
 def split_legs_from_wps_with_toc_tod(wps, wind_from, wind_kt, qnh, oat, mag_var, mag_is_e, desc_angle):
-    legs = []
-    route_points = [dict(**wps[0], name=str(wps[0]['name']))]  # começa no primeiro
+    """Recebe lista de WPs e devolve (legs, route_points).
+       route_points = WPs originais + TOC/TOD inseridos.
+    """
+    def norm_wp(x, idx=None):
+        if isinstance(x, dict):
+            name = str(x.get("name", f"WP{(idx or 0)+1}"))
+            lat  = float(x["lat"])
+            lon  = float(x["lon"])
+            alt  = float(x.get("alt", 0.0))
+            return {"name": name, "lat": lat, "lon": lon, "alt": alt}
+        elif isinstance(x, (list, tuple)) and len(x) >= 4:
+            name, lat, lon, alt = x[0], x[1], x[2], x[3]
+            return {"name": str(name), "lat": float(lat), "lon": float(lon), "alt": float(alt)}
+        else:
+            raise ValueError(f"Waypoint inválido na posição {idx}: {x!r}")
 
-    for i in range(len(wps)-1):
-        A = wps[i]; B = wps[i+1]
-        tc = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
+    if not isinstance(wps, (list, tuple)) or len(wps) < 2:
+        return [], []
+
+    W = [norm_wp(w, i) for i, w in enumerate(wps)]
+
+    legs = []
+    route_points = [W[0]]
+
+    for i in range(len(W) - 1):
+        A, B = W[i], W[i+1]
+        tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
         dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
 
-        pa0 = press_alt(A["alt"], qnh); pa1 = press_alt(B["alt"], qnh)
-        # Speeds fixas
-        _, _, GScl = wind_triangle(tc, TAS_CLIMB, wind_from, wind_kt)
+        _, _, GScl = wind_triangle(tc, TAS_CLIMB,  wind_from, wind_kt)
         _, _, GScr = wind_triangle(tc, TAS_CRUISE, wind_from, wind_kt)
         _, _, GSde = wind_triangle(tc, TAS_DESC,   wind_from, wind_kt)
-        ROC = roc_interp(pa0, oat)
-        ROD = max(100.0, GSde * 5.0 * (desc_angle/3.0))
 
-        if B["alt"] > A["alt"]:  # CLIMB -> TOC
-            t_need = (B["alt"] - A["alt"]) / max(ROC,1e-6)            # min
-            d_need = GScl * (t_need/60.0)
-            if d_need < dist:  # há TOC
+        ROC = roc_interp(press_alt(A["alt"], qnh), oat)
+        ROD = max(100.0, GSde * 5.0 * (desc_angle / 3.0))
+
+        if B["alt"] > A["alt"]:
+            # CLIMB -> TOC
+            t_need = (B["alt"] - A["alt"]) / max(ROC, 1e-6)
+            d_need = GScl * (t_need / 60.0)
+            if d_need < dist:
                 lat_toc, lon_toc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need)
                 wp_toc = {"name": f"TOC L{i+1}", "lat": lat_toc, "lon": lon_toc, "alt": B["alt"]}
-                # A->TOC (climb)
-                legs.append({"TC":tc, "Dist":d_need, "Alt0":A["alt"], "Alt1":B["alt"], "Wfrom":wind_from, "Wkt":wind_kt,
-                             "CK":st.session_state.ck_default, "HoldMin":0.0, "HoldFF":0.0, "phase_hint":"CLIMB"})
+                legs.append({"TC": tc, "Dist": d_need, "Alt0": A["alt"], "Alt1": B["alt"],
+                            "Wfrom": wind_from, "Wkt": wind_kt, "CK": st.session_state.ck_default,
+                            "HoldMin": 0.0, "HoldFF": 0.0, "phase_hint": "CLIMB"})
                 route_points.append(wp_toc)
-                # TOC->B (cruise)
-                legs.append({"TC":tc, "Dist":dist - d_need, "Alt0":B["alt"], "Alt1":B["alt"], "Wfrom":wind_from, "Wkt":wind_kt,
-                             "CK":st.session_state.ck_default, "HoldMin":0.0, "HoldFF":0.0, "phase_hint":"CRUISE"})
-            else:  # não chega -> uma única leg climb
-                legs.append({"TC":tc, "Dist":dist, "Alt0":A["alt"], "Alt1":B["alt"], "Wfrom":wind_from, "Wkt":wind_kt,
-                             "CK":st.session_state.ck_default, "HoldMin":0.0, "HoldFF":0.0, "phase_hint":"CLIMB"})
-                route_points.append(dict(**B))
-        elif B["alt"] < A["alt"]:  # DESCENT -> TOD
-            t_need = (A["alt"] - B["alt"]) / max(ROD,1e-6)            # min
-            d_need = GSde * (t_need/60.0)
-            if d_need < dist:  # há TOD (começa descida a d_need do destino)
-                # TOD fica a (dist - d_need) do início
+                legs.append({"TC": tc, "Dist": dist - d_need, "Alt0": B["alt"], "Alt1": B["alt"],
+                            "Wfrom": wind_from, "Wkt": wind_kt, "CK": st.session_state.ck_default,
+                            "HoldMin": 0.0, "HoldFF": 0.0, "phase_hint": "CRUISE"})
+                route_points.append(B)
+            else:
+                legs.append({"TC": tc, "Dist": dist, "Alt0": A["alt"], "Alt1": B["alt"],
+                            "Wfrom": wind_from, "Wkt": wind_kt, "CK": st.session_state.ck_default,
+                            "HoldMin": 0.0, "HoldFF": 0.0, "phase_hint": "CLIMB"})
+                route_points.append(B)
+
+        elif B["alt"] < A["alt"]:
+            # DESCENT -> TOD
+            t_need = (A["alt"] - B["alt"]) / max(ROD, 1e-6)
+            d_need = GSde * (t_need / 60.0)
+            if d_need < dist:
                 d_cru = dist - d_need
                 lat_tod, lon_tod = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_cru)
                 wp_tod = {"name": f"TOD L{i+1}", "lat": lat_tod, "lon": lon_tod, "alt": A["alt"]}
-                # A->TOD (level/cruise)
-                legs.append({"TC":tc, "Dist":d_cru, "Alt0":A["alt"], "Alt1":A["alt"], "Wfrom":wind_from, "Wkt":wind_kt,
-                             "CK":st.session_state.ck_default, "HoldMin":0.0, "HoldFF":0.0, "phase_hint":"CRUISE"})
+                legs.append({"TC": tc, "Dist": d_cru, "Alt0": A["alt"], "Alt1": A["alt"],
+                            "Wfrom": wind_from, "Wkt": wind_kt, "CK": st.session_state.ck_default,
+                            "HoldMin": 0.0, "HoldFF": 0.0, "phase_hint": "CRUISE"})
                 route_points.append(wp_tod)
-                # TOD->B (descent)
-                legs.append({"TC":tc, "Dist":d_need, "Alt0":A["alt"], "Alt1":B["alt"], "Wfrom":wind_from, "Wkt":wind_kt,
-                             "CK":st.session_state.ck_default, "HoldMin":0.0, "HoldFF":0.0, "phase_hint":"DESCENT"})
-            else:  # desce o que der
-                legs.append({"TC":tc, "Dist":dist, "Alt0":A["alt"], "Alt1":B["alt"], "Wfrom":wind_from, "Wkt":wind_kt,
-                             "CK":st.session_state.ck_default, "HoldMin":0.0, "HoldFF":0.0, "phase_hint":"DESCENT"})
-                route_points.append(dict(**B))
-        else:  # LEVEL
-            legs.append({"TC":tc, "Dist":dist, "Alt0":A["alt"], "Alt1":A["alt"], "Wfrom":wind_from, "Wkt":wind_kt,
-                         "CK":st.session_state.ck_default, "HoldMin":0.0, "HoldFF":0.0, "phase_hint":"CRUISE"})
-            route_points.append(dict(**B))
+                legs.append({"TC": tc, "Dist": d_need, "Alt0": A["alt"], "Alt1": B["alt"],
+                            "Wfrom": wind_from, "Wkt": wind_kt, "CK": st.session_state.ck_default,
+                            "HoldMin": 0.0, "HoldFF": 0.0, "phase_hint": "DESCENT"})
+                route_points.append(B)
+            else:
+                legs.append({"TC": tc, "Dist": dist, "Alt0": A["alt"], "Alt1": B["alt"],
+                            "Wfrom": wind_from, "Wkt": wind_kt, "CK": st.session_state.ck_default,
+                            "HoldMin": 0.0, "HoldFF": 0.0, "phase_hint": "DESCENT"})
+                route_points.append(B)
+
+        else:
+            # LEVEL
+            legs.append({"TC": tc, "Dist": dist, "Alt0": A["alt"], "Alt1": A["alt"],
+                        "Wfrom": wind_from, "Wkt": wind_kt, "CK": st.session_state.ck_default,
+                        "HoldMin": 0.0, "HoldFF": 0.0, "phase_hint": "CRUISE"})
+            route_points.append(B)
 
     return legs, route_points
 
 # ===================== RECOMPUTE POR LEG =====================
 def recompute_all_by_leg():
     st.session_state.computed_by_leg = []
-    params = dict(
-        qnh=st.session_state.qnh, oat=st.session_state.oat,
-        mag_var=st.session_state.mag_var, mag_is_e=st.session_state.mag_is_e,
-        weight=st.session_state.weight, desc_angle=st.session_state.desc_angle
-    )
-
     base_time = None
     if st.session_state.start_clock.strip():
         try:
@@ -369,7 +391,7 @@ def recompute_all_by_leg():
 
         phases = []
         t_cursor = 0
-        for idx_seg, seg in enumerate(res["segments"]):
+        for seg in res["segments"]:
             efob_start = carry_efob
             efob_end   = max(0.0, r10f(efob_start - seg['burn']))
             if clock:
@@ -453,7 +475,7 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
 # ===================== HEADER =====================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 h1, h2, h3, h4 = st.columns([3,2,3,2])
-with h1: st.title("NAVLOG — v12 (AFM)")
+with h1: st.title("NAVLOG — v12.1 (AFM)")
 with h2: st.toggle("Mostrar TIMELINE/CPs", key="show_timeline", value=st.session_state.show_timeline)
 with h3:
     if st.button("➕ Novo waypoint manual", use_container_width=True):
@@ -539,20 +561,23 @@ if st.session_state.wps:
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ===================== GERAR LEGS (com splits TOC/TOD) =====================
+# ===================== GERAR LEGS (com splits TOC/TOD) — com guarda "≥2 WPs" =====================
 cgl1, _ = st.columns([2,6])
 with cgl1: gen = st.button("Gerar/Atualizar legs a partir dos WAYPOINTS (com TOC/TOD)", type="primary", use_container_width=True)
 
-if gen and len(st.session_state.wps) >= 2:
-    legs, rps = split_legs_from_wps_with_toc_tod(
-        st.session_state.wps, st.session_state.wind_from, st.session_state.wind_kt,
-        st.session_state.qnh, st.session_state.oat, st.session_state.mag_var, st.session_state.mag_is_e,
-        st.session_state.desc_angle
-    )
-    st.session_state.legs = legs
-    st.session_state.route_points = rps
-    st.success(f"Criadas {len(legs)} legs (com TOC/TOD inseridos).")
-    recompute_all_by_leg()
+if gen:
+    if len(st.session_state.wps) < 2:
+        st.warning("Precisas de pelo menos 2 waypoints para gerar as legs.")
+    else:
+        legs, rps = split_legs_from_wps_with_toc_tod(
+            st.session_state.wps, st.session_state.wind_from, st.session_state.wind_kt,
+            st.session_state.qnh, st.session_state.oat, st.session_state.mag_var, st.session_state.mag_is_e,
+            st.session_state.desc_angle
+        )
+        st.session_state.legs = legs
+        st.session_state.route_points = rps
+        st.success(f"Criadas {len(legs)} legs (com TOC/TOD inseridos).")
+        recompute_all_by_leg()
 
 # ===================== INPUTS + FASES POR LEG =====================
 if st.session_state.legs:
@@ -652,14 +677,11 @@ def triangle_coords(lat, lon, heading_deg, h_nm=0.9, w_nm=0.65):
 if len(st.session_state.route_points) >= 2 and st.session_state.legs and st.session_state.computed_by_leg:
     path_data, tick_data, tri_data, text_data, mh_data = [], [], [], [], []
 
-    # construir paths com base em route_points (WPs + TOC/TOD)
     rps = st.session_state.route_points
-    route_pairs = []
     leg_index = 0
     for i in range(len(rps)-1):
         A, B = rps[i], rps[i+1]
         path_data.append({"path": [[A["lon"], A["lat"]], [B["lon"], B["lat"]]], "name": f"{A['name']}→{B['name']}"})
-        # riscas 2 min para a leg correspondente
         if leg_index < len(st.session_state.legs):
             leg = st.session_state.legs[leg_index]
             comp = st.session_state.computed_by_leg[leg_index]
@@ -678,27 +700,26 @@ if len(st.session_state.route_points) >= 2 and st.session_state.legs and st.sess
                 tick_data.append({"path": [[llon, llat],[rlon, rlat]]})
                 k+=1
 
-            # DOG HOUSE no lado direito da perna
+            # DOG HOUSE no lado direito
             mid_lat, mid_lon = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], dist_leg/2.0)
             off_lat, off_lon = dest_point(mid_lat, mid_lon, tc+90, 0.30)
             tri = triangle_coords(off_lat, off_lon, tc, h_nm=0.9, w_nm=0.65)
             tri_data.append({"polygon": tri})
 
-            # Texto pequeno (TH, dist, ETE)
+            # etiqueta auxiliar (TH, Dist, GS, ETE)
             th = next((rang(p["TH"]) for p in comp["phases"]), rang(leg["TC"]))
             gs_i = rint(gs); ete_txt = mmss(total_t)
             text_line = f"{th}T • {r10f(dist_leg)}nm • GS {gs_i} • {ete_txt}"
             text_pos  = dest_point(off_lat, off_lon, tc+90, 0.35)
             text_data.append({"position":[text_pos[1], text_pos[0]], "text": text_line, "angle":0})
 
-            # MH GRANDE destacado (cor viva)
+            # MH GRANDE destacado
             mh = next((rang(p["MH"]) for p in comp["phases"]), rang(leg["TC"]))
-            mh_pos  = dest_point(off_lat, off_lon, tc, 0.55)  # à frente do triângulo
+            mh_pos  = dest_point(off_lat, off_lon, tc, 0.55)
             mh_data.append({"position":[mh_pos[1], mh_pos[0]], "text": f"{mh}M", "angle":0})
 
             leg_index += 1
 
-    # LAYERS
     route_layer = pdk.Layer("PathLayer", data=path_data, get_path="path", get_color=[180, 0, 255, 220], width_min_pixels=4)
     ticks_layer = pdk.Layer("PathLayer", data=tick_data, get_path="path", get_color=[0, 0, 0, 255], width_min_pixels=2)
     tri_layer   = pdk.Layer("PolygonLayer", data=tri_data, get_polygon="polygon",
@@ -707,10 +728,9 @@ if len(st.session_state.route_points) >= 2 and st.session_state.legs and st.sess
     text_layer  = pdk.Layer("TextLayer", data=text_data, get_position="position", get_text="text",
                             get_size=14, get_color=[0,0,0], get_alignment_baseline="'center'", get_angle="angle")
     mh_layer    = pdk.Layer("TextLayer", data=mh_data, get_position="position", get_text="text",
-                            get_size=22, get_color=[225,29,72],  # rosa forte
+                            get_size=22, get_color=[225,29,72],
                             get_alignment_baseline="'center'", get_angle="angle")
 
-    # vista centrada
     mean_lat = sum([w["lat"] for w in rps])/len(rps)
     mean_lon = sum([w["lon"] for w in rps])/len(rps)
     view_state = pdk.ViewState(latitude=mean_lat, longitude=mean_lon, zoom=7, pitch=0)
