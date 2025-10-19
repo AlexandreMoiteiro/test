@@ -1,4 +1,4 @@
-# NAVLOG v15 — VFR híbrido — ETO/ETE nas dog houses, TOC/TOD como WPs
+# NAVLOG v16 — VFR híbrido — ETO/ETE nas dog houses, TOC/TOD como WPs
 # TAS fixas (70/90/90), FF 20 L/h, riscas 2 min por GS, seleção única de WPs
 # Mapa: OpenTopoMap + OSM (híbrido) e outros estilos. Sem experimental_rerun.
 
@@ -9,7 +9,7 @@ import math, re, datetime as dt
 from math import sin, asin, radians, degrees
 
 # ===================== PAGE / STYLE =====================
-st.set_page_config(page_title="NAVLOG v15 — VFR", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NAVLOG v16 — VFR", layout="wide", initial_sidebar_state="collapsed")
 
 CSS = """
 <style>
@@ -109,7 +109,7 @@ def roc_interp(pa, temp):
     t0,t1 = (-25,0) if t<=0 else (0,25) if t<=25 else (25,50)
     v00,v01 = ROC_ENR[p0][t0], ROC_ENR[p0][t1]
     v10,v11 = ROC_ENR[p1][t0], ROC_ENR[p1][t1]
-    v0 = interp1(t, t0, t1, v00, v01); v1 = interp1(t, t0, t1, v10, v11)
+    v0 = interp1(t, t0, t1, v00, v01); v1 = interp1(pa_c, p0, p1, v10, v11)
     return max(1.0, interp1(pa_c, p0, p1, v0, v1) * ROC_FACTOR)
 
 # ===================== STATE =====================
@@ -198,7 +198,7 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
 # ===================== HEADER =====================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 h1, h2, h3, h4 = st.columns([3,2,3,2])
-with h1: st.title("NAVLOG — v15 (VFR)")
+with h1: st.title("NAVLOG — v16 (VFR)")
 with h2: st.toggle("Mostrar TIMELINE/CPs", key="show_timeline", value=st.session_state.show_timeline)
 with h3:
     if st.button("➕ Novo waypoint manual", use_container_width=True):
@@ -500,11 +500,13 @@ def render_map_vfr():
 
     styles = ["VFR híbrido (OTM + OSM labels)", "OpenTopoMap", "OSM HOT (labels grandes)", "OSM standard", "Positron clean"]
     try:
-        idx = styles.index(st.session_state.map_style)
+        default_index = styles.index(st.session_state.get("map_style", styles[0]))
     except ValueError:
-        idx = 0
-    sel = st.selectbox("Estilo do mapa", options=styles, index=idx, key="map_style")
-    st.session_state.map_style = sel
+        default_index = 0
+
+    # O próprio widget gere st.session_state["map_style"] — não escrever manualmente
+    st.selectbox("Estilo do mapa", options=styles, index=default_index, key="map_style")
+    current_style = st.session_state.map_style
 
     HOUSE_OFFSET_NM = 0.50
     MH_SIZE, INF_SIZE = 26, 15
@@ -553,7 +555,7 @@ def render_map_vfr():
         mh_labels.append(  {"position":[pos_mh[1],   pos_mh[0]],   "text": mh_text})
         info_labels.append({"position":[pos_info[1], pos_info[0]], "text": info})
 
-        # TOC/TOD destacados e sem tapar
+        # TOC/TOD
         if "TOC" in s:
             lat_toc, lon_toc = s["TOC"]
             special_points.append({"position":[lon_toc, lat_toc], "name":"TOC"})
@@ -565,28 +567,38 @@ def render_map_vfr():
             todl = dest_point(lat_tod, lon_tod, s["TC"]+110, 0.18)
             special_texts.append({"position":[todl[1], todl[0]], "text":"TOD"})
 
-    # fundos
+    # fundos — usar current_style (não escrever no estado)
     layers = []
-    if st.session_state.map_style in ("VFR híbrido (OTM + OSM labels)", "OpenTopoMap"):
-        layers.append(pdk.Layer("TileLayer",
+    if current_style in ("VFR híbrido (OTM + OSM labels)", "OpenTopoMap"):
+        layers.append(pdk.Layer(
+            "TileLayer",
             data="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=17, tile_size=256, opacity=1.0))
-    if st.session_state.map_style == "VFR híbrido (OTM + OSM labels)":
-        layers.append(pdk.Layer("TileLayer",
+            min_zoom=0, max_zoom=17, tile_size=256, opacity=1.0
+        ))
+    if current_style == "VFR híbrido (OTM + OSM labels)":
+        layers.append(pdk.Layer(
+            "TileLayer",
             data="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=19, tile_size=256, opacity=0.55))
-    if st.session_state.map_style == "OSM HOT (labels grandes)":
-        layers.append(pdk.Layer("TileLayer",
+            min_zoom=0, max_zoom=19, tile_size=256, opacity=0.55
+        ))
+    if current_style == "OSM HOT (labels grandes)":
+        layers.append(pdk.Layer(
+            "TileLayer",
             data="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0))
-    if st.session_state.map_style == "OSM standard":
-        layers.append(pdk.Layer("TileLayer",
+            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
+        ))
+    if current_style == "OSM standard":
+        layers.append(pdk.Layer(
+            "TileLayer",
             data="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0))
-    if st.session_state.map_style == "Positron clean":
-        layers.append(pdk.Layer("TileLayer",
+            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
+        ))
+    if current_style == "Positron clean":
+        layers.append(pdk.Layer(
+            "TileLayer",
             data="https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0))
+            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
+        ))
 
     # overlays
     layers += [
@@ -631,5 +643,6 @@ if st.session_state.wps and not st.session_state.legs and len(st.session_state.w
 if st.session_state.legs:
     recompute_and_render()
     render_map_vfr()
+
 
 
