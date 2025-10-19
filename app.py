@@ -530,3 +530,4 @@ if len(st.session_state.route_points) >= 2 and st.session_state.legs and st.sess
     st.pydeck_chart(deck)
 else:
     st.info("Gera as legs (com TOC/TOD) para ver: rota, riscas, dog houses e marcadores TOC/TOD.")
+
