@@ -1,11 +1,11 @@
-# app.py — NAVLOG (Folium estável) — VFR topo/satélite + TOC/TOD como WPs + PDF
-# - TAS fixas: 70 (climb), 90 (cruise/descent) · FF 20 L/h
+# app.py — NAVLOG (Folium VFR + PDF) — estável
+# - TAS fixas: 70/90/90 kt · FF 20 L/h
 # - TOC/TOD inseridos como WPs e legs partidas
-# - Motor: Leaflet/Folium (mais estável p/ tiles)
-# - Dog houses; ticks de 2 min pela GS; MH grande com halo
-# - Labels com OFFSET EM NM (fica bem no PDF)
-# - Botão Export PDF (Leaflet.Browser.Print)
-# - Mais bases de mapa: EOX satélite, Esri Imagery/Topo, OpenTopoMap, OSM, MapTiler (opcional)
+# - Dog houses; MH grande (amarelo com halo); riscas 2 min (GS)
+# - Motor de mapa: Leaflet/Folium (bases VFR/satélite)
+# - Export PDF/PNG (Leaflet.Browser.Print)
+# - Pesquisa com seleção (evita duplicados tipo "NISA")
+# - Form corrigido (sem "Missing submit button")
 
 import streamlit as st
 import pandas as pd
@@ -110,7 +110,7 @@ ens("maptiler_key", "")  # opcional
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 a,b,c,d = st.columns([3,3,2,2])
 with a: st.title("NAVLOG — Folium VFR + PDF")
-with b: st.caption("TAS: 70/90/90 · FF: 20 L/h · labels em NM · pronto a imprimir")
+with b: st.caption("TAS 70/90/90 · FF 20 L/h · offsets em NM · pronto a imprimir")
 with c:
     if st.button("➕ WP", use_container_width=True):
         st.session_state.wps.append({"name": f"WP{len(st.session_state.wps)+1}", "lat": 39.5, "lon": -8.0, "alt": 3000.0})
@@ -119,7 +119,7 @@ with d:
         for k in ["wps","legs","route_nodes"]: st.session_state[k] = []
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ======== PARÂMETROS ========
+# ======== PARÂMETROS (form corrigido) ========
 with st.form("globals"):
     c1,c2,c3,c4 = st.columns(4)
     with c1:
@@ -135,7 +135,8 @@ with st.form("globals"):
         st.session_state.start_efob= st.number_input("EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
         st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
         st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
-    b1,b2 = st.columns([2,2])
+
+    b1, b2 = st.columns([2,2])
     with b1:
         bases = [
             "EOX Sentinel-2 (satélite)",
@@ -145,11 +146,19 @@ with st.form("globals"):
             "OSM Standard",
             "MapTiler Satellite Hybrid (requer key)"
         ]
-        st.session_state.map_base = st.selectbox("Base do mapa", bases, index=bases.index(st.session_state.map_base))
+        cur = st.session_state.get("map_base", bases[0])
+        if cur not in bases:
+            cur = bases[0]
+            st.session_state.map_base = cur
+        idx = next((i for i, v in enumerate(bases) if v == cur), 0)
+        choice = st.selectbox("Base do mapa", bases, index=idx, key="map_base_choice")
+        st.session_state.map_base = choice
     with b2:
         if "MapTiler" in st.session_state.map_base:
             st.session_state.maptiler_key = st.text_input("MapTiler API key (opcional)", st.session_state.maptiler_key)
-    submitted = st.form_submit_button("Aplicar")
+
+    submitted = st.form_submit_button("Aplicar")  # <-- garante submit
+
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ======== CSVs locais (AD/LOC) ========
@@ -315,7 +324,7 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         clk_end   = (base_time + dt.timedelta(seconds=t_cursor+time_sec)).strftime('%H:%M') if base_time else f"T+{mmss(t_cursor+time_sec)}"
 
         # CPs (texto)
-        cps=[]; 
+        cps=[]
         if ck_every_min>0 and gs>0:
             k=1
             while k*ck_every_min*60 <= time_sec:
@@ -371,7 +380,7 @@ def _add_text(map_obj, lat, lon, text, size_px=22, color="#FFD700", halo=True):
     folium.Marker(location=(lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(map_obj)
 
 def add_print_button(m):
-    # plugin Leaflet.Browser.Print
+    # Leaflet.Browser.Print
     m.get_root().header.add_child(folium.Element(
         '<script src="https://unpkg.com/leaflet.browser.print/dist/leaflet.browser.print.min.js"></script>'
     ))
@@ -441,7 +450,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         folium.PolyLine(latlngs, color="#ffffff", weight=8, opacity=0.9).add_to(m)
         folium.PolyLine(latlngs, color="#C000FF", weight=4, opacity=1.0).add_to(m)
 
-    # ticks 2 min (perpendiculares)
+    # riscas 2 min
     for L in legs:
         if L["GS"]<=0 or L["time_sec"]<=0: continue
         k, step = 1, 120
@@ -454,24 +463,21 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
             folium.PolyLine([(llat,llon),(rlat,rlon)], color="#000000", weight=2, opacity=1).add_to(m)
             k += 1
 
-    # dog houses + labels com OFFSET EM NM (lado alternado)
+    # dog houses + labels (offset em NM; alterna lado)
     side = 1
     for L in legs:
         mid_lat, mid_lon = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], L["Dist"]/2.0)
-        tri_center_lat, tri_center_lon = dest_point(mid_lat, mid_lon, L["TC"]+side*90, 0.42)   # 0.42 nm ao lado
+        tri_center_lat, tri_center_lon = dest_point(mid_lat, mid_lon, L["TC"]+side*90, 0.42)
         tri = triangle_coords(tri_center_lat, tri_center_lon, L["TC"], h_nm=1.0, w_nm=0.72)
         folium.Polygon(tri, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.92).add_to(m)
-
-        # MH em amarelo (no mesmo centro)
         _add_text(m, tri_center_lat, tri_center_lon, f"MH {rang(L['MH'])}°", size_px=26, color="#FFD700")
-        # info deslocada mais para o lado (0.62 nm)
         info_lat, info_lon = dest_point(mid_lat, mid_lon, L["TC"]+side*90, 0.62)
         _add_text(m, info_lat, info_lon,
                   f"{rang(L['TH'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm",
                   size_px=14, color="#000000")
         side *= -1
 
-    # WPs (originais + TOC/TOD)
+    # waypoints
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
         color = "#FF5050" if is_toc_tod else "#007AFF"
@@ -479,12 +485,10 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                             weight=2, fill=True, fill_color=color, fill_opacity=1).add_to(m)
         _add_text(m, N["lat"], N["lon"], f"{idx+1}. {N['name']}", size_px=14, color="#FFFFFF")
 
-    # ajustar vista + controlos
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
-    add_print_button(m)                 # botão Export PDF/PNG
+    add_print_button(m)
     folium.LayerControl(collapsed=False).add_to(m)
-
     st_folium(m, width=None, height=720)
 
 # ---- render ----
