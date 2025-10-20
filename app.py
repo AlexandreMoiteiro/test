@@ -1,14 +1,20 @@
-# NAVLOG v20 — Leaflet VFR — Dog houses com texto DENTRO — TOC/TOD WPs
+# NAVLOG v21 — Leaflet VFR — Dog houses com texto DENTRO — TOC/TOD WPs
 # TAS: 70/90/90 — FF 20 L/h — riscas 2 min — seleção única de WPs
+# Melhorias:
+#  • Mapa 100% Leaflet (OTM, OSM HOT, Esri Topo, Esri Satélite híbrido, MapTiler opcional)
+#  • Bug fix: payload JSON é lido DEPOIS de injetado (mapa agora renderiza)
+#  • Pesquisa AD/Localidade com ranking, normalização sem acentos, deduplicação e filtros por tipo
+#  • ETO por sub-leg (se hora off-blocks for dada)
+#  • Sem experimental_rerun (evito reruns; ao subir/descer WP apenas altero a lista)
 
 import streamlit as st
 import pandas as pd
-import math, re, datetime as dt, json
+import math, re, datetime as dt, json, unicodedata
 from math import sin, asin, radians, degrees
 from streamlit.components.v1 import html as st_html
 
 # ============ PAGE / STYLE ============
-st.set_page_config(page_title="NAVLOG v20 — VFR (Leaflet)", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NAVLOG v21 — VFR (Leaflet)", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
 :root{--line:#e5e7eb;--chip:#f3f4f6;--mh:#d61f69}
@@ -29,6 +35,9 @@ rang   = lambda x: int(round(float(x))) % 360
 rint   = lambda x: int(round(float(x)))
 r10f   = lambda x: round(float(x), 1)
 clamp  = lambda v, lo, hi: max(lo, min(hi, v))
+
+def strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
 def wrap360(x): x = math.fmod(float(x), 360.0); return x + 360 if x < 0 else x
 def angdiff(a, b): return (a - b + 180) % 360 - 180
@@ -106,6 +115,7 @@ ens("ck_default", 2); ens("wind_from", 0); ens("wind_kt", 0)
 ens("wps", []); ens("legs", []); ens("sublegs", [])
 ens("leaf_base", "VFR híbrido (OTM + OSM labels)")
 ens("maptiler_key", "")
+ens("filters", {"AD": True, "LOC": True})
 
 # ============ CSV parsing ============
 AD_CSV  = "AD-HEL-ULM.csv"
@@ -162,10 +172,20 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
             rows.append({"type":"LOC","code":code or name, "name":name, "sector":sector,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
+def load_csvs():
+    try:
+        ad_raw  = pd.read_csv(AD_CSV); loc_raw = pd.read_csv(LOC_CSV)
+        return parse_ad_df(ad_raw), parse_loc_df(loc_raw)
+    except Exception:
+        st.warning("Não foi possível ler os CSVs locais (AD/LOC).")
+        return pd.DataFrame(columns=["type","code","name","city","lat","lon","alt"]), pd.DataFrame(columns=["type","code","name","sector","lat","lon","alt"])
+
+ad_df, loc_df = load_csvs()
+
 # ============ HEADER ============
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
-a,b,c,d = st.columns([3,2,3,2])
-with a: st.title("NAVLOG — v20 (Leaflet VFR)")
+a,b,c,d = st.columns([3,2.3,3,2])
+with a: st.title("NAVLOG — v21 (Leaflet VFR)")
 with b:
     st.session_state.leaf_base = st.selectbox(
         "Base do mapa",
@@ -198,40 +218,72 @@ with st.form("globals"):
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ============ PESQUISA/ADD WP (seleção única) ============
-def load_csvs():
-    try:
-        ad_raw  = pd.read_csv(AD_CSV); loc_raw = pd.read_csv(LOC_CSV)
-        return parse_ad_df(ad_raw), parse_loc_df(loc_raw)
-    except Exception:
-        st.warning("Não foi possível ler os CSVs locais (AD/LOC).")
-        return pd.DataFrame(columns=["type","code","name","city","lat","lon","alt"]), pd.DataFrame(columns=["type","code","name","sector","lat","lon","alt"])
+# ============ PESQUISA/ADD WP — ranking e dedupe ============
+def score_row(r, tokens):
+    # campos (normalizados, sem acentos, lower)
+    code = strip_accents(str(r.get("code",""))).lower()
+    name = strip_accents(str(r.get("name",""))).lower()
+    city = strip_accents(str(r.get("city","") or r.get("sector",""))).lower()
+    s = 0
+    q = " ".join(tokens)
+    if q == code: s += 100
+    if q == name: s += 80
+    for t in tokens:
+        if code.startswith(t): s += 40
+        elif t in code: s += 20
+        if name.startswith(t): s += 30
+        elif t in name: s += 15
+        if t and t in city: s += 8
+    # bónus se todos os tokens surgem em (code|name|city)
+    hay = f"{code} {name} {city}"
+    if all(t in hay for t in tokens): s += 10
+    # AD preferido em caso de empate
+    if r.get("type") == "AD": s += 3
+    return s
 
-ad_df, loc_df = load_csvs()
+def smart_search(qtxt, want_AD=True, want_LOC=True, limit=50):
+    if not qtxt.strip(): return pd.DataFrame()
+    tokens = [strip_accents(t).lower() for t in qtxt.strip().split()]
+    df = pd.concat([ad_df, loc_df], ignore_index=True)
+    if not want_AD: df = df[df["type"]!="AD"]
+    if not want_LOC: df = df[df["type"]!="LOC"]
+    if df.empty: return df
+    # scoring
+    df = df.copy()
+    df["__score"] = df.apply(lambda r: score_row(r, tokens), axis=1)
+    df = df[df["__score"]>0]
+    if df.empty: return df
+    # dedupe por (code normalizado) + lat/lon arredondados
+    df["__code_norm"] = df["code"].astype(str).map(lambda s: strip_accents(s).lower())
+    df["__latr"] = (df["lat"].astype(float).round(4))
+    df["__lonr"] = (df["lon"].astype(float).round(4))
+    df.sort_values(["__code_norm","__latr","__lonr","__score"], ascending=[True,True,True,False], inplace=True)
+    df = df.drop_duplicates(subset=["__code_norm","__latr","__lonr"], keep="first")
+    df = df.sort_values("__score", ascending=False).head(limit)
+    return df
 
-def filter_df(df, q):
-    if not q: return df
-    tq = q.lower().strip()
-    return df[df.apply(lambda r: any(tq in str(v).lower() for v in r.values), axis=1)]
+sc1, sc2, sc3, sc4 = st.columns([3,1.5,1.5,2])
+with sc1: qtxt = st.text_input("🔎 Procurar AD/Localidade", "", placeholder="Ex: LPPT, ABRANTES, NISA, LP0078…")
+with sc2:
+    st.session_state.filters["AD"]  = st.checkbox("Incluir AD", value=st.session_state.filters["AD"])
+with sc3:
+    st.session_state.filters["LOC"] = st.checkbox("Incluir LOC", value=st.session_state.filters["LOC"])
+with sc4: alt_wp = st.number_input("Altitude para WP novo (ft)", 0.0, 18000.0, 3000.0, step=100.0)
 
-c1,c2,c3 = st.columns([3,3,2])
-with c1: qtxt = st.text_input("🔎 Procurar AD/Localidade (CSV local)", "", placeholder="Ex: LPPT, ABRANTES, LP0078…")
-with c2: alt_wp = st.number_input("Altitude para WP novo (ft)", 0.0, 18000.0, 3000.0, step=100.0)
-with c3: add_sel = st.button("Adicionar selecionado")
-
-results = pd.concat([filter_df(ad_df, qtxt), filter_df(loc_df, qtxt)], ignore_index=True)
+results = smart_search(qtxt, st.session_state.filters["AD"], st.session_state.filters["LOC"], limit=60)
 sel_idx = None
-if not results.empty and qtxt.strip():
-    st.caption(f"Resultados para **{qtxt}** ({len(results)}) — escolhe um:")
+if not results.empty:
+    st.caption(f"Resultados ({len(results)}) — escolhe um:")
     options = []
     for i, r in results.iterrows():
         extra = r.get("city") or r.get("sector") or ""
-        options.append((i, f"{r['type']} • {r['name']} ({r['code']}) — {extra} [{r['lat']:.5f}, {r['lon']:.5f}]"))
-    sel_label = st.radio("Escolha o waypoint", options=[lbl for _, lbl in options], index=0)
-    sel_map = {lbl:i for i,lbl in options}; sel_idx = sel_map.get(sel_label)
+        label = f"{r['type']} • {r['name']} ({r['code']}) — {extra}  [{r['lat']:.5f}, {r['lon']:.5f}]"
+        options.append((i, label))
+    sel_label = st.radio("Escolha o waypoint", options=[lbl for _, lbl in options], index=0, key="sel_radio")
+    sel_map = {lbl:i for i, lbl in options}; sel_idx = sel_map.get(sel_label)
 
-if add_sel and sel_idx is not None:
-    r = results.iloc[sel_idx]
+if st.button("Adicionar selecionado") and sel_idx is not None:
+    r = results.loc[sel_idx]
     st.session_state.wps.append({"name": str(r["code"]), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
     st.success(f"Adicionado: {r['name']} ({r['code']}).")
 
@@ -253,11 +305,14 @@ if st.session_state.wps:
                 st.session_state.wps[i] = {"name":name,"lat":float(lat),"lon":float(lon),"alt":float(alt)}
             if st.button("Remover", key=f"delwp_{i}"): del_idx = i
     if swap_u is not None:
-        i=swap_u; st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]; st.rerun()
+        i=swap_u; st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]
+        st.info("WP movido para cima. Carrega 'Gerar/Atualizar legs' para recomputar.")
     if swap_d is not None:
-        i=swap_d; st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]; st.rerun()
+        i=swap_d; st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]
+        st.info("WP movido para baixo. Carrega 'Gerar/Atualizar legs' para recomputar.")
     if del_idx is not None:
-        st.session_state.wps.pop(del_idx); st.rerun()
+        st.session_state.wps.pop(del_idx)
+        st.info("WP removido. Carrega 'Gerar/Atualizar legs'.")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
@@ -336,7 +391,24 @@ def make_sublegs():
         else:
             add_leg((latA,lonA), (latB,lonB), L["Alt0"], L["Alt0"], "CRUISE", TAS_CRUISE, THr, MHr, GScr, "Cruise")
 
-# ============ RENDER INFO (ETE/ETO resumido) ============
+def annotate_times():
+    # Calcula ETO acumulado por subleg
+    if not st.session_state.sublegs: return
+    base_time = None
+    if st.session_state.start_clock.strip():
+        try:
+            h,m = map(int, st.session_state.start_clock.split(":"))
+            base_time = dt.datetime.combine(dt.date.today(), dt.time(h,m))
+        except: base_time = None
+    clock = base_time
+    for s in st.session_state.sublegs:
+        if clock is None:
+            s["ETO"] = ""
+        else:
+            clock = clock + dt.timedelta(seconds=s["Time"])
+            s["ETO"] = clock.strftime("%H:%M")
+
+# ============ INFO RESUMO ============
 def render_info_cards():
     if not st.session_state.sublegs: return
     total_t = sum(s["Time"] for s in st.session_state.sublegs)
@@ -383,10 +455,9 @@ def build_leaflet_payload():
     HOUSE_OFFSET_NM = 0.65
     for s in st.session_state.sublegs:
         A=(s["A_lat"], s["A_lon"]); B=(s["B_lat"], s["B_lon"])
-        # routes (duas camadas: sombra preta + magenta)
-        data["paths"].append(dict(color="black", weight=7, latlngs=[[A[0],A[1]],[B[0],B[1]]]))
+        data["paths"].append(dict(color="black",  weight=7, latlngs=[[A[0],A[1]],[B[0],B[1]]]))
         data["paths"].append(dict(color="#ce2bd8", weight=5, latlngs=[[A[0],A[1]],[B[0],B[1]]]))
-        # ticks cada 2 min
+
         interval_s=120; total_t=s["Time"]; total_d=s["Dist"]; tc_here=s["TC"]
         k=1
         while k*interval_s <= total_t:
@@ -397,24 +468,26 @@ def build_leaflet_payload():
             right_lat,right_lon=dest_point(latm,lonm,tc_here+90,half_nm)
             data["ticks"].append([[left_lat,left_lon],[right_lat,right_lon]])
             k+=1
-        # dog house + chips + labels
+
         mid_lat, mid_lon = point_along_gc(A[0],A[1],B[0],B[1], total_d/2.0)
         off_lat, off_lon = dest_point(mid_lat, mid_lon, s["TC"]+90, HOUSE_OFFSET_NM)
         data["houses"].append(house_polygon(off_lat, off_lon, s["TC"]))
         poly_top,  cen_top  = chip_rect_with_center(off_lat, off_lon, s["TC"], w_nm=0.58, h_nm=0.24, forward_nm= 0.08)
         poly_bot,  cen_bot  = chip_rect_with_center(off_lat, off_lon, s["TC"], w_nm=0.58, h_nm=0.24, forward_nm=-0.13)
         data["chips"].append(poly_top); data["chips"].append(poly_bot)
-        data["labels"].append(dict(lat=cen_top[0], lon=cen_top[1], cls="mh",  text=f"{rang(s['MH'])} M"))
+
+        mh_text = f"{rang(s['MH'])} M"
         info = f"{rang(s['TC'])} T&nbsp;&nbsp;{r10f(s['Dist'])} nm&nbsp;&nbsp;GS {rint(s['GS'])}&nbsp;&nbsp;ETE {mmss(s['Time'])}"
         if s.get("ETO"): info += f"&nbsp;&nbsp;ETO {s['ETO']}"
+        data["labels"].append(dict(lat=cen_top[0], lon=cen_top[1], cls="mh",  text=mh_text))
         data["labels"].append(dict(lat=cen_bot[0], lon=cen_bot[1], cls="info", text=info))
-        # TOC/TOD deslocados
+
         if "TOC" in s:
             lt,ln = s["TOC"]; p = dest_point(lt,ln,s["TC"]+90,0.18); lab = dest_point(p[0],p[1],s["TC"]+110,0.16)
-            data["specials"].append(dict(lat=p[0],lon=p[1], label_pos=[lab[0],lab[1]], label="TOC"))
+            data["specials"].append(dict(lat=p[0],lon=p[1]], label_pos=[lab[0],lab[1]], label="TOC"))
         if "TOD" in s:
             lt,ln = s["TOD"]; p = dest_point(lt,ln,s["TC"]+90,0.18); lab = dest_point(p[0],p[1],s["TC"]+110,0.16)
-            data["specials"].append(dict(lat=p[0],lon=p[1], label_pos=[lab[0],lab[1]], label="TOD"))
+            data["specials"].append(dict(lat=p[0],lon=p[1]], label_pos=[lab[0],lab[1]], label="TOD"))
     return data
 
 # ============ LEAFLET (HTML embebido) ============
@@ -438,6 +511,10 @@ LEAFLET_HTML = """
 </head>
 <body>
 <div id="map"></div>
+
+<!-- payload vem ANTES do JS que o lê (bug fix) -->
+<script id="payload" type="application/json">{PAYLOAD}</script>
+
 <script>
 const DATA = JSON.parse(document.getElementById('payload').textContent);
 
@@ -447,12 +524,6 @@ const map = L.map('map', { zoomControl: true });
 // Base layers
 const bases = {};
 function mt(url){ return url.replaceAll('{key}', DATA.maptilerKey || ''); }
-
-if (DATA.base.includes('MapTiler')) {
-  if (!DATA.maptilerKey){
-    alert('Estilo MapTiler escolhido mas sem API key — a usar OTM por defeito.');
-  }
-}
 
 bases["OpenTopoMap"] = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {subdomains:'abc', maxZoom:17, opacity:1});
 bases["OSM HOT"] = L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {subdomains:'abc', maxZoom:19});
@@ -536,7 +607,6 @@ map.fitBounds(b.pad(0.15));
 
 L.control.scale({imperial:false}).addTo(map);
 </script>
-<script id="payload" type="application/json">{PAYLOAD}</script>
 </body>
 </html>
 """
@@ -549,10 +619,12 @@ def render_leaflet():
     if not st.session_state.legs:
         rebuild_legs_from_wps()
     make_sublegs()
+    annotate_times()
     render_info_cards()
     payload = build_leaflet_payload()
     html = LEAFLET_HTML.replace("{PAYLOAD}", json.dumps(payload))
-    st_html(html, height=700, scrolling=False)
+    st_html(html, height=720, scrolling=False)
 
 # ============ RUN ============
 render_leaflet()
+
