@@ -1,12 +1,12 @@
-# app.py — NAVLOG (Leaflet/Folium) — VFR/Satélite + TOC/TOD como WPs
-# - Motor de mapa: Folium/Leaflet (estável), com botão "Imprimir/Exportar" (PDF/PNG via print do browser)
-# - TAS fixas: 70 kt (subida), 90 kt (cruzeiro e descida)
+# app.py — NAVLOG (Folium/Leaflet) — VFR + TOC/TOD + Print
+# - TAS fixas: 70 kt (subida), 90 kt (cruzeiro/descida)
 # - FF fixa: 20 L/h
-# - TOC/TOD inseridos como novos waypoints; legs separadas
-# - Riscas de 2 min calculadas pela GS da leg
-# - Dog houses triangulares; MH grande (amarelo) com halo
-# - Pesquisa com seleção (evita duplicados tipo "NISA")
-# - Bases de mapa: OpenTopoMap, EOX Sentinel-2, ESRI World Imagery/Topo, Carto Positron, OSM Standard, MapTiler Hybrid (opcional key)
+# - TOC/TOD inseridos como novos WPs e as legs são separadas
+# - Mapa Folium/Leaflet (estável) com várias bases VFR (satélite/topo/OSM)
+# - Dog houses triangulares; MH grande (amarelo) com halo branco
+# - Riscas a cada 2 min calculadas pela GS da leg
+# - Pesquisa com seleção (evita duplicados tipo “NISA”)
+# - Botão “Imprimir/Exportar” (leaflet.browser.print)
 
 import streamlit as st
 import pandas as pd
@@ -14,7 +14,7 @@ import folium, math, re, datetime as dt
 from streamlit_folium import st_folium
 from math import sin, asin, radians, degrees
 from jinja2 import Template
-from branca.element import MacroElement
+from branca.element import MacroElement, Element
 
 # ===================== CONSTANTES =====================
 CLIMB_TAS   = 70.0   # kt
@@ -24,7 +24,7 @@ FUEL_FLOW   = 20.0   # L/h (constante)
 EARTH_NM    = 3440.065
 
 # ===================== PAGE / STYLE =====================
-st.set_page_config(page_title="NAVLOG — Folium (VFR/Satélite) + TOC/TOD", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NAVLOG — Leaflet (VFR) + TOC/TOD", layout="wide", initial_sidebar_state="collapsed")
 CSS = """
 <style>
 :root{--line:#e5e7eb;--chip:#f3f4f6}
@@ -33,7 +33,7 @@ CSS = """
 .kvrow{display:flex;gap:8px;flex-wrap:wrap}
 .kv{background:var(--chip);border:1px solid var(--line);border-radius:10px;padding:6px 8px;font-size:12px}
 .sep{height:1px;background:var(--line);margin:10px 0}
-.sticky{position:sticky;top:0;background:#ffffffee;backdrop-filter:saturate(150%) blur(4px);z-index:50;border-bottom:1px solid var(--line);padding-bottom:8px}
+.sticky{position:sticky;top:0;background:#ffffffee;backdrop-filter:saturate(150%) blur(4px);z-index:50;border-bottom:1px solid #e5e7eb;padding-bottom:8px}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -58,7 +58,7 @@ def wind_triangle(tc, tas, wdir, wkt):
     gs  = max(0.0, tas * math.cos(math.radians(wca)) - wkt * math.cos(d))
     return wca, th, gs
 
-def apply_var(th, var, east_is_neg=False):  # var magnética
+def apply_var(th, var, east_is_neg=False):
     return wrap360(th - var if east_is_neg else th + var)
 
 # geodesia
@@ -101,24 +101,6 @@ def triangle_coords(lat, lon, heading_deg, h_nm=1.00, w_nm=0.72):
     br_lat, br_lon = dest_point(base_c_lat, base_c_lon, heading_deg+90.0, w_nm/2.0)
     return [(bl_lat, bl_lon), (apex_lat, apex_lon), (br_lat, br_lon)]
 
-# ===================== PRINT BUTTON (Leaflet plugin) =====================
-class BrowserPrintPlugin(MacroElement):
-    """Botão Imprimir/Exportar (leaflet.browser.print)."""
-    _template = Template("""
-        {% macro script(this, kwargs) %}
-            var s = document.createElement('script');
-            s.src = 'https://unpkg.com/leaflet.browser.print/dist/leaflet.browser.print.min.js';
-            s.onload = function(){
-                L.control.browserPrint({
-                    title: 'Imprimir/Exportar',
-                    position: 'topleft',
-                    printModes: [ L.BrowserPrint.Mode.Landscape(), L.BrowserPrint.Mode.Portrait(), 'Auto', 'Custom' ]
-                }).addTo({{this._parent.get_name()}});
-            };
-            document.head.appendChild(s);
-        {% endmacro %}
-    """)
-
 # ===================== STATE =====================
 def ens(k, v): return st.session_state.setdefault(k, v)
 ens("wind_from", 0); ens("wind_kt", 0)
@@ -134,8 +116,8 @@ ens("maptiler_key", "")
 # ===================== HEADER =====================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 h1, h2, h3, h4 = st.columns([3,3,2,2])
-with h1: st.title("NAVLOG — Folium (VFR/Satélite) + TOC/TOD")
-with h2: st.caption("TAS 70/90/90 · FF 20 L/h · mapa estável + impressão")
+with h1: st.title("NAVLOG — Leaflet (VFR) + TOC/TOD")
+with h2: st.caption("TAS 70/90/90 · FF 20 L/h · Folium/Leaflet (estável) com Print")
 with h3:
     if st.button("➕ Novo waypoint", use_container_width=True):
         st.session_state.wps.append({"name": f"WP{len(st.session_state.wps)+1}", "lat": 39.5, "lon": -8.0, "alt": 3000.0})
@@ -173,15 +155,7 @@ with st.form("globals"):
                 "OSM Standard",
                 "MapTiler Satellite Hybrid (requer key)"
             ],
-            index=[
-                "OpenTopoMap (topo VFR-ish)",
-                "EOX Sentinel-2 (satélite)",
-                "ESRI World Imagery (satélite)",
-                "ESRI WorldTopoMap (topo)",
-                "Carto Positron (clean)",
-                "OSM Standard",
-                "MapTiler Satellite Hybrid (requer key)"
-            ].index(st.session_state.map_base if st.session_state.map_base else "OpenTopoMap (topo VFR-ish)")
+            index=0
         )
     with b2:
         if "MapTiler" in st.session_state.map_base:
@@ -239,7 +213,7 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
             try: lon_idx = tokens.index(lon_tok)
             except ValueError: continue
             code = tokens[lon_idx+1] if lon_idx+1 < len(tokens) else None
-            sector = " ". ".join(tokens[lon_idx+2:]) if lon_idx+2 < len(tokens) else None
+            sector = " ".join(tokens[lon_idx+2:]) if lon_idx+2 < len(tokens) else None
             name = " ".join(tokens[:tokens.index(lat_tok)]).strip()
             rows.append({"src":"LOC","code":code or name, "name":name, "sector":sector,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
@@ -275,6 +249,30 @@ if not results.empty:
         for _, r in results.iloc[sel_idx].iterrows():
             st.session_state.wps.append({"name": str(r.get("code") or r.get("name")), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
         st.success(f"Adicionados {len(sel_idx)} WPs.")
+st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+
+# ===================== EDITOR DE WPs =====================
+if st.session_state.wps:
+    st.subheader("Rota (Waypoints)")
+    for i, w in enumerate(st.session_state.wps):
+        with st.expander(f"WP {i+1} — {w['name']}", expanded=False):
+            c1,c2,c3,c4,c5 = st.columns([2,2,2,1,1])
+            with c1: name = st.text_input(f"Nome — WP{i+1}", w["name"], key=f"wpn_{i}")
+            with c2: lat  = st.number_input(f"Lat — WP{i+1}", -90.0, 90.0, float(w["lat"]), step=0.0001, key=f"wplat_{i}")
+            with c3: lon  = st.number_input(f"Lon — WP{i+1}", -180.0, 180.0, float(w["lon"]), step=0.0001, key=f"wplon_{i}")
+            with c4: alt  = st.number_input(f"Alt (ft) — WP{i+1}", 0.0, 18000.0, float(w["alt"]), step=50.0, key=f"wpalt_{i}")
+            with c5:
+                up = st.button("↑", key=f"up{i}")
+                dn = st.button("↓", key=f"dn{i}")
+                if up and i>0:
+                    st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]
+                if dn and i < len(st.session_state.wps)-1:
+                    st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]
+            if (name,lat,lon,alt) != (w["name"],w["lat"],w["lon"],w["alt"]):
+                st.session_state.wps[i] = {"name":name,"lat":float(lat),"lon":float(lon),"alt":float(alt)}
+            if st.button("Remover", key=f"delwp_{i}"):
+                st.session_state.wps.pop(i)
+
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ===================== TOC/TOD COMO WPs =====================
@@ -407,13 +405,29 @@ if st.session_state.legs:
             )
             st.markdown(f"**Relógio** — {L['clock_start']} → {L['clock_end']}  |  **EFOB** — {L['efob_start']:.1f} → {L['efob_end']:.1f} L")
 
+# ===================== PRINT PLUGIN =====================
+class BrowserPrintPlugin(MacroElement):
+    _template = Template("""
+        {% macro header(this, kwargs) %}
+            <link rel="stylesheet" href="https://unpkg.com/leaflet.browser.print/dist/leaflet.browser.print.css"/>
+        {% endmacro %}
+        {% macro script(this, kwargs) %}
+            L.control.browserPrint({
+                title: 'Imprimir/Exportar',
+                position: 'topleft',
+                printModes: [ L.BrowserPrint.Mode.Landscape(), L.BrowserPrint.Mode.Portrait(), 'Auto', 'Custom' ]
+            }).addTo({{this._parent.get_name()}});
+        {% endmacro %}
+    """)
+
+def enable_print(map_obj):
+    Element('<script src="https://unpkg.com/leaflet.browser.print/dist/leaflet.browser.print.min.js"></script>').add_to(map_obj)
+    map_obj.add_child(BrowserPrintPlugin())
+
 # ===================== MAPA (FOLIUM / LEAFLET) =====================
 def _bounds_from_nodes(nodes):
     lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
-    return [(min(lats), min(lons)), (max(lats), max(lons))]
-
-def _route_latlngs(legs):
-    return [ [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])] for L in legs ]
+    return [(min(lats),min(lons)), (max(lats),max(lons))]
 
 def _add_text(map_obj, lat, lon, text, size_px=22, color="#FFD700", offset_px=(0,0), bold=True, halo=True):
     weight = "700" if bold else "400"
@@ -439,45 +453,52 @@ def render_map_folium(nodes, legs, base_choice="OpenTopoMap (topo VFR-ish)", map
     if base_choice == "OpenTopoMap (topo VFR-ish)":
         folium.TileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
                          attr="© OpenTopoMap (CC-BY-SA)", name="OpenTopoMap").add_to(m)
+
     elif base_choice == "EOX Sentinel-2 (satélite)":
         folium.TileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
                          attr="© EOX & Sentinel-2 cloudless", name="Satélite (EOX)").add_to(m)
         folium.TileLayer("https://tiles.maps.eox.at/wmts/1.0.0/overlay_bright/GoogleMapsCompatible/{z}/{y}/{x}.png",
                          attr="© EOX overlay", name="Labels", overlay=True, control=True, opacity=1.0).add_to(m)
+
     elif base_choice == "ESRI World Imagery (satélite)":
         folium.TileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                          attr="© Esri", name="ESRI World Imagery").add_to(m)
         folium.TileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
                          attr="© Esri Places", name="Places/Labels", overlay=True, control=True, opacity=1.0).add_to(m)
+
     elif base_choice == "ESRI WorldTopoMap (topo)":
         folium.TileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
                          attr="© Esri", name="ESRI WorldTopoMap").add_to(m)
+
     elif base_choice == "Carto Positron (clean)":
         folium.TileLayer("https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png",
                          attr="© Carto", name="Carto Positron").add_to(m)
+
     elif base_choice == "MapTiler Satellite Hybrid (requer key)" and maptiler_key:
         folium.TileLayer(f"https://api.maptiler.com/maps/hybrid/256/{{z}}/{{x}}/{{y}}.jpg?key={maptiler_key}",
                          attr="© MapTiler", name="Satellite Hybrid").add_to(m)
-    else:  # OSM Standard
+
+    else:
         folium.TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
                          attr="© OpenStreetMap contributors", name="OSM Standard").add_to(m)
 
-    # ---------- DESENHO (ordem p/ impressão clara) ----------
+    # ---------- DESENHO (ordem p/ impressão) ----------
     # 1) DOG HOUSES
     side = 1
     for L in legs:
         mid_lat, mid_lon = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], L["Dist"]/2.0)
         off_lat, off_lon = dest_point(mid_lat, mid_lon, L["TC"]+side*90, 0.40)
-        tri = triangle_coords(off_lat, off_lon, L["TC"])
+        tri = triangle_coords(off_lat, off_lon, L["TC"], h_nm=1.00, w_nm=0.72)
         folium.Polygon(tri, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.93).add_to(m)
         side *= -1
 
     # 2) ROTA (halo + magenta)
-    for latlngs in _route_latlngs(legs):
+    for L in legs:
+        latlngs = [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])]
         folium.PolyLine(latlngs, color="#FFFFFF", weight=8, opacity=0.95).add_to(m)
         folium.PolyLine(latlngs, color="#C000FF", weight=4, opacity=1.0).add_to(m)
 
-    # 3) TICKS de 2 min
+    # 3) TICKS 2 min
     for L in legs:
         if L["GS"]<=0 or L["time_sec"]<=0: continue
         k, step = 1, 120
@@ -500,7 +521,7 @@ def render_map_folium(nodes, legs, base_choice="OpenTopoMap (topo VFR-ish)", map
         _add_text(m, off_lat, off_lon, info, size_px=14, color="#000000", offset_px=(side*92,18), halo=True)
         side *= -1
 
-    # 5) WPs (originais + TOC/TOD)
+    # 5) WAYPOINTS
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
         color = "#FF5050" if is_toc_tod else "#007AFF"
@@ -508,15 +529,15 @@ def render_map_folium(nodes, legs, base_choice="OpenTopoMap (topo VFR-ish)", map
                             fill=True, fill_opacity=1, fill_color=color).add_to(m)
         _add_text(m, N["lat"], N["lon"], f"{idx+1}. {N['name']}", size_px=14, color="#FFFFFF", offset_px=(0,-22), halo=True)
 
-    # Controlo + Botão imprimir + Vista
     folium.LayerControl(collapsed=False).add_to(m)
-    m.add_child(BrowserPrintPlugin())
+    enable_print(m)  # botão “Imprimir/Exportar”
+
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
 
     st_folium(m, width=None, height=720)
 
-# ---- render map ----
+# ---- desenhar mapa ----
 if st.session_state.wps:
     if not st.session_state.route_nodes:
         st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar legs.")
