@@ -1,11 +1,6 @@
 # NAVLOG v21 — Leaflet VFR — Dog houses com texto DENTRO — TOC/TOD WPs
-# TAS: 70/90/90 — FF 20 L/h — riscas 2 min — seleção única de WPs
-# Melhorias:
-#  • Mapa 100% Leaflet (OTM, OSM HOT, Esri Topo, Esri Satélite híbrido, MapTiler opcional)
-#  • Bug fix: payload JSON é lido DEPOIS de injetado (mapa agora renderiza)
-#  • Pesquisa AD/Localidade com ranking, normalização sem acentos, deduplicação e filtros por tipo
-#  • ETO por sub-leg (se hora off-blocks for dada)
-#  • Sem experimental_rerun (evito reruns; ao subir/descer WP apenas altero a lista)
+# TAS fixas: 70/90/90 — FF 20 L/h — riscas 2 min — seleção única com pesquisa inteligente
+# Sem PyDeck. Mapa em Leaflet com bases: OTM/OSM HOT/Esri Topo/Esri Sat + MapTiler (opcional).
 
 import streamlit as st
 import pandas as pd
@@ -13,11 +8,11 @@ import math, re, datetime as dt, json, unicodedata
 from math import sin, asin, radians, degrees
 from streamlit.components.v1 import html as st_html
 
-# ============ PAGE / STYLE ============
+# ===================== PAGE / STYLE =====================
 st.set_page_config(page_title="NAVLOG v21 — VFR (Leaflet)", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
-:root{--line:#e5e7eb;--chip:#f3f4f6;--mh:#d61f69}
+:root{--line:#e5e7eb;--chip:#f3f4f6}
 *{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial}
 .card{border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:12px 0;background:#fff}
 .kvrow{display:flex;gap:8px;flex-wrap:wrap}
@@ -27,7 +22,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============ UTILS ============
+# ===================== UTILS =====================
 rt10   = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
 mmss   = lambda t: f"{t//60:02d}:{t%60:02d}"
 hhmmss = lambda t: f"{t//3600:02d}:{(t%3600)//60:02d}:{t%60:02d}"
@@ -36,8 +31,11 @@ rint   = lambda x: int(round(float(x)))
 r10f   = lambda x: round(float(x), 1)
 clamp  = lambda v, lo, hi: max(lo, min(hi, v))
 
-def strip_accents(s: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+def normalize_txt(s: str) -> str:
+    s = str(s or "").strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join([c for c in s if not unicodedata.combining(c)])
+    return re.sub(r"[^0-9a-z]+", " ", s).strip()
 
 def wrap360(x): x = math.fmod(float(x), 360.0); return x + 360 if x < 0 else x
 def angdiff(a, b): return (a - b + 180) % 360 - 180
@@ -50,6 +48,7 @@ def wind_triangle(tc, tas, wdir, wkt):
     return wca, th, gs
 apply_var = lambda th, var, east_is_neg=False: wrap360(th - var if east_is_neg else th + var)
 
+# geodesia
 EARTH_NM = 3440.065
 def gc_dist_nm(lat1, lon1, lat2, lon2):
     φ1, λ1, φ2, λ2 = map(math.radians, [lat1, lon1, lat2, lon2])
@@ -82,7 +81,7 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
-# ============ FIXOS ============
+# ===================== FIXOS =====================
 TAS_CLIMB, TAS_CRUISE, TAS_DESCENT = 70.0, 90.0, 90.0
 FF_CONST = 20.0
 press_alt  = lambda alt, qnh: float(alt) + (1013.0 - float(qnh)) * 30.0
@@ -106,7 +105,7 @@ def roc_interp(pa, temp):
     v0 = interp1(t, t0, t1, v00, v01); v1 = interp1(pa_c, p0, p1, v10, v11)
     return max(1.0, interp1(pa_c, p0, p1, v0, v1) * 0.90)
 
-# ============ STATE ============
+# ===================== STATE =====================
 def ens(k, v): return st.session_state.setdefault(k, v)
 ens("qnh", 1013); ens("oat", 15); ens("mag_var", 1); ens("mag_is_e", False)
 ens("desc_angle", 3.0)
@@ -115,9 +114,8 @@ ens("ck_default", 2); ens("wind_from", 0); ens("wind_kt", 0)
 ens("wps", []); ens("legs", []); ens("sublegs", [])
 ens("leaf_base", "VFR híbrido (OTM + OSM labels)")
 ens("maptiler_key", "")
-ens("filters", {"AD": True, "LOC": True})
 
-# ============ CSV parsing ============
+# ===================== CSV parsing =====================
 AD_CSV  = "AD-HEL-ULM.csv"
 LOC_CSV = "Localidades-Nova-versao-230223.csv"
 
@@ -140,18 +138,18 @@ def parse_ad_df(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for line in df.iloc[:,0].dropna().tolist():
         s = str(line).strip()
-        if not s or s.startswith(("Ident", "DEP/")): continue
+        if not s or s.startswith(("Ident","DEP/")): continue
         tokens = s.split()
         coord_toks = [t for t in tokens if re.match(r"^\d+(?:\.\d+)?[NSEW]$", t)]
         if len(coord_toks) >= 2:
             lat_tok = coord_toks[-2]; lon_tok = coord_toks[-1]
             lat = dms_to_dd(lat_tok, is_lon=False); lon = dms_to_dd(lon_tok, is_lon=True)
             ident = tokens[0] if re.match(r"^[A-Z0-9]{4,}$", tokens[0]) else None
-            try:    name = " ".join(tokens[1:tokens.index(coord_toks[0])]).strip()
+            try: name = " ".join(tokens[1:tokens.index(coord_toks[0])]).strip()
             except: name = " ".join(tokens[1:]).strip()
-            try:    lon_idx = tokens.index(lon_tok); city = " ".join(tokens[lon_idx+1:]) or None
+            try: lon_idx = tokens.index(lon_tok); city = " ".join(tokens[lon_idx+1:]) or None
             except: city = None
-            rows.append({"type":"AD","code":ident or name, "name":name, "city":city,"lat":lat,"lon":lon,"alt":0.0})
+            rows.append({"type":"AD","code":ident or name,"name":name,"place":city,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
 def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -169,22 +167,12 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
             code = tokens[lon_idx+1] if lon_idx+1 < len(tokens) else None
             sector = " ".join(tokens[lon_idx+2:]) if lon_idx+2 < len(tokens) else None
             name = " ".join(tokens[:tokens.index(lat_tok)]).strip()
-            rows.append({"type":"LOC","code":code or name, "name":name, "sector":sector,"lat":lat,"lon":lon,"alt":0.0})
+            rows.append({"type":"LOC","code":code or name,"name":name,"place":sector,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
-def load_csvs():
-    try:
-        ad_raw  = pd.read_csv(AD_CSV); loc_raw = pd.read_csv(LOC_CSV)
-        return parse_ad_df(ad_raw), parse_loc_df(loc_raw)
-    except Exception:
-        st.warning("Não foi possível ler os CSVs locais (AD/LOC).")
-        return pd.DataFrame(columns=["type","code","name","city","lat","lon","alt"]), pd.DataFrame(columns=["type","code","name","sector","lat","lon","alt"])
-
-ad_df, loc_df = load_csvs()
-
-# ============ HEADER ============
+# ===================== HEADER =====================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
-a,b,c,d = st.columns([3,2.3,3,2])
+a,b,c,d = st.columns([3,2.5,3,2.5])
 with a: st.title("NAVLOG — v21 (Leaflet VFR)")
 with b:
     st.session_state.leaf_base = st.selectbox(
@@ -195,11 +183,11 @@ with b:
 with c:
     st.session_state.maptiler_key = st.text_input("MapTiler API key (opcional p/ estilos 'MapTiler')", st.session_state.maptiler_key)
 with d:
-    if st.button("🗑 Limpar rota/legs"):
+    if st.button("🗑 Limpar rota/legs", use_container_width=True):
         st.session_state.wps = []; st.session_state.legs = []; st.session_state.sublegs = []
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ============ PARÂMETROS ============
+# ===================== PARÂMETROS =====================
 with st.form("globals"):
     p1,p2,p3 = st.columns(3)
     with p1:
@@ -218,76 +206,78 @@ with st.form("globals"):
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ============ PESQUISA/ADD WP — ranking e dedupe ============
-def score_row(r, tokens):
-    # campos (normalizados, sem acentos, lower)
-    code = strip_accents(str(r.get("code",""))).lower()
-    name = strip_accents(str(r.get("name",""))).lower()
-    city = strip_accents(str(r.get("city","") or r.get("sector",""))).lower()
-    s = 0
-    q = " ".join(tokens)
-    if q == code: s += 100
-    if q == name: s += 80
-    for t in tokens:
-        if code.startswith(t): s += 40
-        elif t in code: s += 20
-        if name.startswith(t): s += 30
-        elif t in name: s += 15
-        if t and t in city: s += 8
-    # bónus se todos os tokens surgem em (code|name|city)
-    hay = f"{code} {name} {city}"
-    if all(t in hay for t in tokens): s += 10
-    # AD preferido em caso de empate
-    if r.get("type") == "AD": s += 3
-    return s
+# ===================== PESQUISA/ADD WP (inteligente + seleção única) =====================
+def load_csvs():
+    try:
+        ad_raw  = pd.read_csv(AD_CSV); loc_raw = pd.read_csv(LOC_CSV)
+        return parse_ad_df(ad_raw), parse_loc_df(loc_raw)
+    except Exception:
+        st.warning("Não foi possível ler os CSVs locais (AD/LOC).")
+        cols = ["type","code","name","place","lat","lon","alt"]
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
 
-def smart_search(qtxt, want_AD=True, want_LOC=True, limit=50):
-    if not qtxt.strip(): return pd.DataFrame()
-    tokens = [strip_accents(t).lower() for t in qtxt.strip().split()]
-    df = pd.concat([ad_df, loc_df], ignore_index=True)
-    if not want_AD: df = df[df["type"]!="AD"]
-    if not want_LOC: df = df[df["type"]!="LOC"]
-    if df.empty: return df
-    # scoring
-    df = df.copy()
-    df["__score"] = df.apply(lambda r: score_row(r, tokens), axis=1)
-    df = df[df["__score"]>0]
-    if df.empty: return df
-    # dedupe por (code normalizado) + lat/lon arredondados
-    df["__code_norm"] = df["code"].astype(str).map(lambda s: strip_accents(s).lower())
-    df["__latr"] = (df["lat"].astype(float).round(4))
-    df["__lonr"] = (df["lon"].astype(float).round(4))
-    df.sort_values(["__code_norm","__latr","__lonr","__score"], ascending=[True,True,True,False], inplace=True)
-    df = df.drop_duplicates(subset=["__code_norm","__latr","__lonr"], keep="first")
-    df = df.sort_values("__score", ascending=False).head(limit)
-    return df
+ad_df, loc_df = load_csvs()
 
-sc1, sc2, sc3, sc4 = st.columns([3,1.5,1.5,2])
-with sc1: qtxt = st.text_input("🔎 Procurar AD/Localidade", "", placeholder="Ex: LPPT, ABRANTES, NISA, LP0078…")
-with sc2:
-    st.session_state.filters["AD"]  = st.checkbox("Incluir AD", value=st.session_state.filters["AD"])
-with sc3:
-    st.session_state.filters["LOC"] = st.checkbox("Incluir LOC", value=st.session_state.filters["LOC"])
-with sc4: alt_wp = st.number_input("Altitude para WP novo (ft)", 0.0, 18000.0, 3000.0, step=100.0)
+def smart_search(query: str, ad_df: pd.DataFrame, loc_df: pd.DataFrame, hide_dupes=True):
+    base = pd.concat([ad_df, loc_df], ignore_index=True)
+    if not query.strip():
+        res = base.copy()
+        res["score"] = 1
+    else:
+        q = normalize_txt(query)
+        q_tokens = q.split()
+        rows = []
+        for _, r in base.iterrows():
+            name = normalize_txt(r["name"]); code = normalize_txt(r.get("code","")); place = normalize_txt(r.get("place",""))
+            score = 0
+            if q == code: score = 1000
+            elif q == name: score = 900
+            elif code.startswith(q): score = 800
+            elif name.startswith(q): score = 700
+            elif all(t in name for t in q_tokens): score = 650
+            elif q in name or q in code or q in place: score = 500
+            # bónus por AD
+            if r["type"] == "AD": score += 40
+            if score>0:
+                rr = r.to_dict(); rr["score"] = score; rows.append(rr)
+        res = pd.DataFrame(rows)
+        if res.empty: res = base.assign(score=1)
 
-results = smart_search(qtxt, st.session_state.filters["AD"], st.session_state.filters["LOC"], limit=60)
+    # ordenar e (opcional) esconder duplicados por mesma posição/nome
+    res = res.sort_values(["score","type"], ascending=[False, True])
+    if hide_dupes and not res.empty:
+        seen = set(); keep = []
+        for _, r in res.iterrows():
+            key = (round(float(r["lat"]),4), round(float(r["lon"]),4), normalize_txt(r["name"]))
+            if key in seen: continue
+            seen.add(key); keep.append(r)
+        res = pd.DataFrame(keep)
+    return res.reset_index(drop=True)
+
+c1,c2,c3,c4 = st.columns([3,1.6,1.6,1.8])
+with c1: qtxt = st.text_input("🔎 Procurar AD/Localidade (CSV local)", "", placeholder="Ex: LPPT, ABRANTES, LP0078, Nisa…")
+with c2: alt_wp = st.number_input("Altitude para WP novo (ft)", 0.0, 18000.0, 3000.0, step=100.0)
+with c3: hide_dupes = st.checkbox("Ocultar duplicados", value=True)
+with c4: add_sel = st.button("Adicionar selecionado", type="primary")
+
+results = smart_search(qtxt, ad_df, loc_df, hide_dupes=hide_dupes)
 sel_idx = None
 if not results.empty:
-    st.caption(f"Resultados ({len(results)}) — escolhe um:")
-    options = []
+    st.caption(f"{len(results)} resultado(s). Seleciona um para adicionar:")
+    opts = []
     for i, r in results.iterrows():
-        extra = r.get("city") or r.get("sector") or ""
-        label = f"{r['type']} • {r['name']} ({r['code']}) — {extra}  [{r['lat']:.5f}, {r['lon']:.5f}]"
-        options.append((i, label))
-    sel_label = st.radio("Escolha o waypoint", options=[lbl for _, lbl in options], index=0, key="sel_radio")
-    sel_map = {lbl:i for i, lbl in options}; sel_idx = sel_map.get(sel_label)
+        extra = r.get("place") or ""
+        lbl = f"{r['type']} • {r['name']} ({r['code']}) — {extra}  [{r['lat']:.5f}, {r['lon']:.5f}]"
+        opts.append((i, lbl))
+    sel_label = st.radio("Escolha o waypoint", options=[lbl for _, lbl in opts], index=0)
+    sel_map = {lbl:i for i,lbl in opts}; sel_idx = sel_map.get(sel_label)
 
-if st.button("Adicionar selecionado") and sel_idx is not None:
-    r = results.loc[sel_idx]
-    st.session_state.wps.append({"name": str(r["code"]), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
+if add_sel and sel_idx is not None:
+    r = results.iloc[sel_idx]
+    st.session_state.wps.append({"name": str(r["code"] or r["name"]), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
     st.success(f"Adicionado: {r['name']} ({r['code']}).")
 
-# ============ EDITOR DE WPs ============
+# ===================== EDITOR DE WPs =====================
 if st.session_state.wps:
     st.subheader("Rota (Waypoints)")
     del_idx, swap_u, swap_d = None, None, None
@@ -305,18 +295,15 @@ if st.session_state.wps:
                 st.session_state.wps[i] = {"name":name,"lat":float(lat),"lon":float(lon),"alt":float(alt)}
             if st.button("Remover", key=f"delwp_{i}"): del_idx = i
     if swap_u is not None:
-        i=swap_u; st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]
-        st.info("WP movido para cima. Carrega 'Gerar/Atualizar legs' para recomputar.")
+        i=swap_u; st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]; st.rerun()
     if swap_d is not None:
-        i=swap_d; st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]
-        st.info("WP movido para baixo. Carrega 'Gerar/Atualizar legs' para recomputar.")
+        i=swap_d; st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]; st.rerun()
     if del_idx is not None:
-        st.session_state.wps.pop(del_idx)
-        st.info("WP removido. Carrega 'Gerar/Atualizar legs'.")
+        st.session_state.wps.pop(del_idx); st.rerun()
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ============ LEGS + SUBLEGS ============
+# ===================== LEGS + SUBLEGS =====================
 def rebuild_legs_from_wps():
     st.session_state.legs = []
     for i in range(len(st.session_state.wps)-1):
@@ -391,24 +378,26 @@ def make_sublegs():
         else:
             add_leg((latA,lonA), (latB,lonB), L["Alt0"], L["Alt0"], "CRUISE", TAS_CRUISE, THr, MHr, GScr, "Cruise")
 
-def annotate_times():
-    # Calcula ETO acumulado por subleg
+# ETO por subleg (para labels)
+def inject_eto_into_sublegs():
     if not st.session_state.sublegs: return
-    base_time = None
-    if st.session_state.start_clock.strip():
-        try:
-            h,m = map(int, st.session_state.start_clock.split(":"))
-            base_time = dt.datetime.combine(dt.date.today(), dt.time(h,m))
-        except: base_time = None
-    clock = base_time
+    clk = st.session_state.start_clock.strip()
+    if not clk: 
+        for s in st.session_state.sublegs: s["ETO"] = ""
+        return
+    try:
+        h,m = map(int, clk.split(":"))
+        t0 = dt.datetime.combine(dt.date.today(), dt.time(h,m))
+    except:
+        for s in st.session_state.sublegs: s["ETO"] = ""
+        return
+    acc = 0
     for s in st.session_state.sublegs:
-        if clock is None:
-            s["ETO"] = ""
-        else:
-            clock = clock + dt.timedelta(seconds=s["Time"])
-            s["ETO"] = clock.strftime("%H:%M")
+        acc += s["Time"]
+        eto = (t0 + dt.timedelta(seconds=acc)).strftime("%H:%M")
+        s["ETO"] = eto
 
-# ============ INFO RESUMO ============
+# ===================== INFO TOTAL =====================
 def render_info_cards():
     if not st.session_state.sublegs: return
     total_t = sum(s["Time"] for s in st.session_state.sublegs)
@@ -420,7 +409,7 @@ def render_info_cards():
         + "</div>", unsafe_allow_html=True
     )
 
-# ============ GEOMETRIA PARA LEAFLET ============
+# ===================== GEOMETRIA p/ Leaflet =====================
 def house_polygon(lat, lon, heading_deg, w_nm=0.72, h_nm=0.92, roof_nm=0.30):
     left_lat, left_lon   = dest_point(lat, lon, heading_deg-90.0, w_nm/2.0)
     right_lat, right_lon = dest_point(lat, lon, heading_deg+90.0, w_nm/2.0)
@@ -432,8 +421,8 @@ def house_polygon(lat, lon, heading_deg, w_nm=0.72, h_nm=0.92, roof_nm=0.30):
     return [[bot_l_lat, bot_l_lon],[bot_r_lat, bot_r_lon],[top_r_lat, top_r_lon],
             [roof_lat, roof_lon],[top_l_lat, top_l_lon],[bot_l_lat, bot_l_lon]]
 
-def chip_rect_with_center(lat, lon, heading_deg, w_nm, h_nm, forward_nm):
-    c_lat, c_lon = dest_point(lat, lon, heading_deg, forward_nm)
+def chip_rect_with_center(lat, lon, heading_deg, w_nm, h_nm, fwd_nm):
+    c_lat, c_lon = dest_point(lat, lon, heading_deg, fwd_nm)
     left_lat, left_lon   = dest_point(c_lat, c_lon, heading_deg-90.0, w_nm/2.0)
     right_lat, right_lon = dest_point(c_lat, c_lon, heading_deg+90.0, w_nm/2.0)
     top_l_lat,  top_l_lon  = dest_point(left_lat,  left_lon,  heading_deg,  h_nm/2.0)
@@ -455,9 +444,9 @@ def build_leaflet_payload():
     HOUSE_OFFSET_NM = 0.65
     for s in st.session_state.sublegs:
         A=(s["A_lat"], s["A_lon"]); B=(s["B_lat"], s["B_lon"])
-        data["paths"].append(dict(color="black",  weight=7, latlngs=[[A[0],A[1]],[B[0],B[1]]]))
+        data["paths"].append(dict(color="black", weight=7, latlngs=[[A[0],A[1]],[B[0],B[1]]]))
         data["paths"].append(dict(color="#ce2bd8", weight=5, latlngs=[[A[0],A[1]],[B[0],B[1]]]))
-
+        # ticks 2 min
         interval_s=120; total_t=s["Time"]; total_d=s["Dist"]; tc_here=s["TC"]
         k=1
         while k*interval_s <= total_t:
@@ -466,22 +455,21 @@ def build_leaflet_payload():
             half_nm=0.12
             left_lat,left_lon=dest_point(latm,lonm,tc_here-90,half_nm)
             right_lat,right_lon=dest_point(latm,lonm,tc_here+90,half_nm)
-            data["ticks"].append([[left_lat,left_lon],[right_lat,right_lon]])
-            k+=1
-
+            data["ticks"].append([[left_lat,left_lon],[right_lat,right_lon]]); k+=1
+        # dog house deslocada
         mid_lat, mid_lon = point_along_gc(A[0],A[1],B[0],B[1], total_d/2.0)
         off_lat, off_lon = dest_point(mid_lat, mid_lon, s["TC"]+90, HOUSE_OFFSET_NM)
         data["houses"].append(house_polygon(off_lat, off_lon, s["TC"]))
-        poly_top,  cen_top  = chip_rect_with_center(off_lat, off_lon, s["TC"], w_nm=0.58, h_nm=0.24, forward_nm= 0.08)
-        poly_bot,  cen_bot  = chip_rect_with_center(off_lat, off_lon, s["TC"], w_nm=0.58, h_nm=0.24, forward_nm=-0.13)
-        data["chips"].append(poly_top); data["chips"].append(poly_bot)
-
-        mh_text = f"{rang(s['MH'])} M"
+        # chips + labels dentro
+        poly_top, cen_top = chip_rect_with_center(off_lat, off_lon, s["TC"], 0.58, 0.24,  0.08)
+        poly_bot, cen_bot = chip_rect_with_center(off_lat, off_lon, s["TC"], 0.58, 0.24, -0.13)
+        data["chips"] += [poly_top, poly_bot]
+        mh_text  = f"{rang(s['MH'])} M"
         info = f"{rang(s['TC'])} T&nbsp;&nbsp;{r10f(s['Dist'])} nm&nbsp;&nbsp;GS {rint(s['GS'])}&nbsp;&nbsp;ETE {mmss(s['Time'])}"
         if s.get("ETO"): info += f"&nbsp;&nbsp;ETO {s['ETO']}"
         data["labels"].append(dict(lat=cen_top[0], lon=cen_top[1], cls="mh",  text=mh_text))
         data["labels"].append(dict(lat=cen_bot[0], lon=cen_bot[1], cls="info", text=info))
-
+        # TOC/TOD
         if "TOC" in s:
             lt,ln = s["TOC"]; p = dest_point(lt,ln,s["TC"]+90,0.18); lab = dest_point(p[0],p[1],s["TC"]+110,0.16)
             data["specials"].append(dict(lat=p[0],lon=p[1]], label_pos=[lab[0],lab[1]], label="TOC"))
@@ -490,7 +478,7 @@ def build_leaflet_payload():
             data["specials"].append(dict(lat=p[0],lon=p[1]], label_pos=[lab[0],lab[1]], label="TOD"))
     return data
 
-# ============ LEAFLET (HTML embebido) ============
+# ===================== LEAFLET HTML (payload ANTES do script principal — bug fix) =====================
 LEAFLET_HTML = """
 <!doctype html>
 <html>
@@ -500,7 +488,7 @@ LEAFLET_HTML = """
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   html, body, #map{height:100%; margin:0}
-  .lbl{font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial; white-space:nowrap}
+  .lbl{font-family: ui-sans-serif, system-ui, -apple-system,'Segoe UI', Roboto, Arial; white-space:nowrap}
   .lbl.mh{font-weight:800; font-size:22px; color:#d61f69; text-shadow:0 0 2px #fff, 0 0 6px #fff}
   .lbl.info{font-weight:600; font-size:13px; color:#111; text-shadow:0 0 2px #fff, 0 0 6px #fff}
   .lbl.wp{font-weight:700; font-size:14px; color:#111; text-shadow:0 0 2px #fff, 0 0 6px #fff}
@@ -511,36 +499,26 @@ LEAFLET_HTML = """
 </head>
 <body>
 <div id="map"></div>
-
-<!-- payload vem ANTES do JS que o lê (bug fix) -->
 <script id="payload" type="application/json">{PAYLOAD}</script>
-
 <script>
 const DATA = JSON.parse(document.getElementById('payload').textContent);
-
-// Map init
 const map = L.map('map', { zoomControl: true });
 
-// Base layers
+// Bases
 const bases = {};
 function mt(url){ return url.replaceAll('{key}', DATA.maptilerKey || ''); }
-
-bases["OpenTopoMap"] = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {subdomains:'abc', maxZoom:17, opacity:1});
-bases["OSM HOT"] = L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {subdomains:'abc', maxZoom:19});
-bases["Esri Topo"] = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {maxZoom:19});
-bases["Esri Sat"]  = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {maxZoom:19});
-bases["OSM Std"]   = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {subdomains:'abc', maxZoom:19, opacity:0.45});
-
-// MapTiler (opcional)
+bases["OpenTopoMap"] = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{subdomains:'abc',maxZoom:17});
+bases["OSM HOT"] = L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',{subdomains:'abc',maxZoom:19});
+bases["Esri Topo"] = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',{maxZoom:19});
+bases["Esri Sat"]  = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19});
+bases["OSM Std"]   = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{subdomains:'abc',maxZoom:19,opacity:0.45});
 if (DATA.maptilerKey){
-  bases["MapTiler Outdoor"] = L.tileLayer(mt('https://api.maptiler.com/maps/outdoor/{z}/{x}/{y}.png?key={key}'), {maxZoom:19});
-  bases["MapTiler Hybrid"]  = L.layerGroup([
+  bases["MT Outdoor"] = L.tileLayer(mt('https://api.maptiler.com/maps/outdoor/{z}/{x}/{y}.png?key={key}'),{maxZoom:19});
+  bases["MT Hybrid"]  = L.layerGroup([
     L.tileLayer(mt('https://api.maptiler.com/tiles/satellite/{z}/{x}/{y}.jpg?key={key}')),
-    L.tileLayer(mt('https://api.maptiler.com/maps/hybrid/{z}/{x}/{y}.png?key={key}'), {opacity:0.85})
+    L.tileLayer(mt('https://api.maptiler.com/maps/hybrid/{z}/{x}/{y}.png?key={key}'),{opacity:0.85})
   ]);
 }
-
-// Pick default
 let chosen;
 switch (DATA.base){
   case "VFR híbrido (OTM + OSM labels)": chosen = L.layerGroup([bases["OpenTopoMap"], bases["OSM Std"]]); break;
@@ -548,83 +526,61 @@ switch (DATA.base){
   case "OpenTopoMap": chosen = bases["OpenTopoMap"]; break;
   case "Esri Topo": chosen = bases["Esri Topo"]; break;
   case "Esri Satélite híbrido": chosen = L.layerGroup([bases["Esri Sat"], bases["OSM Std"]]); break;
-  case "MapTiler Outdoor": chosen = bases["MapTiler Outdoor"] || bases["OpenTopoMap"]; break;
-  case "MapTiler Hybrid": chosen = bases["MapTiler Hybrid"] || L.layerGroup([bases["Esri Sat"], bases["OSM Std"]]); break;
-  default: chosen = bases["OpenTopoMap"];
+  case "MapTiler Outdoor": chosen = bases["MT Outdoor"] || bases["OpenTopoMap"]; break;
+  case "MapTiler Hybrid": chosen = bases["MT Hybrid"] || L.layerGroup([bases["Esri Sat"], bases["OSM Std"]]); break;
+  default: chosen = L.layerGroup([bases["OpenTopoMap"], bases["OSM Std"]]);
 }
 chosen.addTo(map);
 
 // Layers
-const routeLayer = L.layerGroup().addTo(map);
-const tickLayer  = L.layerGroup().addTo(map);
-const houseLayer = L.layerGroup().addTo(map);
-const chipLayer  = L.layerGroup().addTo(map);
-const labelLayer = L.layerGroup().addTo(map);
-const wpLayer    = L.layerGroup().addTo(map);
-const specialLayer = L.layerGroup().addTo(map);
+const Lroute = L.layerGroup().addTo(map);
+const Lticks = L.layerGroup().addTo(map);
+const Lhouse = L.layerGroup().addTo(map);
+const Lchips = L.layerGroup().addTo(map);
+const Llbls  = L.layerGroup().addTo(map);
+const Lwps   = L.layerGroup().addTo(map);
+const Lsp    = L.layerGroup().addTo(map);
 
-// Draw routes (shadow + magenta)
-DATA.paths.forEach(p=>{
-  L.polyline(p.latlngs, {color:p.color, weight:p.weight, opacity:1, lineCap:'round'}).addTo(routeLayer);
-});
-
-// Ticks
-DATA.ticks.forEach(t=>{
-  L.polyline(t,{color:'#000', weight:2}).addTo(tickLayer);
-});
-
-// WPs
+// Routes
+DATA.paths.forEach(p=>L.polyline(p.latlngs,{color:p.color,weight:p.weight,opacity:1,lineCap:'round'}).addTo(Lroute));
+DATA.ticks.forEach(t=>L.polyline(t,{color:'#000',weight:2}).addTo(Lticks));
 DATA.wps.forEach((w,i)=>{
-  L.marker([w.lat,w.lon], {icon: L.divIcon({className:'wpdot'})}).addTo(wpLayer);
-  L.marker([w.lat,w.lon], {icon: L.divIcon({className:'lbl wp', html:w.name, iconAnchor:[-6,-14]})}).addTo(wpLayer);
+  L.marker([w.lat,w.lon],{icon:L.divIcon({className:'wpdot'})}).addTo(Lwps);
+  L.marker([w.lat,w.lon],{icon:L.divIcon({className:'lbl wp', html:w.name, iconAnchor:[-6,-14]})}).addTo(Lwps);
 });
-
-// Houses + chips
-DATA.houses.forEach(poly=>{
-  L.polygon(poly, {color:'#000', weight:2, fill:true, fillColor:'#fff', fillOpacity:0.95}).addTo(houseLayer);
-});
-DATA.chips.forEach(poly=>{
-  L.polygon(poly, {color:'#000', weight:2, fill:true, fillColor:'#fff', fillOpacity:1}).addTo(chipLayer);
-});
-
-// Labels (dentro das caixas)
-DATA.labels.forEach(lbl=>{
-  L.marker([lbl.lat,lbl.lon], {icon: L.divIcon({className:'lbl '+lbl.cls, html: lbl.text, iconAnchor:[0,12]})}).addTo(labelLayer);
-});
-
-// TOC/TOD
+DATA.houses.forEach(poly=>L.polygon(poly,{color:'#000',weight:2,fill:true,fillColor:'#fff',fillOpacity:.95}).addTo(Lhouse));
+DATA.chips.forEach(poly=>L.polygon(poly,{color:'#000',weight:2,fill:true,fillColor:'#fff',fillOpacity:1}).addTo(Lchips));
+DATA.labels.forEach(lbl=>L.marker([lbl.lat,lbl.lon],{icon:L.divIcon({className:'lbl '+lbl.cls, html:lbl.text, iconAnchor:[0,12]})}).addTo(Llbls));
 DATA.specials.forEach(s=>{
-  L.marker([s.lat,s.lon], {icon: L.divIcon({className:'toc'})}).addTo(specialLayer);
-  L.marker(s.label_pos, {icon: L.divIcon({className:'lbl tag', html:s.label, iconAnchor:[0,0]})}).addTo(specialLayer);
+  L.marker([s.lat,s.lon],{icon:L.divIcon({className:'toc'})}).addTo(Lsp);
+  L.marker(s.label_pos,{icon:L.divIcon({className:'lbl tag', html:s.label, iconAnchor:[0,0]})}).addTo(Lsp);
 });
 
 // Fit bounds
 const all = [];
 DATA.paths.forEach(p=>p.latlngs.forEach(ll=>all.push(ll)));
 DATA.wps.forEach(w=>all.push([w.lat,w.lon]));
-const b = L.latLngBounds(all);
-map.fitBounds(b.pad(0.15));
-
+if(all.length){ map.fitBounds(L.latLngBounds(all).pad(0.15)); } else { map.setView([39.5,-8.0], 7); }
 L.control.scale({imperial:false}).addTo(map);
 </script>
 </body>
 </html>
 """
 
-# ============ RENDER ============
-def render_leaflet():
+# ===================== RENDER =====================
+def recompute_everything_and_show():
     if len(st.session_state.wps) < 2:
         st.info("Adiciona pelo menos 2 waypoints e gera as legs.")
         return
     if not st.session_state.legs:
         rebuild_legs_from_wps()
     make_sublegs()
-    annotate_times()
+    inject_eto_into_sublegs()
     render_info_cards()
     payload = build_leaflet_payload()
     html = LEAFLET_HTML.replace("{PAYLOAD}", json.dumps(payload))
-    st_html(html, height=720, scrolling=False)
+    # key depende do estilo para forçar re-render quando muda
+    st_html(html, height=720, scrolling=False, key=f"leaf_{st.session_state.leaf_base}")
 
-# ============ RUN ============
-render_leaflet()
+recompute_everything_and_show()
 
