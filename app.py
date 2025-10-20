@@ -1,17 +1,17 @@
-# app.py — NAVLOG (VFR + Satélite + TOC/TOD como WPs)
-# - TAS fixas: 70 kt (subida), 90 kt (cruzeiro e descida)
+# app.py — NAVLOG (Folium/Leaflet engine) — satélite limpo + VFR overlay
+# - TAS fixas: 70 kt (subida), 90 kt (cruzeiro/descida)
 # - FF fixa: 20 L/h
-# - TOC/TOD são novos waypoints e as legs são separadas
-# - Mapa satélite (ESRI) com overlay de localidades (estilo VFR-ish)
-# - Dog houses triangulares; MH grande (amarelo) com halo branco
-# - Riscas a cada 2 min calculadas pela GS da leg
-# - Pesquisa com seleção (evita duplicados de topónimos)
-# - Sem experimental_rerun e sem RPM
+# - TOC/TOD inseridos como novos WPs e as legs são partidas
+# - Mapa via Folium (Leaflet): EOX Sentinel-2 Cloudless (satélite GRATUITO) + overlay de labels transparentes
+# - Dog houses triangulares, MH grande (amarelo) com halo
+# - Riscas a cada 2 min usando GS da leg
+# - Pesquisa com seleção (evita “NISA” a duplicar)
+# - Sem Voyager/Mapbox; podes alternar para OpenTopoMap/OSM/MapTiler (opcional c/ key)
 
 import streamlit as st
-import pydeck as pdk
 import pandas as pd
-import math, re, datetime as dt
+import folium, math, re, datetime as dt
+from streamlit_folium import st_folium
 from math import sin, asin, radians, degrees
 
 # ===================== CONSTANTES =====================
@@ -22,7 +22,7 @@ FUEL_FLOW   = 20.0   # L/h (constante)
 EARTH_NM    = 3440.065
 
 # ===================== PAGE / STYLE =====================
-st.set_page_config(page_title="NAVLOG — VFR (Satélite) + TOC/TOD", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NAVLOG — Folium (satélite) + TOC/TOD", layout="wide", initial_sidebar_state="collapsed")
 CSS = """
 <style>
 :root{--line:#e5e7eb;--chip:#f3f4f6}
@@ -32,7 +32,6 @@ CSS = """
 .kv{background:var(--chip);border:1px solid var(--line);border-radius:10px;padding:6px 8px;font-size:12px}
 .sep{height:1px;background:var(--line);margin:10px 0}
 .sticky{position:sticky;top:0;background:#ffffffee;backdrop-filter:saturate(150%) blur(4px);z-index:50;border-bottom:1px solid var(--line);padding-bottom:8px}
-.small{font-size:12px;color:#555}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -48,7 +47,6 @@ wrap360 = lambda x: (x % 360 + 360) % 360
 def angdiff(a, b): return (a - b + 180) % 360 - 180
 
 def wind_triangle(tc, tas, wdir, wkt):
-    # devolve (WCA, TH, GS)
     if tas <= 0: return 0.0, wrap360(tc), 0.0
     d = math.radians(angdiff(wdir, tc))
     cross = wkt * sin(d)
@@ -58,7 +56,7 @@ def wind_triangle(tc, tas, wdir, wkt):
     gs  = max(0.0, tas * math.cos(math.radians(wca)) - wkt * math.cos(d))
     return wca, th, gs
 
-def apply_var(th, var, east_is_neg=False):
+def apply_var(th, var, east_is_neg=False):  # var magnética
     return wrap360(th - var if east_is_neg else th + var)
 
 # geodesia
@@ -99,23 +97,26 @@ def triangle_coords(lat, lon, heading_deg, h_nm=0.95, w_nm=0.7):
     apex_lat, apex_lon      = dest_point(lat, lon, heading_deg,  h_nm/2.0)
     bl_lat, bl_lon = dest_point(base_c_lat, base_c_lon, heading_deg-90.0, w_nm/2.0)
     br_lat, br_lon = dest_point(base_c_lat, base_c_lon, heading_deg+90.0, w_nm/2.0)
-    return [[bl_lon, bl_lat], [apex_lon, apex_lat], [br_lon, br_lat], [bl_lon, bl_lat]]
+    return [(bl_lat, bl_lon), (apex_lat, apex_lon), (br_lat, br_lon)]
 
 # ===================== STATE =====================
 def ens(k, v): return st.session_state.setdefault(k, v)
 ens("wind_from", 0); ens("wind_kt", 0)
 ens("mag_var", 1.0); ens("mag_is_e", False)
-ens("roc_fpm", 600)              # ROC global (ft/min)
-ens("desc_angle", 3.0)           # graus
+ens("roc_fpm", 600)
+ens("desc_angle", 3.0)
 ens("start_clock", ""); ens("start_efob", 85.0)
 ens("ck_default", 2)
 ens("wps", []); ens("legs", []); ens("route_nodes", [])
+ens("map_base", "EOX Sentinel-2 (satélite)")
+ens("maptiler_key", "")  # opcional
 
 # ===================== HEADER =====================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 h1, h2, h3, h4 = st.columns([3,3,2,2])
-with h1: st.title("NAVLOG — VFR Satélite + TOC/TOD")
-with h2: st.caption("TAS: 70/90/90 · FF: 20 L/h · Satélite ESRI + labels")
+with h1: st.title("NAVLOG — Folium (satélite) + TOC/TOD")
+with h2:
+    st.caption("TAS 70/90/90 · FF 20 L/h · motor Leaflet/Folium (estável)")
 with h3:
     if st.button("➕ Novo waypoint", use_container_width=True):
         st.session_state.wps.append({"name": f"WP{len(st.session_state.wps)+1}", "lat": 39.5, "lon": -8.0, "alt": 3000.0})
@@ -140,6 +141,15 @@ with st.form("globals"):
         st.session_state.start_efob= st.number_input("EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
         st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
         st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
+    b1, b2 = st.columns([2,2])
+    with b1:
+        st.session_state.map_base = st.selectbox("Base do mapa",
+            ["EOX Sentinel-2 (satélite)", "OpenTopoMap (topo VFR-ish)", "OSM Standard", "MapTiler Satellite Hybrid (requer key)"],
+            index=["EOX Sentinel-2 (satélite)","OpenTopoMap (topo VFR-ish)","OSM Standard","MapTiler Satellite Hybrid (requer key)"].index(st.session_state.map_base)
+        )
+    with b2:
+        if "MapTiler" in st.session_state.map_base:
+            st.session_state.maptiler_key = st.text_input("MapTiler API key (opcional)", st.session_state.maptiler_key)
     submitted = st.form_submit_button("Aplicar")
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
@@ -258,10 +268,8 @@ st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ===================== TOC/TOD COMO WPs =====================
 def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, desc_angle_deg):
-    """Insere TOC/TOD entre WPs quando necessário."""
     nodes = []
-    if len(user_wps) < 2: 
-        return nodes
+    if len(user_wps) < 2: return nodes
     for i in range(len(user_wps)-1):
         A, B = user_wps[i], user_wps[i+1]
         nodes.append(A)
@@ -272,21 +280,20 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, desc_angle_deg):
 
         if B["alt"] > A["alt"]:  # CLIMB → TOC
             dh = B["alt"] - A["alt"]
-            t_need = dh / max(roc_fpm, 1)            # min
-            d_need = gs_cl * (t_need/60.0)           # nm
+            t_need = dh / max(roc_fpm, 1)             # min
+            d_need = gs_cl * (t_need/60.0)            # nm
             if d_need < dist - 0.05:
                 lat_toc, lon_toc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need)
                 nodes.append({"name": f"TOC L{i+1}", "lat": lat_toc, "lon": lon_toc, "alt": B["alt"]})
         elif B["alt"] < A["alt"]:  # DESCENT → TOD
-            rod_fpm = max(100.0, gs_de * 5.0 * (desc_angle_deg/3.0))  # aproxima ROD pela razão 3°
+            rod_fpm = max(100.0, gs_de * 5.0 * (desc_angle_deg/3.0))
             dh = A["alt"] - B["alt"]
-            t_need = dh / max(rod_fpm, 1)           # min
+            t_need = dh / max(rod_fpm, 1)             # min
             d_need = gs_de * (t_need/60.0)
             if d_need < dist - 0.05:
                 pos_from_start = max(0.0, dist - d_need)
                 lat_tod, lon_tod = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], pos_from_start)
                 nodes.append({"name": f"TOD L{i+1}", "lat": lat_tod, "lon": lon_tod, "alt": A["alt"]})
-        # LEVEL → nada
     nodes.append(user_wps[-1])
     return nodes
 
@@ -312,7 +319,7 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         profile = "LEVEL" if abs(B["alt"]-A["alt"])<1e-6 else ("CLIMB" if B["alt"]>A["alt"] else "DESCENT")
         tas = CLIMB_TAS if profile=="CLIMB" else (DESCENT_TAS if profile=="DESCENT" else CRUISE_TAS)
         _, th, gs = wind_triangle(tc, tas, wind_from, wind_kt)
-        mh = apply_var(th, mag_var, mag_is_e)
+        mh = apply_var(th, st.session_state.mag_var, st.session_state.mag_is_e)
 
         time_sec = rt10((dist / max(gs,1e-9)) * 3600.0) if gs>0 else 0
         burn = FUEL_FLOW * (time_sec/3600.0)
@@ -323,7 +330,7 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         clk_start = (base_time + dt.timedelta(seconds=t_cursor)).strftime('%H:%M') if base_time else f"T+{mmss(t_cursor)}"
         clk_end   = (base_time + dt.timedelta(seconds=t_cursor+time_sec)).strftime('%H:%M') if base_time else f"T+{mmss(t_cursor+time_sec)}"
 
-        # CPs textuais (não desenhados)
+        # CPs (texto)
         cps = []
         if ck_every_min>0 and gs>0:
             k=1
@@ -389,24 +396,69 @@ if st.session_state.legs:
             )
             st.markdown(f"**Relógio** — {L['clock_start']} → {L['clock_end']}  |  **EFOB** — {L['efob_start']:.1f} → {L['efob_end']:.1f} L")
 
-# ===================== MAPA (SATÉLITE VFR-ISH) =====================
-def _zoom_from_length_nm(total_nm):
-    if total_nm <= 25:  return 10
-    if total_nm <= 60:  return 9
-    if total_nm <= 120: return 8
-    if total_nm <= 240: return 7
-    return 6
+# ===================== MAPA (FOLIUM / LEAFLET) =====================
+def _bounds_from_nodes(nodes):
+    lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
+    sw = (min(lats), min(lons)); ne = (max(lats), max(lons))
+    return [sw, ne]
 
-def make_map(nodes, legs):
+def _route_latlngs(legs):
+    return [ [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])] for L in legs ]
+
+def _add_text(map_obj, lat, lon, text, size_px=22, color="#FFD700", offset_px=(0,0), bold=True, halo=True):
+    # usa DivIcon para texto com sombra (halo)
+    weight = "700" if bold else "400"
+    shadow = "text-shadow: -1px -1px 0 #fff, 1px -1px 0 #fff, -1px 1px 0 #fff, 1px 1px 0 #fff;" if halo else ""
+    html = f"""
+    <div style="font-size:{size_px}px;color:{color};font-weight:{weight};{shadow};
+                white-space:nowrap;transform:translate({offset_px[0]}px,{offset_px[1]}px);">
+      {text}
+    </div>"""
+    icon = folium.DivIcon(html=html, icon_size=(0,0), icon_anchor=(0,0))
+    folium.Marker(location=(lat,lon), icon=icon, draggable=False).add_to(map_obj)
+
+def render_map_folium(nodes, legs, base_choice="EOX Sentinel-2 (satélite)", maptiler_key=""):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em *Gerar/Atualizar rota*.")
         return
 
-    # rota por leg
-    path_data = [{"path": [[L["A"]["lon"],L["A"]["lat"]],[L["B"]["lon"],L["B"]["lat"]]], "name": f"L{L['i']}"} for L in legs]
+    mean_lat = sum([n["lat"] for n in nodes])/len(nodes)
+    mean_lon = sum([n["lon"] for n in nodes])/len(nodes)
+    m = folium.Map(location=[mean_lat, mean_lon], zoom_start=8, control_scale=True, tiles=None, prefer_canvas=True)
 
-    # ticks 2 min
-    tick_data = []
+    # --- bases de mapa ---
+    if base_choice == "EOX Sentinel-2 (satélite)":
+        folium.raster_layers.TileLayer(
+            tiles="https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
+            attr='© EOX & Sentinel-2 cloudless', name="Satélite (EOX)",
+            overlay=False, control=True
+        ).add_to(m)
+        folium.raster_layers.TileLayer(
+            tiles="https://tiles.maps.eox.at/wmts/1.0.0/overlay_bright/GoogleMapsCompatible/{z}/{y}/{x}.png",
+            attr='© EOX Overlay', name="Labels", overlay=True, control=True, opacity=1.0
+        ).add_to(m)
+    elif base_choice == "OpenTopoMap (topo VFR-ish)":
+        folium.raster_layers.TileLayer(
+            tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+            attr="© OpenTopoMap (CC-BY-SA)", name="OpenTopoMap", overlay=False, control=True
+        ).add_to(m)
+    elif base_choice == "MapTiler Satellite Hybrid (requer key)" and maptiler_key:
+        folium.raster_layers.TileLayer(
+            tiles=f"https://api.maptiler.com/maps/hybrid/256/{{z}}/{{x}}/{{y}}.jpg?key={maptiler_key}",
+            attr="© MapTiler", name="Satellite Hybrid", overlay=False, control=True
+        ).add_to(m)
+    else:
+        folium.raster_layers.TileLayer(
+            tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            attr="© OpenStreetMap contributors", name="OSM", overlay=False, control=True
+        ).add_to(m)
+
+    # --- rota (halo + magenta) ---
+    for latlngs in _route_latlngs(legs):
+        folium.PolyLine(latlngs, color="#ffffff", weight=8, opacity=0.9).add_to(m)   # halo
+        folium.PolyLine(latlngs, color="#C000FF", weight=4, opacity=1.0).add_to(m)   # linha
+
+    # --- riscas de 2 min ---
     for L in legs:
         if L["GS"]<=0 or L["time_sec"]<=0: continue
         k, step = 1, 120
@@ -416,101 +468,51 @@ def make_map(nodes, legs):
             latm, lonm = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], d)
             left_lat, left_lon   = dest_point(latm, lonm, L["TC"]-90, 0.15)
             right_lat, right_lon = dest_point(latm, lonm, L["TC"]+90, 0.15)
-            tick_data.append({"path": [[left_lon,left_lat],[right_lon,right_lat]]})
+            folium.PolyLine([(left_lat,left_lon),(right_lat,right_lon)], color="#000000", weight=2, opacity=1).add_to(m)
             k += 1
 
-    # dog houses + rótulos (lado alternado)
-    tri_data, mh_fg, mh_bg, info_fg, info_bg = [], [], [], [], []
+    # --- dog houses + labels (alterna lado) ---
     side = 1
     for L in legs:
         mid_lat, mid_lon = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], L["Dist"]/2.0)
         off_lat, off_lon = dest_point(mid_lat, mid_lon, L["TC"]+side*90, 0.38)
-        tri_data.append({"polygon": triangle_coords(off_lat, off_lon, L["TC"], h_nm=0.95, w_nm=0.7)})
 
-        mh_text = f"MH {rang(L['MH'])}°"
-        pos = [off_lon, off_lat]
-        mh_bg.append({"position": pos, "text": mh_text, "px": [0, -2]})
-        mh_fg.append({"position": pos, "text": mh_text, "px": [0, -2]})
+        tri = triangle_coords(off_lat, off_lon, L["TC"], h_nm=0.95, w_nm=0.7)
+        folium.Polygon(tri, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.92).add_to(m)
 
-        info_text = f"{rang(L['TH'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm"
-        info_bg.append({"position": pos, "text": info_text, "px": [side*90, 16]})
-        info_fg.append({"position": pos, "text": info_text, "px": [side*90, 16]})
+        _add_text(m, off_lat, off_lon, f"MH {rang(L['MH'])}°", size_px=26, color="#FFD700", offset_px=(0,-2), halo=True)
+        _add_text(m, off_lat, off_lon, f"{rang(L['TH'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm",
+                  size_px=14, color="#000000", offset_px=(side*90,16), halo=True)
         side *= -1
 
-    # waypoints
-    wp_points, wp_labels = [], []
+    # --- WPs (originais + TOC/TOD) ---
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
-        color = [255,80,80,230] if is_toc_tod else [0,122,255,230]
-        wp_points.append({"position":[N["lon"],N["lat"]], "color":color})
-        wp_labels.append({"position":[N["lon"],N["lat"]], "text":f"{idx+1}. {N['name']}", "px":[0, -18]})
+        color = "#FF5050" if is_toc_tod else "#007AFF"
+        folium.CircleMarker(location=(N["lat"],N["lon"]), radius=6, color="#FFFFFF",
+                            weight=2, fill=True, fill_opacity=1, fill_color=color).add_to(m)
+        _add_text(m, N["lat"], N["lon"], f"{idx+1}. {N['name']}", size_px=14, color="#FFFFFF", offset_px=(0,-22), halo=True)
 
-    # layers: satélite + nomes + rota + doghouses + labels
-    sat = pdk.Layer(
-        "TileLayer",
-        data="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
-    )
-    places = pdk.Layer(
-        "TileLayer",
-        data="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
-        min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
-    )
+    # ajustar vista à rota
+    try:
+        m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
+    except Exception:
+        pass
 
-    route_halo = pdk.Layer("PathLayer", data=path_data, get_path="path",
-                           get_color=[255,255,255,230], width_min_pixels=8)
-    route_line = pdk.Layer("PathLayer", data=path_data, get_path="path",
-                           get_color=[200,0,255,255], width_min_pixels=4)
-    ticks_layer = pdk.Layer("PathLayer", data=tick_data, get_path="path",
-                            get_color=[0,0,0,230], width_min_pixels=2)
+    folium.LayerControl(collapsed=False).add_to(m)
+    st_folium(m, width=None, height=700)
 
-    tri_layer = pdk.Layer("PolygonLayer", data=tri_data, get_polygon="polygon",
-                          get_fill_color=[255,255,255,235], get_line_color=[0,0,0,255],
-                          line_width_min_pixels=2, stroked=True, filled=True)
-
-    # MH com halo (duas camadas)
-    mh_bg_layer = pdk.Layer("TextLayer", data=mh_bg, get_position="position", get_text="text",
-                            get_size=30, get_color=[255,255,255], billboard=True,
-                            get_text_anchor="'middle'", get_alignment_baseline="'center'",
-                            get_pixel_offset="px")
-    mh_fg_layer = pdk.Layer("TextLayer", data=mh_fg, get_position="position", get_text="text",
-                            get_size=26, get_color=[255,215,0], billboard=True,
-                            get_text_anchor="'middle'", get_alignment_baseline="'center'",
-                            get_pixel_offset="px")
-
-    info_bg_layer = pdk.Layer("TextLayer", data=info_bg, get_position="position", get_text="text",
-                              get_size=16, get_color=[255,255,255], billboard=True,
-                              get_text_anchor="'middle'", get_alignment_baseline="'center'",
-                              get_pixel_offset="px")
-    info_fg_layer = pdk.Layer("TextLayer", data=info_fg, get_position="position", get_text="text",
-                              get_size=14, get_color=[0,0,0], billboard=True,
-                              get_text_anchor="'middle'", get_alignment_baseline="'center'",
-                              get_pixel_offset="px")
-
-    wp_layer = pdk.Layer("ScatterplotLayer", data=wp_points, get_position="position",
-                         get_radius=200, get_fill_color="color",
-                         get_line_color=[255,255,255,255], line_width_min_pixels=2)
-    wp_text  = pdk.Layer("TextLayer", data=wp_labels, get_position="position", get_text="text",
-                         get_size=14, get_color=[255,255,255], billboard=True,
-                         get_text_anchor="'middle'", get_alignment_baseline="'center'",
-                         get_pixel_offset="px")
-
-    mean_lat = sum([n["lat"] for n in nodes]) / len(nodes)
-    mean_lon = sum([n["lon"] for n in nodes]) / len(nodes)
-    total_nm = sum(L["Dist"] for L in legs)
-    view_state = pdk.ViewState(latitude=mean_lat, longitude=mean_lon,
-                               zoom=_zoom_from_length_nm(total_nm), pitch=0)
-
-    deck = pdk.Deck(
-        map_style=None,
-        initial_view_state=view_state,
-        layers=[sat, places, route_halo, route_line, ticks_layer,
-                tri_layer, mh_bg_layer, mh_fg_layer, info_bg_layer, info_fg_layer,
-                wp_layer, wp_text]
-    )
-    st.pydeck_chart(deck)
-
-# ---- render map ----
-make_map(st.session_state.route_nodes if st.session_state.route_nodes else st.session_state.wps,
-         st.session_state.legs)
+# ---- construir rota e desenhar mapa ----
+if st.session_state.wps:
+    if not st.session_state.route_nodes:
+        st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar legs.")
+    else:
+        render_map_folium(
+            st.session_state.route_nodes,
+            st.session_state.legs,
+            base_choice=st.session_state.map_base,
+            maptiler_key=st.session_state.maptiler_key
+        )
+else:
+    st.info("Adiciona pelo menos 2 waypoints para começares.")
 
