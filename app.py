@@ -1,28 +1,30 @@
-# app.py — NAVLOG (Leaflet/Folium) — VFR-ish + Satélite
-# - TAS fixas: 70 (climb), 90 (cruise/descida)
-# - FF fixa: 20 L/h
-# - TOC/TOD inseridos como novos WPs e legs separadas
-# - Riscas de 2 min com GS real
+# app.py — NAVLOG (Folium/Leaflet) — VFR-ish, TOC/TOD como WPs, seleção melhorada
+# - TAS: 70 (climb) / 90 (cruise & descent) kt
+# - FF: 20 L/h
+# - TOC/TOD inseridos como novos WPs e legs partidas
+# - Mapa Folium: vários estilos (satélite/topo/OSM), FULLSCREEN (para print)
 # - Dog houses triangulares; MH grande (amarelo) com halo
-# - Mapa Folium com várias bases; apenas FULLSCREEN p/ tirar print
+# - Riscas a cada 2 min usando GS da leg
+# - UI de pesquisa com TABELA + checkboxes (nada de multiselect confuso)
+# - Sem experimental_rerun e sem RPM
 
 import streamlit as st
 import pandas as pd
 import folium, math, re, datetime as dt
 from streamlit_folium import st_folium
-from folium.plugins import Fullscreen
+from folium.plugins import Fullscreen, MeasureControl
 from math import sin, asin, radians, degrees
 
 # ===================== CONSTANTES =====================
-CLIMB_TAS   = 70.0   # kt
-CRUISE_TAS  = 90.0   # kt
-DESCENT_TAS = 90.0   # kt
-FUEL_FLOW   = 20.0   # L/h (constante)
+CLIMB_TAS   = 70.0
+CRUISE_TAS  = 90.0
+DESCENT_TAS = 90.0
+FUEL_FLOW   = 20.0
 EARTH_NM    = 3440.065
 
 # ===================== PAGE / STYLE =====================
-st.set_page_config(page_title="NAVLOG — Folium (satélite) + TOC/TOD", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
+st.set_page_config(page_title="NAVLOG — Folium (VFR) + TOC/TOD", layout="wide", initial_sidebar_state="collapsed")
+CSS = """
 <style>
 :root{--line:#e5e7eb;--chip:#f3f4f6}
 *{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial}
@@ -32,7 +34,8 @@ st.markdown("""
 .sep{height:1px;background:var(--line);margin:10px 0}
 .sticky{position:sticky;top:0;background:#ffffffee;backdrop-filter:saturate(150%) blur(4px);z-index:50;border-bottom:1px solid var(--line);padding-bottom:8px}
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
 # ===================== HELPERS =====================
 rt10 = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
@@ -54,7 +57,7 @@ def wind_triangle(tc, tas, wdir, wkt):
     gs  = max(0.0, tas * math.cos(math.radians(wca)) - wkt * math.cos(d))
     return wca, th, gs
 
-def apply_var(th, var, east_is_neg=False):  # var magnética
+def apply_var(th, var, east_is_neg=False):
     return wrap360(th - var if east_is_neg else th + var)
 
 # geodesia
@@ -74,7 +77,8 @@ def gc_course_tc(lat1, lon1, lat2, lon2):
     return (θ + 360) % 360
 
 def dest_point(lat, lon, bearing_deg, dist_nm):
-    θ = math.radians(bearing_deg); δ = dist_nm / EARTH_NM
+    θ = math.radians(bearing_deg)
+    δ = dist_nm / EARTH_NM
     φ1, λ1 = math.radians(lat), math.radians(lon)
     sinφ2 = math.sin(φ1)*math.cos(δ) + math.cos(φ1)*math.sin(δ)*math.cos(θ)
     φ2 = math.asin(sinφ2)
@@ -106,12 +110,14 @@ ens("start_clock", ""); ens("start_efob", 85.0)
 ens("ck_default", 2)
 ens("wps", []); ens("legs", []); ens("route_nodes", [])
 ens("map_base", "OpenTopoMap (topo VFR-ish)")
-ens("maptiler_key", "")  # opcional
+ens("maptiler_key", "")
+ens("search_results", None)   # DataFrame persistente para a tabela
+ens("search_q", "")
 
 # ===================== HEADER =====================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 h1, h2, h3, h4 = st.columns([3,3,2,2])
-with h1: st.title("NAVLOG — Leaflet/Folium VFR + TOC/TOD")
+with h1: st.title("NAVLOG — Folium (VFR) + TOC/TOD")
 with h2: st.caption("TAS 70/90/90 · FF 20 L/h · Fullscreen para print")
 with h3:
     if st.button("➕ Novo waypoint", use_container_width=True):
@@ -139,17 +145,16 @@ with st.form("globals"):
         st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
     b1, b2 = st.columns([2,2])
     with b1:
-        st.session_state.map_base = st.selectbox("Base do mapa",
-            ["EOX Sentinel-2 (satélite)",
+        st.session_state.map_base = st.selectbox(
+            "Base do mapa",
+            ["OpenTopoMap (topo VFR-ish)",
+             "EOX Sentinel-2 (satélite)",
              "Esri World Imagery + Places",
-             "OpenTopoMap (topo VFR-ish)",
              "Stamen Terrain (topo)",
              "Stadia Outdoors (topo)",
              "OSM Standard",
              "MapTiler Satellite Hybrid (key)"],
-            index=["EOX Sentinel-2 (satélite)","Esri World Imagery + Places","OpenTopoMap (topo VFR-ish)",
-                   "Stamen Terrain (topo)","Stadia Outdoors (topo)","OSM Standard","MapTiler Satellite Hybrid (key)"]
-            .index(st.session_state.map_base)
+            index=0
         )
     with b2:
         if "MapTiler" in st.session_state.map_base:
@@ -222,27 +227,49 @@ except Exception:
     loc_df = pd.DataFrame(columns=["src","code","name","sector","lat","lon","alt"])
     st.warning("Não foi possível ler os CSVs locais. Verifica os nomes de ficheiro.")
 
-# ===================== PESQUISA + SELEÇÃO =====================
-cflt1, cflt2 = st.columns([3,1.5])
-with cflt1: qtxt = st.text_input("🔎 Procurar AD/Localidade (CSV local)", "", placeholder="Ex: LPPT, ABRANTES, NISA…")
-with cflt2: alt_wp = st.number_input("Altitude default (ft) p/ WPs novos", 0.0, 18000.0, 3000.0, step=100.0)
+# ===================== PESQUISA + SELEÇÃO (TABELA COM CHECKBOX) =====================
+st.subheader("Adicionar waypoints por pesquisa (CSV local)")
+with st.form("search_form", clear_on_submit=False):
+    c1,c2,c3 = st.columns([3,1.2,1.2])
+    with c1:
+        st.session_state.search_q = st.text_input("Pesquisar (ex.: LPPT, NISA, ABRANTES…)", st.session_state.search_q)
+    with c2:
+        alt_wp = st.number_input("Altitude para novos WPs (ft)", 0.0, 18000.0, 3000.0, step=100.0)
+    with c3:
+        do_search = st.form_submit_button("🔎 Procurar")
+# congela resultados numa DataFrame persistente
+if do_search:
+    q = st.session_state.search_q.strip().lower()
+    res = pd.concat([ad_df, loc_df], ignore_index=True)
+    if q:
+        res = res[res.apply(lambda r: any(q in str(v).lower() for v in r.values), axis=1)]
+    res = res[["src","code","name","lat","lon"]].copy()
+    res.insert(0, "add", False)
+    st.session_state.search_results = res.reset_index(drop=True)
 
-results = pd.concat([ad_df, loc_df])
-if qtxt.strip():
-    tq = qtxt.lower().strip()
-    results = results[results.apply(lambda r: any(tq in str(v).lower() for v in r.values), axis=1)]
+if st.session_state.search_results is not None:
+    st.caption("Marca os registos que queres adicionar e clica em “Adicionar selecionados”.")
+    edited = st.data_editor(
+        st.session_state.search_results,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "add": st.column_config.CheckboxColumn("Adicionar"),
+            "src": st.column_config.TextColumn("Fonte"),
+            "code": st.column_config.TextColumn("Código"),
+            "name": st.column_config.TextColumn("Nome"),
+            "lat": st.column_config.NumberColumn("Lat", format="%.5f"),
+            "lon": st.column_config.NumberColumn("Lon", format="%.5f"),
+        },
+        num_rows="fixed"
+    )
+    st.session_state.search_results = edited
+    if st.button("➕ Adicionar selecionados"):
+        picks = edited[edited["add"] == True]
+        for _, r in picks.iterrows():
+            st.session_state.wps.append({"name": str(r["code"] or r["name"]), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
+        st.success(f"Adicionados {len(picks)} WPs.")
 
-if not results.empty:
-    options, labels = [], []
-    for idx, r in results.reset_index(drop=True).iterrows():
-        label = f"[{r['src']}] {r.get('code','')} — {r.get('name','')} ({r['lat']:.4f}, {r['lon']:.4f})"
-        options.append((idx, label)); labels.append(label)
-    picked = st.multiselect("Seleciona os resultados a adicionar:", labels)
-    if st.button("Adicionar selecionados"):
-        sel_idx = [options[labels.index(s)][0] for s in picked]
-        for _, r in results.iloc[sel_idx].iterrows():
-            st.session_state.wps.append({"name": str(r.get("code") or r.get("name")), "lat": float(r["lat"]), "lon": float(r["lon"]), "alt": float(alt_wp)})
-        st.success(f"Adicionados {len(sel_idx)} WPs.")
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ===================== EDITOR DE WPs =====================
@@ -400,8 +427,15 @@ if st.session_state.legs:
             st.markdown(f"**Relógio** — {L['clock_start']} → {L['clock_end']}  |  **EFOB** — {L['efob_start']:.1f} → {L['efob_end']:.1f} L")
 
 # ===================== MAPA (FOLIUM / LEAFLET) =====================
-def _add_text(map_obj, lat, lon, text, size_px=22, color="#FFD700",
-              offset_px=(0,0), bold=True, pane=None):
+def _bounds_from_nodes(nodes):
+    lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
+    sw = (min(lats), min(lons)); ne = (max(lats), max(lons))
+    return [sw, ne]
+
+def _route_latlngs(legs):
+    return [ [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])] for L in legs ]
+
+def _add_text(map_obj, lat, lon, text, size_px=22, color="#FFD700", offset_px=(0,0), bold=True, pane='labels'):
     weight = "700" if bold else "400"
     halo = "text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;"
     html = f"""
@@ -410,24 +444,27 @@ def _add_text(map_obj, lat, lon, text, size_px=22, color="#FFD700",
       {text}
     </div>"""
     icon = folium.DivIcon(html=html, icon_size=(0,0), icon_anchor=(0,0))
-    folium.Marker((lat,lon), icon=icon, draggable=False, pane=pane).add_to(map_obj)
+    folium.Marker(location=(lat,lon), icon=icon, draggable=False, pane=pane).add_to(map_obj)
 
 def render_map_folium(nodes, legs, base_choice="OpenTopoMap (topo VFR-ish)", maptiler_key=""):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em *Gerar/Atualizar rota*.")
         return
 
-    mean_lat = sum(n["lat"] for n in nodes)/len(nodes)
-    mean_lon = sum(n["lon"] for n in nodes)/len(nodes)
-    m = folium.Map(location=[mean_lat, mean_lon], zoom_start=9,
-                   tiles=None, control_scale=True, prefer_canvas=True)
+    mean_lat = sum([n["lat"] for n in nodes])/len(nodes)
+    mean_lon = sum([n["lon"] for n in nodes])/len(nodes)
+    m = folium.Map(location=[mean_lat, mean_lon], zoom_start=9, tiles=None, control_scale=True, prefer_canvas=True)
 
     # ---- BASES ----
     if base_choice == "EOX Sentinel-2 (satélite)":
-        folium.TileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
-                         attr='© EOX & Sentinel-2', name="EOX Sat").add_to(m)
-        folium.TileLayer("https://tiles.maps.eox.at/wmts/1.0.0/overlay_bright/GoogleMapsCompatible/{z}/{y}/{x}.png",
-                         attr='© EOX Overlay', name="Labels", overlay=True).add_to(m)
+        folium.TileLayer(
+            tiles="https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
+            attr='© EOX & Sentinel-2', name="EOX Sat"
+        ).add_to(m)
+        folium.TileLayer(
+            tiles="https://tiles.maps.eox.at/wmts/1.0.0/overlay_bright/GoogleMapsCompatible/{z}/{y}/{x}.png",
+            attr='© EOX overlay', name="Labels", overlay=True, opacity=1
+        ).add_to(m)
     elif base_choice == "Esri World Imagery + Places":
         folium.TileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                          attr="© Esri", name="Esri Imagery").add_to(m)
@@ -435,16 +472,16 @@ def render_map_folium(nodes, legs, base_choice="OpenTopoMap (topo VFR-ish)", map
                          attr="© Esri", name="Places", overlay=True, opacity=1).add_to(m)
     elif base_choice == "Stamen Terrain (topo)":
         folium.TileLayer("https://stamen-tiles.a.ssl.fastly.net/terrain/{z}/{x}/{y}.jpg",
-                         attr="© Stamen", name="Stamen Terrain").add_to(m)
+                         attr="Map tiles by Stamen", name="Stamen Terrain").add_to(m)
     elif base_choice == "Stadia Outdoors (topo)":
         folium.TileLayer("https://tiles.stadiamaps.com/tiles/outdoors/{z}/{x}/{y}.png",
                          attr="© Stadia Maps © OpenMapTiles © OSM", name="Stadia Outdoors").add_to(m)
-    elif base_choice == "MapTiler Satellite Hybrid (key)" and maptiler_key:
-        folium.TileLayer(f"https://api.maptiler.com/maps/hybrid/256/{{z}}/{{x}}/{{y}}.jpg?key={maptiler_key}",
-                         attr="© MapTiler", name="MapTiler Hybrid").add_to(m)
     elif base_choice == "OSM Standard":
         folium.TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
                          attr="© OpenStreetMap", name="OSM").add_to(m)
+    elif base_choice == "MapTiler Satellite Hybrid (key)" and maptiler_key:
+        folium.TileLayer(f"https://api.maptiler.com/maps/hybrid/256/{{z}}/{{x}}/{{y}}.jpg?key={maptiler_key}",
+                         attr="© MapTiler", name="MapTiler Hybrid").add_to(m)
     else:  # OpenTopoMap por defeito
         folium.TileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
                          attr="© OpenTopoMap (CC-BY-SA)", name="OpenTopoMap").add_to(m)
@@ -456,13 +493,12 @@ def render_map_folium(nodes, legs, base_choice="OpenTopoMap (topo VFR-ish)", map
     folium.map.Pane('labels', z_index=670).add_to(m)
     folium.map.Pane('wps',    z_index=680).add_to(m)
 
-    # ---- ROTA (halo + magenta) ----
-    for L in legs:
-        seg = [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])]
-        folium.PolyLine(seg, color="#ffffff", weight=8, opacity=0.9, pane='route').add_to(m)
-        folium.PolyLine(seg, color="#C000FF", weight=4, opacity=1.0, pane='route').add_to(m)
+    # ---- ROTA COM HALO ----
+    for latlngs in _route_latlngs(legs):
+        folium.PolyLine(latlngs, color="#ffffff", weight=8, opacity=0.9, pane='route').add_to(m)
+        folium.PolyLine(latlngs, color="#C000FF", weight=4, opacity=1.0, pane='route').add_to(m)
 
-    # ---- RISCA 2 min ----
+    # ---- RISCAS 2 MIN ----
     for L in legs:
         if L["GS"]<=0 or L["time_sec"]<=0: continue
         k, step = 1, 120
@@ -476,40 +512,45 @@ def render_map_folium(nodes, legs, base_choice="OpenTopoMap (topo VFR-ish)", map
                             color="#000", weight=2, opacity=1, pane='ticks').add_to(m)
             k += 1
 
-    # ---- DOG HOUSES + LABELS ----
+    # ---- DOG HOUSES + RÓTULOS ----
     side = 1
     for L in legs:
-        mid_lat, mid_lon = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], L["Dist"]/2)
+        mid_lat, mid_lon = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], L["Dist"]/2.0)
         off_lat, off_lon = dest_point(mid_lat, mid_lon, L["TC"]+side*90, 0.38)
         tri = triangle_coords(off_lat, off_lon, L["TC"], h_nm=0.95, w_nm=0.7)
-        folium.Polygon(tri, color="#000", weight=2, fill=True, fill_color="#FFF", fill_opacity=0.92, pane='dog').add_to(m)
+        folium.Polygon(tri, color="#000", weight=2, fill=True,
+                       fill_color="#FFF", fill_opacity=0.92, pane='dog').add_to(m)
 
-        _add_text(m, off_lat, off_lon, f"MH {rang(L['MH'])}°", size_px=28, color="#FFD700", offset_px=(0,-2), pane='labels')
+        _add_text(m, off_lat, off_lon, f"MH {rang(L['MH'])}°", size_px=28,
+                  color="#FFD700", offset_px=(0,-2), pane='labels')
         _add_text(m, off_lat, off_lon,
                   f"{rang(L['TH'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm",
                   size_px=15, color="#000000", offset_px=(side*90,16), pane='labels')
         side *= -1
 
-    # ---- WPs ----
+    # ---- WAYPOINTS ----
     for idx, N in enumerate(nodes):
         is_tt = str(N["name"]).startswith(("TOC","TOD"))
         color = "#FF5050" if is_tt else "#007AFF"
-        folium.CircleMarker((N["lat"],N["lon"]), radius=6, color="#FFF", weight=2,
+        folium.CircleMarker((N["lat"],N["lon"]), radius=6, color="#FFFFFF", weight=2,
                             fill=True, fill_color=color, fill_opacity=1, pane='wps').add_to(m)
-        _add_text(m, N["lat"], N["lon"], f"{idx+1}. {N['name']}", size_px=14, color="#FFFFFF", offset_px=(0,-22), pane='labels')
+        _add_text(m, N["lat"], N["lon"], f"{idx+1}. {N['name']}",
+                  size_px=14, color="#FFFFFF", offset_px=(0,-22), pane='labels')
 
-    # ---- FULLSCREEN para tirares print ----
+    # ---- CONTROLOS (FULLSCREEN p/ PRINT) ----
     Fullscreen(position="topleft").add_to(m)
+    MeasureControl(position="topleft", primary_length_unit='nauticalmiles').add_to(m)
 
-    # ajustar vista
+    # vista
     try:
-        lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
-        m.fit_bounds([(min(lats), min(lons)), (max(lats), max(lons))], padding=(30,30))
-    except: pass
+        m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
+    except Exception:
+        pass
 
-    st_folium(m, width=None, height=740)
+    folium.LayerControl(collapsed=False).add_to(m)
+    st_folium(m, width=None, height=720)
 
-# ---- render ----
+# ---- desenhar mapa ----
 if st.session_state.wps:
     if not st.session_state.route_nodes:
         st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar legs.")
@@ -522,4 +563,3 @@ if st.session_state.wps:
         )
 else:
     st.info("Adiciona pelo menos 2 waypoints para começares.")
-
