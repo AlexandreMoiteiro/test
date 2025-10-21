@@ -1,9 +1,13 @@
-# app.py — NAVLOG (Folium VFR + PDF) — rev2
+# app.py — NAVLOG (Folium VFR + PDF) — rev3
 # - OpenTopoMap por defeito
-# - WPs: Pesquisar CSV simplificado (Adicionar 1.º / ➕ por linha / Adicionar todos), + Mapa (clique) + Colar lista
-# - Rótulos limpos (pílulas) + MH grande com leader line (anti-sobreposição)
-# - Riscas a cada 2 min pela GS (toggle)
-# - Fix do DeltaGenerator ao adicionar por clique no mapa
+# - FULLSCREEN no mapa (Leaflet.Fullscreen)
+# - Seleção de WPs ultra simples:
+#     • Caixa de pesquisa -> ENTER adiciona logo o 1.º resultado (1 ação)
+#     • Sugestões (top 8) clicáveis (1 clique)
+#     • Clique no mapa e Colar lista continuam disponíveis
+# - Rótulos de legs limpos (pílulas) + “MH” grande com leader line (anti-sobreposição)
+# - Riscas exatamente a cada 2 min pela GS (sem confusão visual)
+# - Nomes de WPs a PRETO com halo (visível em qualquer base)
 
 import streamlit as st
 import pandas as pd
@@ -12,12 +16,13 @@ from streamlit_folium import st_folium
 from branca.element import Template, MacroElement
 from math import sin, asin, radians, degrees
 
-# ======== CONSTANTES ========
+# ================== CONSTANTES ==================
 CLIMB_TAS, CRUISE_TAS, DESCENT_TAS = 70.0, 90.0, 90.0  # kt
 FUEL_FLOW = 20.0  # L/h
 EARTH_NM  = 3440.065
+TICK_EVERY_MIN = 2  # riscas sempre de 2 min
 
-# ======== PAGE / STYLE ========
+# ================== PAGE / STYLE ==================
 st.set_page_config(page_title="NAVLOG — Folium VFR + PDF", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
@@ -31,7 +36,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ======== HELPERS ========
+# ================== HELPERS ==================
 rt10 = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
 mmss = lambda t: f"{int(t)//60:02d}:{int(t)%60:02d}"
 hhmmss = lambda t: f"{int(t)//3600:02d}:{(int(t)%3600)//60:02d}:{int(t)%60:02d}"
@@ -87,14 +92,14 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
 # ======== LABELS (sem sobreposição) ========
-LABEL_MIN_NM    = 4.0   # não rotula legs demasiado curtas
-LABEL_SIDE_OFF  = 0.60  # afastamento lateral em NM
-LABEL_LINE_OFF  = 0.30  # comprimento da "leader line" em NM
+LABEL_MIN_NM    = 4.0
+LABEL_SIDE_OFF  = 0.65
+LABEL_LINE_OFF  = 0.32
 
 def _nm_dist(a,b):
     return gc_dist_nm(a[0],a[1],b[0],b[1])
 
-def add_text_marker(map_obj, lat, lon, text, size_px=16, color="#111111", halo=True, weight="700"):
+def add_text_marker(map_obj, lat, lon, text, size_px=16, color="#111111", halo=True, weight="800"):
     shadow = "text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;" if halo else ""
     html=f"""<div style="font-size:{size_px}px;color:{color};font-weight:{weight};{shadow};white-space:nowrap;">{text}</div>"""
     folium.Marker(location=(lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(map_obj)
@@ -102,7 +107,7 @@ def add_text_marker(map_obj, lat, lon, text, size_px=16, color="#111111", halo=T
 def add_label_box(m, lat, lon, text, big=False):
     if big:
         html = f"""
-        <div style="font-size:26px;color:#FFD700;font-weight:800;
+        <div style="font-size:26px;color:#FFD700;font-weight:900;
                     text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;
                     white-space:nowrap;">{text}</div>
         """
@@ -115,13 +120,9 @@ def add_label_box(m, lat, lon, text, big=False):
     folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
 
 def best_label_anchor(L, used_points):
-    """
-    Procura o melhor lado/posição para o rótulo: 1/3 ou 2/3 da perna,
-    lado esquerdo ou direito, maximizando distância a ancoragens já usadas e a WPs.
-    """
     candidates = []
     for frac in (0.33, 0.67):
-        along = max(0.5, min(L["Dist"]-0.5, L["Dist"]*frac))
+        along = max(0.6, min(L["Dist"]-0.6, L["Dist"]*frac))
         base_lat, base_lon = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], along)
         for side in (-1, +1):
             lab_lat, lab_lon = dest_point(base_lat, base_lon, L["TC"]+90*side, LABEL_SIDE_OFF)
@@ -133,19 +134,20 @@ def best_label_anchor(L, used_points):
     _, anchor, base, side = max(candidates, key=lambda x: x[0])
     return anchor, base, side
 
-# ======== STATE ========
+# ================== STATE ==================
 def ens(k, v): return st.session_state.setdefault(k, v)
 ens("wind_from", 0); ens("wind_kt", 0)
 ens("mag_var", 1.0); ens("mag_is_e", False)
 ens("roc_fpm", 600); ens("desc_angle", 3.0)
 ens("start_clock", ""); ens("start_efob", 85.0)
 ens("ck_default", 2)
-ens("show_ticks", True); ens("tick_every_min", 2)
 ens("wps", []); ens("legs", []); ens("route_nodes", [])
-ens("map_base", "OpenTopoMap (VFR-ish)")  # 👉 padrão: OpenTopo
-ens("maptiler_key", "")  # opcional
+ens("map_base", "OpenTopoMap (VFR-ish)")     # 👉 padrão OpenTopo
+ens("maptiler_key", "")
+ens("qadd", ""); ens("alt_qadd", 3000.0)
+ens("db_points", None)
 
-# ======== HEADER ========
+# ================== HEADER ==================
 st.markdown("<div class='sticky'>", unsafe_allow_html=True)
 a,b,c,d = st.columns([3,3,2,2])
 with a: st.title("NAVLOG — Folium VFR + PDF")
@@ -158,7 +160,7 @@ with d:
         for k in ["wps","legs","route_nodes"]: st.session_state[k] = []
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ======== PARÂMETROS (form corrigido) ========
+# ================== PARÂMETROS ==================
 with st.form("globals"):
     c1,c2,c3,c4 = st.columns(4)
     with c1:
@@ -175,7 +177,7 @@ with st.form("globals"):
         st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
         st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
 
-    b1, b2, b3 = st.columns([2,1.2,1.2])
+    b1, b2 = st.columns([2,2])
     with b1:
         bases = [
             "OpenTopoMap (VFR-ish)",
@@ -187,21 +189,16 @@ with st.form("globals"):
         ]
         cur = st.session_state.get("map_base", bases[0])
         idx = bases.index(cur) if cur in bases else 0
-        choice = st.selectbox("Base do mapa", bases, index=idx, key="map_base_choice")
-        st.session_state.map_base = choice
+        st.session_state.map_base = st.selectbox("Base do mapa", bases, index=idx, key="map_base_choice")
     with b2:
-        st.session_state.show_ticks = st.toggle("Mostrar riscas 2 min", value=st.session_state.show_ticks)
-    with b3:
-        st.session_state.tick_every_min = st.number_input("Intervalo riscas (min)", 1, 10, int(st.session_state.tick_every_min))
+        if "MapTiler" in st.session_state.map_base:
+            st.session_state.maptiler_key = st.text_input("MapTiler API key (opcional)", st.session_state.maptiler_key)
 
-    if "MapTiler" in st.session_state.map_base:
-        st.session_state.maptiler_key = st.text_input("MapTiler API key (opcional)", st.session_state.maptiler_key)
-
-    submitted = st.form_submit_button("Aplicar")  # <-- garante submit
+    st.form_submit_button("Aplicar")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== CSVs locais (AD/LOC) ========
+# ================== CSVs LOCAIS ==================
 AD_CSV  = "AD-HEL-ULM.csv"
 LOC_CSV = "Localidades-Nova-versao-230223.csv"
 
@@ -264,11 +261,17 @@ except Exception:
     loc_df = pd.DataFrame(columns=["src","code","name","sector","lat","lon","alt"])
     st.warning("Não foi possível ler os CSVs locais. Verifica os nomes de ficheiro.")
 
-# ======== WPs — ADIÇÃO (CSV simples / Mapa / Colar) ========
-st.subheader("Adicionar waypoints")
+# base de pesquisa única em memória
+if st.session_state.db_points is None:
+    db = pd.concat([ad_df, loc_df]).dropna(subset=["lat","lon"]).reset_index(drop=True)
+    st.session_state.db_points = db
+else:
+    db = st.session_state.db_points
+
+# ================== ADICIONAR WPs — ULTRA SIMPLES ==================
+st.subheader("Adicionar waypoints (rápido)")
 
 def add_wp_unique(name, lat, lon, alt):
-    # evita duplicados por nome+proximidade (<= 0.2 NM)
     for w in st.session_state.wps:
         if str(w["name"]).strip().lower() == str(name).strip().lower():
             if gc_dist_nm(w["lat"], w["lon"], lat, lon) <= 0.2:
@@ -276,75 +279,68 @@ def add_wp_unique(name, lat, lon, alt):
     st.session_state.wps.append({"name": str(name), "lat": float(lat), "lon": float(lon), "alt": float(alt)})
     return True
 
-tab1, tab2, tab3 = st.tabs(["🔎 CSV (rápido)", "🗺️ Mapa (clique)", "📋 Colar lista"])
+def auto_add_first_result():
+    q = st.session_state.qadd.strip().lower()
+    alt = float(st.session_state.alt_qadd)
+    if not q: return
+    res = db[db.apply(lambda r: any(q in str(v).lower() for v in r.values), axis=1)]
+    if res.empty: return
+    r = res.iloc[0]
+    ok = add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), alt)
+    st.session_state.qadd = ""  # limpa a caixa
+    st.session_state._last_msg = ("success", f"Adicionado: {r.get('code') or r.get('name')}") if ok else ("warning", "Já existia perto com o mesmo nome.")
 
-with tab1:
-    # ——— 1 campo + 2 botões (1 clique) ———
-    q = st.text_input("Procurar (código/nome/cidade…)", "", placeholder="Ex: LPPT, ABRANTES, NISA…")
-    alt_wp = st.number_input("Alt (ft) p/ novos WPs", 0.0, 18000.0, 3000.0, step=100.0, key="alt_csv")
+c1, c2 = st.columns([3,1])
+with c1:
+    st.text_input("Escreve e carrega ENTER para adicionar o 1.º resultado",
+                  key="qadd", on_change=auto_add_first_result,
+                  placeholder="Ex: LPPT, ÉVORA, NISA, ABRANTES…")
+with c2:
+    st.number_input("Alt (ft) para novos WPs", 0.0, 18000.0, float(st.session_state.alt_qadd), step=100.0, key="alt_qadd")
 
-    results = pd.concat([ad_df, loc_df])
-    if q.strip():
-        tq = q.lower().strip()
-        results = results[results.apply(lambda r: any(tq in str(v).lower() for v in r.values), axis=1)]
-    results = results.drop_duplicates(subset=["lat","lon"]).reset_index(drop=True)
+# mostra mensagem do auto-add (sem DeltaGenerator no output)
+if "_last_msg" in st.session_state:
+    typ, msg = st.session_state._last_msg
+    (st.success if typ=="success" else st.warning)(msg)
+    del st.session_state._last_msg
 
-    cbtn1, cbtn2 = st.columns([1,1])
-    with cbtn1:
-        if st.button("➕ Adicionar 1.º resultado", use_container_width=True, disabled=results.empty):
-            r = results.iloc[0]
-            ok = add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), alt_wp)
-            if ok: st.success(f"Adicionado: {r.get('code') or r.get('name')}")
-            else:  st.warning("Já existia perto com o mesmo nome.")
-    with cbtn2:
-        if st.button("➕➕ Adicionar todos visíveis", use_container_width=True, disabled=results.empty):
-            n=0
-            for _, r in results.iterrows():
-                if add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), alt_wp): n+=1
-            st.success(f"Adicionados {n} WPs.")
+# sugestões clicáveis (top 8) conforme se escreve
+q_preview = st.session_state.qadd.strip().lower()
+if q_preview:
+    res_prev = db[db.apply(lambda r: any(q_preview in str(v).lower() for v in r.values), axis=1)].head(8)
+    if not res_prev.empty:
+        st.caption("Sugestões (clique para adicionar):")
+        for i, r in res_prev.iterrows():
+            label = f"[{r['src']}] {r.get('code','')} — {r.get('name','')}  ({r['lat']:.4f}, {r['lon']:.4f})"
+            if st.button(label, key=f"sug_{i}"):
+                ok = add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), float(st.session_state.alt_qadd))
+                (st.success if ok else st.warning)("Adicionado." if ok else "Já existia perto com o mesmo nome.")
 
-    # lista com botões “➕” por linha (top 30 para não pesar)
-    if results.empty:
-        st.info("Sem resultados.")
-    else:
-        st.caption("Resultados (clique em ➕ para adicionar apenas esse):")
-        for i, r in results.head(30).iterrows():
-            lcol, rcol = st.columns([6,1])
-            with lcol:
-                st.markdown(f"- **[{r['src']}] {r.get('code','')} — {r.get('name','')}**  "
-                            f"({r['lat']:.4f}, {r['lon']:.4f})  "
-                            f"{'· '+str(r.get('city')) if r.get('city') else ''}")
-            with rcol:
-                if st.button("➕", key=f"add_row_{i}"):
-                    ok = add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), alt_wp)
-                    if ok: st.success("Adicionado.")
-                    else:  st.warning("Já existia perto com o mesmo nome.")
-
-with tab2:
-    st.caption("Clica no mapa para adicionar um WP rapidamente. O nome é livre; podes editar depois.")
-    m0 = folium.Map(location=[39.7, -8.1], zoom_start=7, tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+# ======== Alternativas: Mapa (clique) e Colar lista ========
+tabs = st.tabs(["🗺️ Adicionar no mapa", "📋 Colar lista"])
+with tabs[0]:
+    st.caption("Clica no mapa e depois em **Adicionar**.")
+    m0 = folium.Map(location=[39.7, -8.1], zoom_start=7,
+                    tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
                     attr="© OpenTopoMap", control_scale=True)
     for w in st.session_state.wps:
         folium.CircleMarker((w["lat"],w["lon"]), radius=5, color="#007AFF", fill=True, fill_opacity=1).add_to(m0)
     map_out = st_folium(m0, width=None, height=420, key="pickmap")
     with st.form("add_by_click"):
-        n1,n2,n3 = st.columns([2,1,1])
-        with n1: nm = st.text_input("Nome", "WP novo")
-        with n2: alt = st.number_input("Alt (ft)", 0.0, 18000.0, 3000.0, step=100.0)
+        cA,cB,cC = st.columns([2,1,1])
+        with cA: nm = st.text_input("Nome", "WP novo")
+        with cB: alt = st.number_input("Alt (ft)", 0.0, 18000.0, float(st.session_state.alt_qadd), step=100.0)
         clicked = map_out.get("last_clicked")
         st.write("Último clique:", clicked if clicked else "—")
-        submitted = st.form_submit_button("Adicionar do último clique")
-        if submitted and clicked:
+        if st.form_submit_button("Adicionar do clique") and clicked:
             ok = add_wp_unique(nm, clicked["lat"], clicked["lng"], alt)
-            if ok:
-                st.success("Adicionado.")
-            else:
-                st.warning("Já existia perto com o mesmo nome.")
+            (st.success if ok else st.warning)("Adicionado." if ok else "Já existia perto com o mesmo nome.")
 
-with tab3:
-    st.caption("Cola linhas: `NOME; LAT; LON; ALT` — aceita DD ou DMS compactas (ex: `390712N 0083155W`). ALT opcional.")
-    txt = st.text_area("Lista", height=120, placeholder="ABRANTES; 39.4667; -8.2; 3000\nPONTO X; 390712N; 0083155W; 2500")
-    alt_def = st.number_input("Alt (ft) se faltar", 0.0, 18000.0, 3000.0, step=100.0, key="alt_def_paste")
+with tabs[1]:
+    st.caption("Formato por linha: `NOME; LAT; LON; ALT` — aceita DD ou DMS compactas (`390712N 0083155W`). ALT opcional.")
+    txt = st.text_area("Lista", height=120,
+                       placeholder="ABRANTES; 39.4667; -8.2; 3000\nPONTO X; 390712N; 0083155W; 2500")
+    alt_def = st.number_input("Alt (ft) se faltar", 0.0, 18000.0, float(st.session_state.alt_qadd), step=100.0, key="alt_def_paste")
     if st.button("Adicionar da lista"):
         n=0
         for line in txt.splitlines():
@@ -361,7 +357,7 @@ with tab3:
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== EDITOR WPs ========
+# ================== EDITOR WPs ==================
 if st.session_state.wps:
     st.subheader("Rota (Waypoints)")
     for i, w in enumerate(st.session_state.wps):
@@ -380,7 +376,7 @@ if st.session_state.wps:
             if st.button("Remover", key=f"delwp_{i}"): st.session_state.wps.pop(i)
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== TOC/TOD AS WPs ========
+# ================== TOC/TOD AS WPs ==================
 def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, desc_angle_deg):
     nodes = []
     if len(user_wps) < 2: return nodes
@@ -406,7 +402,7 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, desc_angle_deg):
     nodes.append(user_wps[-1])
     return nodes
 
-# ======== LEGS ========
+# ================== LEGS ==================
 def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every_min):
     legs = []
     if len(nodes) < 2: return legs
@@ -435,7 +431,6 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         clk_start = (base_time + dt.timedelta(seconds=t_cursor)).strftime('%H:%M') if base_time else f"T+{mmss(t_cursor)}"
         clk_end   = (base_time + dt.timedelta(seconds=t_cursor+time_sec)).strftime('%H:%M') if base_time else f"T+{mmss(t_cursor+time_sec)}"
 
-        # CPs (texto)
         cps=[]
         if ck_every_min>0 and gs>0:
             k=1
@@ -451,7 +446,7 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         t_cursor += time_sec; carry_efob = efob_end
     return legs
 
-# ======== GERAR ROTA/LEGS ========
+# ================== GERAR ROTA/LEGS ==================
 cgen,_ = st.columns([2,6])
 with cgen:
     if st.button("Gerar/Atualizar rota (insere TOC/TOD) ✅", type="primary", use_container_width=True):
@@ -464,7 +459,7 @@ with cgen:
             st.session_state.mag_var, st.session_state.mag_is_e, st.session_state.ck_default
         )
 
-# ======== RESUMO ========
+# ================== RESUMO ==================
 if st.session_state.legs:
     total_sec  = sum(L["time_sec"] for L in st.session_state.legs)
     total_burn = r10f(sum(L["burn"] for L in st.session_state.legs))
@@ -478,7 +473,7 @@ if st.session_state.legs:
     )
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== MAPA (FOLIUM) ========
+# ================== MAPA (FOLIUM) ==================
 def _bounds_from_nodes(nodes):
     lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
     return [(min(lats),min(lons)), (max(lats),max(lons))]
@@ -486,17 +481,24 @@ def _bounds_from_nodes(nodes):
 def _route_latlngs(legs):
     return [[(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])] for L in legs]
 
-def add_print_button(m):
+def add_print_and_fullscreen(m):
+    # Print
     m.get_root().header.add_child(folium.Element(
         '<script src="https://unpkg.com/leaflet.browser.print/dist/leaflet.browser.print.min.js"></script>'
     ))
+    # Fullscreen
+    m.get_root().header.add_child(folium.Element(
+        '<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen/Control.FullScreen.css" />'
+    ))
+    m.get_root().header.add_child(folium.Element(
+        '<script src="https://unpkg.com/leaflet.fullscreen/Control.FullScreen.js"></script>'
+    ))
     tpl = """
     {% macro script(this, kwargs) %}
-      L.control.browserPrint({
-        position:'topleft',
-        title: 'Export PDF/PNG',
-        printModes: ['Portrait','Landscape','Auto','Custom']
-      }).addTo({{this._parent.get_name()}});
+      const mp = {{this._parent.get_name()}};
+      L.control.browserPrint({position:'topleft', title:'Export PDF/PNG',
+                              printModes:['Portrait','Landscape','Auto','Custom']}).addTo(mp);
+      if (L.control.fullscreen) { L.control.fullscreen({position:'topleft', title:'Fullscreen'}).addTo(mp); }
     {% endmacro %}
     """
     macro = MacroElement(); macro._template = Template(tpl)
@@ -551,27 +553,25 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
             attr="© OpenStreetMap", name="OSM", overlay=False
         ).add_to(m)
 
-    # rota com HALO
+    # rota com HALO mais forte
     for latlngs in _route_latlngs(legs):
-        folium.PolyLine(latlngs, color="#ffffff", weight=8, opacity=0.9).add_to(m)
+        folium.PolyLine(latlngs, color="#ffffff", weight=9, opacity=1.0).add_to(m)
         folium.PolyLine(latlngs, color="#C000FF", weight=4, opacity=1.0).add_to(m)
 
-    # riscas a cada N minutos segundo GS (toggle)
-    if st.session_state.show_ticks:
-        every = max(1, int(st.session_state.tick_every_min))
-        for L in legs:
-            if L["GS"]<=0 or L["time_sec"]<=0: continue
-            t = every*60
-            while t <= L["time_sec"]:
-                d = min(L["Dist"], L["GS"]*(t/3600.0))
-                latm, lonm = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], d)
-                llat, llon = dest_point(latm, lonm, L["TC"]-90, 0.16)
-                rlat, rlon = dest_point(latm, lonm, L["TC"]+90, 0.16)
-                folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
-                t += every*60
+    # riscas — exatamente a cada 2 min pela GS
+    for L in legs:
+        if L["GS"]<=0 or L["time_sec"]<120: continue
+        t = 120
+        while t <= L["time_sec"]:
+            d = min(L["Dist"], L["GS"]*(t/3600.0))
+            latm, lonm = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], d)
+            llat, llon = dest_point(latm, lonm, L["TC"]-90, 0.17)
+            rlat, rlon = dest_point(latm, lonm, L["TC"]+90, 0.17)
+            folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
+            t += 120
 
-    # ---- RÓTULOS / INFO POR LEG (sem triângulos) ----
-    used = []  # pontos onde já colocámos labels (evita choques básicos)
+    # rótulos (pílulas) + MH grande
+    used = []
     for L in legs:
         if L["Dist"] < LABEL_MIN_NM or L["GS"] <= 0 or L["time_sec"] <= 0:
             continue
@@ -579,19 +579,17 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         anchor, base, side = best_label_anchor(L, used)
         used.append(anchor)
 
-        # linha de chamada (da rota para fora)
+        # leader line
         mid_pt = dest_point(base[0], base[1], L["TC"] + 90 * side, min(LABEL_LINE_OFF, LABEL_SIDE_OFF-0.05))
         folium.PolyLine([(base[0],base[1]), (mid_pt[0], mid_pt[1])], color="#000000", weight=2, opacity=1).add_to(m)
 
-        # pílula com info compacta
         info_txt = f"{rang(L['TH'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm"
         add_label_box(m, anchor[0], anchor[1], info_txt, big=False)
 
-        # MH grande (amarelo)
-        mh_lat, mh_lon = dest_point(anchor[0], anchor[1], L["TC"], 0.20)
+        mh_lat, mh_lon = dest_point(anchor[0], anchor[1], L["TC"], 0.22)
         add_label_box(m, mh_lat, mh_lon, f"MH {rang(L['MH'])}°", big=True)
 
-    # waypoints (ponto + nome em preto com halo)
+    # WPs (ponto + nome a preto com halo)
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
         color = "#FF5050" if is_toc_tod else "#007AFF"
@@ -601,9 +599,9 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
 
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
-    add_print_button(m)
+    add_print_and_fullscreen(m)
     folium.LayerControl(collapsed=False).add_to(m)
-    st_folium(m, width=None, height=720)
+    st_folium(m, width=None, height=740)
 
 # ---- render ----
 if st.session_state.wps and st.session_state.route_nodes and st.session_state.legs:
@@ -613,5 +611,3 @@ elif st.session_state.wps:
     st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar as legs.")
 else:
     st.info("Adiciona pelo menos 2 waypoints.")
-
-
