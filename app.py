@@ -1,11 +1,11 @@
-# app.py — NAVLOG — rev8
+# app.py — NAVLOG — rev9
 # - OpenTopoMap por defeito
 # - Abas: 🔎 Pesquisar CSV · 🗺️ Adicionar no mapa · 📋 Colar lista
-# - Setas alinhadas à leg com texto rodado (inclui MH)
-# - **Agora mostra pílulas mesmo em pernas curtas** quando envolvem TOC/TOD ou CLIMB/DESCENT
-#   e escala tamanho/offset dinamicamente por distância
-# - Anti-sobreposição (lado e offset adaptativos + candidato no meio para pernas curtas)
+# - Setas alinhadas à leg com texto rodado e MAIORES (inclui MH/TC, GS, ETE, Dist, Burn)
+# - Pílulas aparecem também em pernas curtas (TOC/TOD/CLIMB/DESCENT) com escala dinâmica
 # - CP ticks mais compridos
+# - ETO/EFOB em cada FIX (caixa branca junto ao WP)
+# - Anti-sobreposição (lado/offset adaptativos + candidato no meio para pernas curtas)
 # - Fullscreen; sem botão de export
 
 import streamlit as st
@@ -30,6 +30,7 @@ st.markdown("""
 .kvrow{display:flex;gap:8px;flex-wrap:wrap}
 .kv{background:var(--chip);border:1px solid var(--line);border-radius:10px;padding:6px 8px;font-size:12px}
 .sep{height:1px;background:var(--line);margin:10px 0}
+.leaflet-control-zoom a{font-weight:800}
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,6 +43,7 @@ r10f = lambda x: round(float(x), 1)
 rang = lambda x: int(round(float(x))) % 360
 wrap360 = lambda x: (x % 360 + 360) % 360
 def angdiff(a, b): return (a - b + 180) % 360 - 180
+def deg3(v): return f"{int(round(v))%360:03d}°"
 
 def wind_triangle(tc, tas, wdir, wkt):
     if tas <= 0: return 0.0, wrap360(tc), 0.0
@@ -91,7 +93,7 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
 # ======== LABELS (seta alinhada + anti-sobreposição) ========
 LABEL_MIN_NM_NORMAL = 0.8      # limiar padrão
 LABEL_MIN_GAP       = 0.8      # distância mínima entre ancoragens (NM)
-CP_TICK_HALF        = 0.32     # meia-extensão do tick (0.64 NM total)
+CP_TICK_HALF        = 0.38     # meia-extensão do tick (=> 0.76 NM total) — maior e visível
 
 def _nm_dist(a,b): return gc_dist_nm(a[0],a[1],b[0],b[1])
 
@@ -99,10 +101,10 @@ def html_marker(m, lat, lon, html):
     folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
 
 def rotated_text_html(text, angle_deg, scale=1.0):
-    fs = int(13*scale)
+    fs = int(15*scale)  # texto maior por defeito
     return f"""
     <div style="transform: translate(-50%,-50%) rotate({angle_deg}deg);
-                transform-origin:center center; font-size:{fs}px; font-weight:800; color:#111;
+                transform-origin:center center; font-size:{fs}px; font-weight:900; color:#111;
                 text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;
                 white-space:nowrap; letter-spacing:.2px;">{text}</div>
     """
@@ -123,15 +125,16 @@ def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head
     return [BL, NL, (F_lat, F_lon), NR, BR, BL]
 
 def dynamic_label_params(dist_nm, global_scale):
-    # escalar 0.55..1.00 conforme a distância (curtas ficam compactas)
-    base = min(1.0, max(0.55, dist_nm/8.0))
+    # Escala mais agressiva para ficar visível:
+    # base 0.9..1.35 consoante a distância (curtas ainda legíveis)
+    base = min(1.35, max(0.9, dist_nm/6.0))
     s = base * float(global_scale)
-    # seta em NM (comprimento/ largura/ cabeça)
-    L = 1.85 * s
-    W = 0.55 * s
-    H = 0.42 * s
-    # afastamento lateral 0.65..1.2 NM
-    side_off = 0.65 + 0.55*min(1.0, dist_nm/8.0)
+    # Seta — comprimento 1.9..3.2 nm; largura proporcional
+    L = min(3.2, max(1.9, 2.1*s))
+    W = min(0.85, max(0.55, 0.6*s))
+    H = min(0.70, max(0.45, 0.48*s))
+    # Afastamento lateral 0.8..1.4 NM
+    side_off = min(1.4, max(0.8, 0.9*s))
     return s, L, W, H, side_off
 
 def label_candidates(L, side_off):
@@ -155,8 +158,6 @@ def choose_anchor(L, used_points, side_off):
     score, anchor, side = best
     tries=0
     while score < LABEL_MIN_GAP and tries<4:
-        side_off += 0.18
-        # recalcula só movendo lateralmente
         anchor = dest_point(anchor[0], anchor[1], L["TC"]+90*side, 0.18)
         dists = [ _nm_dist(anchor, p) for p in crowd ]
         score = min(dists+[999]); tries+=1
@@ -172,7 +173,7 @@ ens("ck_default", 2)
 ens("wps", []); ens("legs", []); ens("route_nodes", [])
 ens("map_base", "OpenTopoMap (VFR-ish)")
 ens("maptiler_key", "")
-ens("show_labels", True); ens("show_ticks", True); ens("text_scale", 1.0)
+ens("show_labels", True); ens("show_ticks", True); ens("text_scale", 1.25)  # maior por defeito
 ens("db_points", None); ens("qadd", ""); ens("alt_qadd", 3000.0)
 ens("search_rows", []); ens("search_selected_idx", -1)
 
@@ -200,7 +201,7 @@ with st.form("globals"):
         st.session_state.show_labels = st.toggle("Mostrar pílulas", value=st.session_state.show_labels)
         st.session_state.show_ticks  = st.toggle("Mostrar riscas CP", value=st.session_state.show_ticks)
     with b3:
-        st.session_state.text_scale  = st.slider("Tamanho do texto", 0.8, 1.6, float(st.session_state.text_scale), 0.05)
+        st.session_state.text_scale  = st.slider("Tamanho do texto", 0.9, 1.8, float(st.session_state.text_scale), 0.05)
     st.form_submit_button("Aplicar")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
@@ -475,8 +476,8 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
                 k+=1
 
         legs.append({"i":i+1,"A":A,"B":B,"profile":profile,"TC":tc,"TH":th,"MH":mh,"TAS":tas,"GS":gs,
-                     "Dist":dist,"time_sec":time_sec,"burn":r10f(burn),"efob_start":efob_start,
-                     "efob_end":efob_end,"clock_start":clk_start,"clock_end":clk_end,"cps":cps})
+                     "Dist":dist,"time_sec":time_sec,"burn":r10f(burn),"efob_start":r10f(efob_start),
+                     "efob_end":r10f(efob_end),"clock_start":clk_start,"clock_end":clk_end,"cps":cps})
         t_cursor += time_sec; carry_efob = efob_end
     return legs
 
@@ -515,6 +516,20 @@ def _bounds_from_nodes(nodes):
 def _route_latlngs(legs):
     return [[(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])] for L in legs]
 
+def _wp_time_fuel(nodes, legs):
+    """Retorna lista de dicts por nó com ETO/EFOB."""
+    info = [{"eto": None, "efob": None} for _ in nodes]
+    if not legs: return info
+    # nó 0: início
+    info[0]["eto"]  = legs[0]["clock_start"]
+    info[0]["efob"] = legs[0]["efob_start"]
+    # demais
+    for i in range(1, len(nodes)):
+        Lprev = legs[i-1]
+        info[i]["eto"]  = Lprev["clock_end"]
+        info[i]["efob"] = Lprev["efob_end"]
+    return info
+
 def render_map(nodes, legs, base_choice, maptiler_key=""):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**.")
@@ -552,7 +567,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
 
     # Rota com halo
     for latlngs in _route_latlngs(legs):
-        folium.PolyLine(latlngs, color="#ffffff", weight=9, opacity=1.0).add_to(m)
+        folium.PolyLine(latlngs, color="#ffffff", weight=10, opacity=1.0).add_to(m)
         folium.PolyLine(latlngs, color="#C000FF", weight=4, opacity=1.0).add_to(m)
 
     # CP Ticks (maiores)
@@ -566,7 +581,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
 
-    # Setas + texto (com MH) — SEMPRE mostrar em TOC/TOD/CLIMB/DESCENT
+    # Setas + texto (MH/TC, GS, ETE, Dist, Burn)
     if st.session_state.show_labels:
         used = []
         for L in legs:
@@ -584,13 +599,23 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
             poly = arrow_polygon(anchor[0], anchor[1], L["TC"], Lnm, Wnm, Hnm)
             folium.Polygon(poly, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.96).add_to(m)
 
-            txt = f"MH {rang(L['MH'])}° • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm"
+            txt = f"{deg3(L['MH'])}M/{deg3(L['TC'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm • {L['burn']:.1f}L"
             html_marker(m, anchor[0], anchor[1], rotated_text_html(txt, L["TC"], scale=s))
 
-    # WPs + nomes com halo
+    # WPs + nomes + ETO/EFOB (caixa branca)
+    info = _wp_time_fuel(nodes, legs)
+
     def name_halo_html(text, scale=1.0):
-        fs = int(14*scale)
+        fs = int(16*scale)
         return f"<div style='transform:translate(-50%,-50%);font-size:{fs}px;color:#111;font-weight:900;text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;white-space:nowrap;'>{text}</div>"
+
+    def box_html(text, scale=1.0):
+        fs = int(13*scale)
+        return f"""
+        <div style="transform:translate(-50%,-50%); background:#fff; border:2px solid #111; border-radius:10px;
+                    padding:2px 6px; font-size:{fs}px; font-weight:800; color:#111;
+                    box-shadow:0 0 0 2px #fff; white-space:nowrap;">{text}</div>
+        """
 
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
@@ -598,6 +623,18 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         folium.CircleMarker((N["lat"],N["lon"]), radius=6, color="#FFFFFF",
                             weight=2, fill=True, fill_color=color, fill_opacity=1).add_to(m)
         html_marker(m, N["lat"], N["lon"], name_halo_html(f"{idx+1}. {N['name']}", scale=float(st.session_state.text_scale)))
+
+        # Caixa ETO/EFOB ao lado, alinhada pela perna adjacente
+        tc_ref = None
+        if idx < len(legs): tc_ref = legs[idx]["TC"]
+        else: tc_ref = legs[-1]["TC"]
+        side = -1 if idx % 2 == 0 else +1
+        off = 0.55
+        lab_lat, lab_lon = dest_point(N["lat"], N["lon"], tc_ref + 90*side, off)
+        eto = info[idx]["eto"] or "-"
+        efb = info[idx]["efob"]
+        efb_txt = f"{efb:.1f}L" if efb is not None else "-"
+        html_marker(m, lab_lat, lab_lon, box_html(f"ETO {eto} • EFOB {efb_txt}", scale=float(st.session_state.text_scale)))
 
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
@@ -611,4 +648,5 @@ elif st.session_state.wps:
     st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar as legs.")
 else:
     st.info("Adiciona pelo menos 2 waypoints.")
+
 
