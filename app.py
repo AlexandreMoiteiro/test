@@ -1,12 +1,14 @@
-# app.py — NAVLOG — rev9
+# app.py — NAVLOG — rev10
 # - OpenTopoMap por defeito
 # - Abas: 🔎 Pesquisar CSV · 🗺️ Adicionar no mapa · 📋 Colar lista
-# - Setas alinhadas à leg com texto rodado e MAIORES (inclui MH/TC, GS, ETE, Dist, Burn)
-# - Pílulas aparecem também em pernas curtas (TOC/TOD/CLIMB/DESCENT) com escala dinâmica
+# - Pílulas COMPACTAS por defeito (MH/GS/ETE) + tooltip com detalhes
+# - Setas alinhadas à leg com texto rodado e MAIORES (inclui MH/TC, GS, ETE, Dist, Burn quando detalhadas)
+# - Leader line das pílulas até à perna (melhor legibilidade)
+# - Anti-sobreposição reforçado (offset lateral progressivo + tentativa alternada de lado; candidato no meio para pernas curtas)
+# - Caixas ETO/EFOB com colocação adaptativa e anti-colisão
 # - CP ticks mais compridos
-# - ETO/EFOB em cada FIX (caixa branca junto ao WP)
-# - Anti-sobreposição (lado/offset adaptativos + candidato no meio para pernas curtas)
 # - Fullscreen; sem botão de export
+# - Pesquisa: apenas multiselect + "Adicionar selecionados" (sem rádio redundante)
 
 import streamlit as st
 import pandas as pd
@@ -31,6 +33,7 @@ st.markdown("""
 .kv{background:var(--chip);border:1px solid var(--line);border-radius:10px;padding:6px 8px;font-size:12px}
 .sep{height:1px;background:var(--line);margin:10px 0}
 .leaflet-control-zoom a{font-weight:800}
+.leaflet-tooltip{font-weight:700}
 </style>
 """, unsafe_allow_html=True)
 
@@ -92,8 +95,8 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
 
 # ======== LABELS (seta alinhada + anti-sobreposição) ========
 LABEL_MIN_NM_NORMAL = 0.8      # limiar padrão
-LABEL_MIN_GAP       = 0.8      # distância mínima entre ancoragens (NM)
-CP_TICK_HALF        = 0.38     # meia-extensão do tick (=> 0.76 NM total) — maior e visível
+LABEL_MIN_GAP       = 0.9      # distância mínima entre ancoragens (NM) — um pouco maior
+CP_TICK_HALF        = 0.38     # meia-extensão do tick (=> 0.76 NM total)
 
 def _nm_dist(a,b): return gc_dist_nm(a[0],a[1],b[0],b[1])
 
@@ -106,7 +109,9 @@ def rotated_text_html(text, angle_deg, scale=1.0):
     <div style="transform: translate(-50%,-50%) rotate({angle_deg}deg);
                 transform-origin:center center; font-size:{fs}px; font-weight:900; color:#111;
                 text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;
-                white-space:nowrap; letter-spacing:.2px;">{text}</div>
+                white-space:nowrap; letter-spacing:.2px; background:rgba(255,255,255,.85); padding:1px 4px; border-radius:6px;">
+        {text}
+    </div>
     """
 
 def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head_nm):
@@ -126,18 +131,18 @@ def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head
 
 def dynamic_label_params(dist_nm, global_scale):
     # Escala mais agressiva para ficar visível:
-    # base 0.9..1.35 consoante a distância (curtas ainda legíveis)
     base = min(1.35, max(0.9, dist_nm/6.0))
     s = base * float(global_scale)
     # Seta — comprimento 1.9..3.2 nm; largura proporcional
     L = min(3.2, max(1.9, 2.1*s))
     W = min(0.85, max(0.55, 0.6*s))
     H = min(0.70, max(0.45, 0.48*s))
-    # Afastamento lateral 0.8..1.4 NM
-    side_off = min(1.4, max(0.8, 0.9*s))
+    # Afastamento lateral 0.9..1.6 NM
+    side_off = min(1.6, max(0.9, 1.0*s))
     return s, L, W, H, side_off
 
 def label_candidates(L, side_off):
+    """Gera candidatos: pontos ao longo da leg e deslocados lateralmente. Devolve (anchor, side, base_pt)."""
     cands = []
     fracs = (0.33, 0.5, 0.67) if L["Dist"] < 5.0 else (0.33, 0.67)
     for frac in fracs:
@@ -145,23 +150,28 @@ def label_candidates(L, side_off):
         base = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], base_d)
         for side in (-1, +1):
             anchor = dest_point(base[0], base[1], L["TC"]+90*side, side_off)
-            cands.append((anchor, side))
+            cands.append((anchor, side, base))
     return cands
 
 def choose_anchor(L, used_points, side_off):
+    """Escolhe âncora maximizando distância a pontos já usados; tenta afastar progressivamente se necessário."""
     crowd = used_points + [(L["A"]["lat"],L["A"]["lon"]),(L["B"]["lat"],L["B"]["lon"])]
     best=None
-    for anchor, side in label_candidates(L, side_off):
+    chosen_base=None
+    for anchor, side, base in label_candidates(L, side_off):
         dists = [ _nm_dist(anchor, p) for p in crowd ]
         score = min(dists+[999])
-        if (best is None) or (score>best[0]): best=(score, anchor, side)
+        if (best is None) or (score>best[0]): best=(score, anchor, side); chosen_base=base
     score, anchor, side = best
     tries=0
-    while score < LABEL_MIN_GAP and tries<4:
-        anchor = dest_point(anchor[0], anchor[1], L["TC"]+90*side, 0.18)
+    while score < LABEL_MIN_GAP and tries<6:
+        # cresce offset lateral e alterna ligeiramente ao longo da perna
+        anchor = dest_point(anchor[0], anchor[1], L["TC"]+90*side, 0.20 + 0.05*tries)
+        along  = max(0.2, min(L["Dist"]-0.2, (L["Dist"]*0.45) + tries*0.15))
+        chosen_base = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], along)
         dists = [ _nm_dist(anchor, p) for p in crowd ]
         score = min(dists+[999]); tries+=1
-    return anchor, side
+    return anchor, side, chosen_base
 
 # ======== STATE ========
 def ens(k, v): return st.session_state.setdefault(k, v)
@@ -174,8 +184,9 @@ ens("wps", []); ens("legs", []); ens("route_nodes", [])
 ens("map_base", "OpenTopoMap (VFR-ish)")
 ens("maptiler_key", "")
 ens("show_labels", True); ens("show_ticks", True); ens("text_scale", 1.25)  # maior por defeito
+ens("labels_compact", True); ens("labels_leader", True)  # NOVO
 ens("db_points", None); ens("qadd", ""); ens("alt_qadd", 3000.0)
-ens("search_rows", []); ens("search_selected_idx", -1)
+ens("search_rows", []); ens("search_selected_idx", -1); ens("search_multi", [])
 
 # ======== PARÂMETROS GLOBAIS ========
 with st.form("globals"):
@@ -193,7 +204,7 @@ with st.form("globals"):
         st.session_state.start_efob= st.number_input("EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
         st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
         st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
-    b1,b2,b3 = st.columns([1.2,1,1])
+    b1,b2,b3,b4 = st.columns([1.3,1,1.1,1.2])
     with b1:
         bases = ["OpenTopoMap (VFR-ish)","EOX Sentinel-2 (satélite)","Esri World Imagery (satélite + labels)","Esri World TopoMap (topo)","OSM Standard","MapTiler Satellite Hybrid (requer key)"]
         st.session_state.map_base = st.selectbox("Base do mapa", bases, index=bases.index(st.session_state.map_base) if st.session_state.map_base in bases else 0)
@@ -202,6 +213,9 @@ with st.form("globals"):
         st.session_state.show_ticks  = st.toggle("Mostrar riscas CP", value=st.session_state.show_ticks)
     with b3:
         st.session_state.text_scale  = st.slider("Tamanho do texto", 0.9, 1.8, float(st.session_state.text_scale), 0.05)
+    with b4:
+        st.session_state.labels_compact = st.toggle("Pílulas detalhadas", value=st.session_state.labels_compact, help="Se desligado, mostra versão compacta (recomendado).")
+        st.session_state.labels_leader  = st.toggle("Leader line p/ pílulas", value=st.session_state.labels_leader)
     st.form_submit_button("Aplicar")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
@@ -279,7 +293,7 @@ tab_csv, tab_map, tab_paste = st.tabs(["🔎 Pesquisar CSV", "🗺️ Adicionar 
 with tab_csv:
     c1, c2 = st.columns([3,1])
     with c1:
-        q = st.text_input("Pesquisar (escolhe na lista abaixo)", key="qadd",
+        q = st.text_input("Pesquisar (seleciona vários e adiciona de uma vez)", key="qadd",
                           placeholder="Ex: LPPT, ALPAL, ÉVORA, NISA…").strip()
     with c2:
         st.session_state.alt_qadd = st.number_input("Alt (ft) p/ novos WPs", 0.0, 18000.0,
@@ -305,50 +319,46 @@ with tab_csv:
         return df.sort_values("__score", ascending=False)
 
     results = _search_points(q)
-    st.session_state.search_rows = results.head(20).to_dict("records") if not results.empty else []
-    left, right = st.columns([2,1])
-    with left:
-        if st.session_state.search_rows:
-            labels = [ f"[{r['src']}] {r.get('code','')} — {r.get('name','')}  ({r['lat']:.4f}, {r['lon']:.4f})"
-                       for r in st.session_state.search_rows ]
-            st.session_state.search_selected_idx = st.radio(
-                label="Resultados (escolhe 1):", options=list(range(len(labels))),
-                format_func=lambda i: labels[i], index=0
-            )
-            def add_wp_unique(name, lat, lon, alt):
-                for w in st.session_state.wps:
-                    if str(w["name"]).strip().lower() == str(name).strip().lower():
-                        if gc_dist_nm(w["lat"], w["lon"], lat, lon) <= 0.2: return False
-                st.session_state.wps.append({"name": str(name), "lat": float(lat), "lon": float(lon), "alt": float(alt)})
-                return True
-            cbtn1, cbtn2 = st.columns([1,1])
-            with cbtn1:
-                if st.button("➕ Adicionar selecionado", use_container_width=True):
-                    r = st.session_state.search_rows[st.session_state.search_selected_idx]
-                    ok = add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), float(st.session_state.alt_qadd))
-                    (st.success if ok else st.warning)("Adicionado." if ok else "Já existia perto com o mesmo nome.")
-            with cbtn2:
-                picks = st.multiselect("Multi-seleção (opcional)", labels, default=[])
-                if st.button("➕➕ Adicionar selecionados", use_container_width=True, disabled=(not picks)):
-                    idxs = [labels.index(s) for s in picks]
-                    n=0
-                    for i in idxs:
-                        r = st.session_state.search_rows[i]
-                        if add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), float(st.session_state.alt_qadd)):
-                            n+=1
-                    st.success(f"Adicionados {n} WPs.")
-        else:
-            st.info("Sem resultados.")
-    with right:
-        st.caption("Pré-visualização")
-        if st.session_state.search_rows:
-            r = st.session_state.search_rows[st.session_state.search_selected_idx]
-            mprev = folium.Map(location=[r["lat"], r["lon"]], zoom_start=10,
-                               tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-                               attr="© OpenTopoMap", control_scale=True)
-            folium.CircleMarker((r["lat"], r["lon"]), radius=7, color="#FF8800", weight=2,
-                                fill=True, fill_color="#FF8800", fill_opacity=0.9).add_to(mprev)
-            st_folium(mprev, width=None, height=240, key="preview_map")
+    st.session_state.search_rows = results.head(60).to_dict("records") if not results.empty else []
+
+    if st.session_state.search_rows:
+        labels = [ f"[{r['src']}] {r.get('code','')} — {r.get('name','')}  ({r['lat']:.4f}, {r['lon']:.4f})"
+                   for r in st.session_state.search_rows ]
+        st.session_state.search_multi = st.multiselect(
+            "Resultados (multi-seleção):", labels, default=[]
+        )
+
+        cbtn1, cprev = st.columns([1,1])
+        with cbtn1:
+            if st.button("➕ Adicionar selecionados", use_container_width=True, disabled=(not st.session_state.search_multi)):
+                idxs = [labels.index(s) for s in st.session_state.search_multi]
+                def add_wp_unique(name, lat, lon, alt):
+                    for w in st.session_state.wps:
+                        if str(w["name"]).strip().lower() == str(name).strip().lower():
+                            if gc_dist_nm(w["lat"], w["lon"], lat, lon) <= 0.2: return False
+                    st.session_state.wps.append({"name": str(name), "lat": float(lat), "lon": float(lon), "alt": float(alt)})
+                    return True
+                n=0
+                for i in idxs:
+                    r = st.session_state.search_rows[i]
+                    if add_wp_unique(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), float(st.session_state.alt_qadd)):
+                        n+=1
+                st.success(f"Adicionados {n} WPs.")
+        with cprev:
+            st.caption("Pré-visualização (último selecionado)")
+            if st.session_state.search_multi:
+                last_idx = labels.index(st.session_state.search_multi[-1])
+                r = st.session_state.search_rows[last_idx]
+                mprev = folium.Map(location=[r["lat"], r["lon"]], zoom_start=10,
+                                   tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+                                   attr="© OpenTopoMap", control_scale=True)
+                folium.CircleMarker((r["lat"], r["lon"]), radius=7, color="#FF8800", weight=2,
+                                    fill=True, fill_color="#FF8800", fill_opacity=0.9).add_to(mprev)
+                st_folium(mprev, width=None, height=240, key="preview_map")
+            else:
+                st.info("Seleciona itens para pré-visualizar.")
+    else:
+        st.info("Sem resultados.")
 
 with tab_map:
     st.caption("Clica no mapa e depois em **Adicionar**.")
@@ -530,6 +540,14 @@ def _wp_time_fuel(nodes, legs):
         info[i]["efob"] = Lprev["efob_end"]
     return info
 
+def _box_html(text, scale=1.0):
+    fs = int(13*scale)
+    return f"""
+    <div style="transform:translate(-50%,-50%); background:#fff; border:2px solid #111; border-radius:10px;
+                padding:2px 6px; font-size:{fs}px; font-weight:800; color:#111;
+                box-shadow:0 0 0 2px #fff; white-space:nowrap;">{text}</div>
+    """
+
 def render_map(nodes, legs, base_choice, maptiler_key=""):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**.")
@@ -581,60 +599,82 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
 
-    # Setas + texto (MH/TC, GS, ETE, Dist, Burn)
+    # ---------- Labels/Pílulas ----------
+    used_points = []   # pontos já ocupados, para anti-sobreposição
+    def reserve(p): used_points.append(p)
+
+    # Pílulas (por perna)
     if st.session_state.show_labels:
-        used = []
         for L in legs:
             is_toc = str(L["A"]["name"]).startswith(("TOC","TOD")) or str(L["B"]["name"]).startswith(("TOC","TOD"))
             is_profile = L["profile"] in ("CLIMB","DESCENT")
             must_show = is_toc or is_profile
             min_len = LABEL_MIN_NM_NORMAL if not must_show else 0.0
-            if L["GS"]<=0 or L["time_sec"]<=0 or L["Dist"] < min_len:
+            if L["GS"]<=0 or L["time_sec"]<=0 or L["Dist"] < min_len:  # demasiado curta e não prioritária
                 continue
 
             s, Lnm, Wnm, Hnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale)
-            anchor, side = choose_anchor(L, used, side_off)
-            used.append(anchor)
+            anchor, side, base_pt = choose_anchor(L, used_points, side_off)
+            reserve(anchor)
 
+            # seta
             poly = arrow_polygon(anchor[0], anchor[1], L["TC"], Lnm, Wnm, Hnm)
             folium.Polygon(poly, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.96).add_to(m)
 
-            txt = f"{deg3(L['MH'])}M/{deg3(L['TC'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm • {L['burn']:.1f}L"
-            html_marker(m, anchor[0], anchor[1], rotated_text_html(txt, L["TC"], scale=s))
+            # texto compacto/detalhado
+            if st.session_state.labels_compact:
+                txt = f"{deg3(L['MH'])}/{rint(L['GS'])}kt • {mmss(L['time_sec'])}"
+                tip = (f"MH {deg3(L['MH'])} • TC {deg3(L['TC'])} • GS {rint(L['GS'])} kt • "
+                       f"ETE {mmss(L['time_sec'])} • Dist {L['Dist']:.1f} nm • Burn {L['burn']:.1f} L")
+            else:
+                txt = f"{deg3(L['MH'])}M/{deg3(L['TC'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm • {L['burn']:.1f}L"
+                tip = txt
 
-    # WPs + nomes + ETO/EFOB (caixa branca)
+            html_marker(m, anchor[0], anchor[1], rotated_text_html(txt, L["TC"], scale=s))
+            folium.CircleMarker(base_pt, radius=0.1, opacity=0, fill=False,
+                                tooltip=tip).add_to(m)
+
+            # Leader line até à perna (melhor leitura)
+            if st.session_state.labels_leader:
+                folium.PolyLine([base_pt, (anchor[0],anchor[1])], color="#000000", dash_array="3,6", weight=2, opacity=0.8).add_to(m)
+
+    # WPs + nomes + ETO/EFOB (caixa branca com anti-colisão simples)
     info = _wp_time_fuel(nodes, legs)
 
     def name_halo_html(text, scale=1.0):
         fs = int(16*scale)
-        return f"<div style='transform:translate(-50%,-50%);font-size:{fs}px;color:#111;font-weight:900;text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;white-space:nowrap;'>{text}</div>"
-
-    def box_html(text, scale=1.0):
-        fs = int(13*scale)
-        return f"""
-        <div style="transform:translate(-50%,-50%); background:#fff; border:2px solid #111; border-radius:10px;
-                    padding:2px 6px; font-size:{fs}px; font-weight:800; color:#111;
-                    box-shadow:0 0 0 2px #fff; white-space:nowrap;">{text}</div>
-        """
+        return f"<div style='transform:translate(-50%,-50%);font-size:{fs}px;color:#111;font-weight:900;text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;white-space:nowrap;background:rgba(255,255,255,.85);padding:1px 4px;border-radius:6px'>{text}</div>"
 
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
         color = "#FF5050" if is_toc_tod else "#007AFF"
         folium.CircleMarker((N["lat"],N["lon"]), radius=6, color="#FFFFFF",
-                            weight=2, fill=True, fill_color=color, fill_opacity=1).add_to(m)
+                            weight=2, fill=True, fill_color=color, fill_opacity=1,
+                            tooltip=N["name"]).add_to(m)
         html_marker(m, N["lat"], N["lon"], name_halo_html(f"{idx+1}. {N['name']}", scale=float(st.session_state.text_scale)))
+        reserve((N["lat"],N["lon"]))
 
-        # Caixa ETO/EFOB ao lado, alinhada pela perna adjacente
-        tc_ref = None
-        if idx < len(legs): tc_ref = legs[idx]["TC"]
-        else: tc_ref = legs[-1]["TC"]
-        side = -1 if idx % 2 == 0 else +1
-        off = 0.55
-        lab_lat, lab_lon = dest_point(N["lat"], N["lon"], tc_ref + 90*side, off)
+        # Caixa ETO/EFOB ao lado, alinhada pela perna adjacente, com reposicionamento anti-colisão
+        tc_ref = legs[idx]["TC"] if idx < len(legs) else legs[-1]["TC"]
+        base_side = -1 if idx % 2 == 0 else +1
+        off = 0.75  # mais afastado
+        lab_lat, lab_lon = dest_point(N["lat"], N["lon"], tc_ref + 90*base_side, off)
+
+        # tenta reposicionar se houver sobreposição com pontos usados
+        tries=0; side=base_side
+        while any(_nm_dist((lab_lat,lab_lon), p) < LABEL_MIN_GAP for p in used_points) and tries<6:
+            side = -side if tries%2 else side
+            off += 0.18
+            lab_lat, lab_lon = dest_point(N["lat"], N["lon"], tc_ref + 90*side, off)
+            tries+=1
+        reserve((lab_lat,lab_lon))
+
         eto = info[idx]["eto"] or "-"
         efb = info[idx]["efob"]
         efb_txt = f"{efb:.1f}L" if efb is not None else "-"
-        html_marker(m, lab_lat, lab_lon, box_html(f"ETO {eto} • EFOB {efb_txt}", scale=float(st.session_state.text_scale)))
+        html_marker(m, lab_lat, lab_lon, _box_html(f"ETO {eto} • EFOB {efb_txt}", scale=float(st.session_state.text_scale)))
+        if st.session_state.labels_leader:
+            folium.PolyLine([(N["lat"],N["lon"]), (lab_lat,lab_lon)], color="#000000", dash_array="3,6", weight=1.8, opacity=0.8).add_to(m)
 
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
@@ -648,5 +688,3 @@ elif st.session_state.wps:
     st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar as legs.")
 else:
     st.info("Adiciona pelo menos 2 waypoints.")
-
-
