@@ -1,11 +1,7 @@
-# app.py — NAVLOG — rev16
-# - Pílulas sem “setas” (apenas placas redondas) e texto sempre dentro
-# - Removidos líderes/“espetos”; info do fix por baixo do ponto: "T+MM:SS · 83.3L"
-# - Sem legenda CLIMB/CRUISE/DESCENT por defeito (toggle opcional)
-# - Tamanho dos textos ajusta com o zoom (JS Leaflet -> CSS var --navlog-z)
-# - Legs coloridas por perfil
-# - Seleção CSV em cards + botão ➕
-# - Permite WPs repetidos (sufixo #2, #3, …)
+# app.py — NAVLOG — rev17 (pílulas horizontais legíveis)
+# - Pílulas sem rotação (texto sempre horizontal)
+# - Tamanho dos textos agora = zoom Leaflet (--navlog-z) × slider do utilizador (--navlog-user)
+# - Restante comportamento inalterado
 
 import streamlit as st
 import pandas as pd
@@ -27,7 +23,7 @@ PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386"}
 st.set_page_config(page_title="NAVLOG", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
-:root{--line:#e5e7eb;--chip:#f3f4f6; --navlog-z: 1}
+:root{--line:#e5e7eb;--chip:#f3f4f6; --navlog-z: 1; --navlog-user: 1}
 *{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial}
 .card{border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:8px 0;background:#fff}
 .kvrow{display:flex;gap:8px;flex-wrap:wrap}
@@ -38,21 +34,26 @@ st.markdown("""
 .row{display:flex;gap:8px;align-items:center}
 .badge{font-weight:700;border:1px solid #111;border-radius:8px;padding:2px 6px;margin-right:6px}
 
-/* === estilos dinâmica por zoom === */
+/* === estilos dinâmica por zoom + slider === */
 .nav-pill{ 
   font-weight:900; color:#111; background:rgba(255,255,255,0.96);
   padding:4px 6px; border-radius:10px; border:2px solid #111;
   box-shadow:0 0 0 2px rgba(255,255,255,0.96);
-  line-height:1.05; letter-spacing:.2px; text-align:center; white-space:nowrap;
-  font-size: calc(14px * var(--navlog-z, 1));
+  line-height:1.1; letter-spacing:.2px; text-align:center; white-space:nowrap;
+  /* Escala combinada: zoom do mapa × slider do utilizador */
+  font-size: calc(14px * var(--navlog-z, 1) * var(--navlog-user, 1));
+  /* Texto SEM rotação — mantêm-se sempre horizontal para legibilidade */
+  transform: translate(-50%,-50%);
+  transform-origin:center center;
+  will-change: transform;
 }
 .nav-wpname{
-  font-size: calc(16px * var(--navlog-z, 1)); color:#111; font-weight:900;
+  font-size: calc(16px * var(--navlog-z, 1) * var(--navlog-user, 1)); color:#111; font-weight:900;
   text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;
   white-space:nowrap;
 }
 .nav-wpinfo{
-  font-size: calc(12px * var(--navlog-z, 1)); font-weight:800; color:#111;
+  font-size: calc(12px * var(--navlog-z, 1) * var(--navlog-user, 1)); font-weight:800; color:#111;
   background:rgba(255,255,255,0.96); border:2px solid #111; border-radius:8px;
   padding:1px 5px; white-space:nowrap;
 }
@@ -156,6 +157,12 @@ with st.form("globals"):
         st.session_state.text_scale  = st.slider("Tamanho base do texto", 0.9, 1.8, float(st.session_state.text_scale), 0.05)
     st.form_submit_button("Aplicar")
 
+# — injeta a escala do utilizador numa CSS var global (usada nas classes .nav-*)
+st.markdown(
+    f"<style>:root{{--navlog-user:{float(st.session_state.text_scale)};}}</style>",
+    unsafe_allow_html=True
+)
+
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ======== CSVs locais ========
@@ -208,7 +215,7 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
             try: lon_idx = tokens.index(lon_tok)
             except ValueError: continue
             code = tokens[lon_idx+1] if lon_idx+1 < len(tokens) else None
-            sector = " ".join(tokens[lon_idx+2:]) if lon_idx+2 < len(tokens) else None
+            sector = " ". ".join(tokens[lon_idx+2:]) if lon_idx+2 < len(tokens) else None
             name = " ".join(tokens[:tokens.index(lat_tok)]).strip()
             rows.append({"src":"LOC","code":code or name, "name":name, "sector":sector,"lat":lat,"lon":lon,"alt":0.0})
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
@@ -479,9 +486,9 @@ def html_marker(m, lat, lon, html):
     folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
 
 def pill_html(line1, line2, angle_deg, scale=1.0):
-    rot = f"rotate({angle_deg}deg)"
+    # Mantemos SEM rotação para garantir legibilidade em qualquer rumo
     return f"""
-    <div class="nav-pill" style="transform: translate(-50%,-50%) {rot}; transform-origin:center center;">
+    <div class="nav-pill">
         <div>{line1}</div>
         <div>{line2}</div>
     </div>
@@ -619,7 +626,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         folium.TileLayer(f"https://api.maptiler.com/maps/hybrid/256/{{z}}/{{x}}/{{y}}.jpg?key={maptiler_key}",
                          attr="© MapTiler", name="MapTiler Hybrid", overlay=False).add_to(m)
     else:
-        folium.TileLayer("https://{s}.tile.openstreetmap.org/{z}/{y}/{x}.png",
+        folium.TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
                          attr="© OpenStreetMap", name="OSM", overlay=False).add_to(m)
 
     # halo + cor por perfil
@@ -655,12 +662,11 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
     for N in nodes: zones.add(N["lat"], N["lon"], ZONE_WP_R)
     for L in legs:  zones.add_leg_corridor(L["A"], L["B"])
 
-    # pílulas (placas) — SEM setas
+    # pílulas (placas) — SEM setas e SEM rotação
     if st.session_state.show_labels:
         prev_side=None
         for idx, L in enumerate(legs):
             if L["Dist"] < LABEL_MIN_NM_NORMAL: continue
-            # tamanho relativo à distância e ao slider
             base = min(1.25, max(0.85, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
             side_off = min(2.2, max(1.1, 1.10*s))
@@ -702,3 +708,4 @@ elif st.session_state.wps:
     st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar as legs.")
 else:
     st.info("Adiciona pelo menos 2 waypoints.")
+
