@@ -1,11 +1,11 @@
-# app.py — NAVLOG — rev11
-# - Declutter 2D por zonas (labels e caixas escolhem posição por “clearance”)
-# - Pílulas legíveis (fundo branco, borda, halo) + setas maiores e mais afastadas
-# - Caixas ETO/EFOB com líder e busca 360° (multi-raios) para evitar clusters
-# - CP ticks maiores
-# - Fullscreen; sem botão de export
-# - Pesquisa CSV com UMA multiseleção e preview múltiplo
-# - >>> Permite duplicar WPs (mesmo nome/coords) sem restrições
+# app.py — NAVLOG — rev12
+# - Declutter “hub-aware”: deteta clusters de WPs (ex.: AD com muitas pernas)
+#   • abre zona morta no centro; suprime pílulas curtinhas dentro do hub
+#   • coloca ETO/EFOB em anel com líder (sem sobrepor) e raio adaptativo
+# - Pílulas mais legíveis (fundo branco 0.92, borda preta, halo) e mais afastadas
+# - Pesquisa CSV com uma única multiseleção + preview múltiplo
+# - Permite WPs repetidos (mesmo nome/coords) para ida/volta
+# - Toggle “Declutter agressivo”
 
 import streamlit as st
 import pandas as pd
@@ -15,7 +15,7 @@ from folium.plugins import Fullscreen
 from math import sin, radians, degrees
 
 # ======== CONSTANTES ========
-CLIMB_TAS, CRUISE_TAS, DESCENT_TAS = 70.0, 90.0, 90.0   # kt
+CLIMB_TAS, CRUISE_TAS, DESCENT_TAS = 70.0, 90.0, 90.0
 FUEL_FLOW = 20.0  # L/h
 EARTH_NM  = 3440.065
 
@@ -33,7 +33,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ======== HELPERS GERAIS ========
+# ======== HELPERS ========
 rt10 = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
 mmss = lambda t: f"{int(t)//60:02d}:{int(t)%60:02d}"
 hhmmss = lambda t: f"{int(t)//3600:02d}:{(int(t)%3600)//60:02d}:{int(t)%60:02d}"
@@ -46,7 +46,7 @@ def deg3(v): return f"{int(round(v))%360:03d}°"
 def wind_triangle(tc, tas, wdir, wkt):
     if tas <= 0: return 0.0, wrap360(tc), 0.0
     d = math.radians(angdiff(wdir, tc))
-    cross = wkt * math.sin(d)
+    cross = wkt * sin(d)
     s = max(-1, min(1, cross / max(tas,1e-9)))
     wca = degrees(math.asin(s))
     th  = wrap360(tc + wca)
@@ -72,8 +72,7 @@ def gc_course_tc(lat1, lon1, lat2, lon2):
     return (θ + 360) % 360
 
 def dest_point(lat, lon, bearing_deg, dist_nm):
-    θ = math.radians(bearing_deg)
-    δ = dist_nm / EARTH_NM
+    θ = math.radians(bearing_deg); δ = dist_nm / EARTH_NM
     φ1, λ1 = math.radians(lat), math.radians(lon)
     sinφ2 = math.sin(φ1)*math.cos(δ) + math.cos(φ1)*math.sin(δ)*math.cos(θ)
     φ2 = math.asin(sinφ2)
@@ -88,13 +87,13 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
-# ======== LABELS / LAYOUT ========
+# ======== VISUAL PARAMS ========
 LABEL_MIN_NM_NORMAL = 0.8
 CP_TICK_HALF        = 0.38
-ZONE_WP_R           = 0.8
-ZONE_BOX_R          = 0.75
-ZONE_LABEL_BASE_R   = 1.0
-LABEL_MIN_CLEAR     = 0.65
+ZONE_WP_R           = 0.9
+ZONE_BOX_R          = 0.8
+ZONE_LABEL_BASE_R   = 1.1
+LABEL_MIN_CLEAR     = 0.75
 
 def _nm_dist(a,b): return gc_dist_nm(a[0],a[1],b[0],b[1])
 
@@ -123,16 +122,16 @@ def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head
     NR = lat_off(neck_lat, neck_lon, +1, half)
     return [BL, NL, (F_lat, F_lon), NR, BR, BL]
 
-def dynamic_label_params(dist_nm, global_scale):
-    base = min(1.45, max(0.95, dist_nm/6.0))
+def dynamic_label_params(dist_nm, global_scale, super_declutter=False):
+    base = min(1.55, max(1.0, dist_nm/5.5))
     s = base * float(global_scale)
-    L = min(3.4, max(2.3, 2.45*s))
-    W = min(1.05, max(0.65, 0.7*s))
-    H = min(0.80, max(0.52, 0.55*s))
-    side_off = min(1.8, max(1.0, 1.2*s))  # mais para fora
+    L = min(3.6, max(2.4, 2.55*s))
+    W = min(1.10, max(0.70, 0.75*s))
+    H = min(0.85, max(0.55, 0.58*s))
+    side_off = min(2.2 if super_declutter else 1.9, max(1.2, 1.3*s))
     return s, L, W, H, side_off
 
-# --------- ZONAS (anti-sobreposição) ----------
+# ======== ZONAS / DECLUTTER =========
 class Zones:
     def __init__(self): self.z = []
     def add(self, lat, lon, r): self.z.append((lat, lon, float(r)))
@@ -140,17 +139,12 @@ class Zones:
         if not self.z: return 9e9
         return min(_nm_dist((lat,lon),(a,b)) - r for a,b,r in self.z)
 
-def _search_ring(center_lat, center_lon, bearings, radii):
-    for r in radii:
-        for brg in bearings:
-            yield dest_point(center_lat, center_lon, brg, r)
-
 def choose_leg_anchor(L, zones: Zones, side_off, label_radius_nm):
-    """Procura 2D: avança/recua na perna e afasta lateralmente."""
+    # procura 2D (ao longo e fora da perna)
     fracs = (0.25, 0.38, 0.50, 0.62, 0.74) if L["Dist"] >= 5.0 else (0.34, 0.5, 0.66)
-    along = (0.0, 0.35, 0.7, -0.35, -0.7)   # avança/recua (NM)
+    along = (0.0, 0.35, 0.7, -0.35, -0.7)
     lateral = (side_off, side_off+0.35, side_off+0.7, side_off+1.05)
-    cands=[]
+    best=None
     for frac in fracs:
         base_d = max(0.5, min(L["Dist"]-0.5, L["Dist"]*frac))
         base = point_along_gc(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"], base_d)
@@ -159,30 +153,64 @@ def choose_leg_anchor(L, zones: Zones, side_off, label_radius_nm):
             for side in (-1, +1):
                 for off in lateral:
                     anchor = dest_point(shift[0], shift[1], L["TC"]+90*side, off)
-                    cands.append((anchor, side))
-    # escolhe pelo maior clearance (preferindo miolo da perna)
-    best=None
-    for anchor, side in cands:
-        clr = zones.clearance(anchor[0], anchor[1])
-        mid_bias = 1.0 - abs(0.5 - min(0.99, gc_dist_nm(L["A"]["lat"],L["A"]["lon"],anchor[0],anchor[1]) / max(L["Dist"],1e-9)))
-        score = clr + 0.5*mid_bias
-        if (best is None) or (score>best[0]): best=(score, anchor, side)
+                    clr = zones.clearance(anchor[0], anchor[1])
+                    mid_bias = 1.0 - abs(0.5 - min(0.99, gc_dist_nm(L["A"]["lat"],L["A"]["lon"],anchor[0],anchor[1]) / max(L["Dist"],1e-9)))
+                    score = clr + 0.5*mid_bias
+                    if (best is None) or (score>best[0]): best=(score, anchor, side)
     _, anchor, side = best
     zones.add(anchor[0], anchor[1], label_radius_nm)
     return (anchor[0],anchor[1]), side
 
 def best_callout_position(center_lat, center_lon, preferred_brg, zones: Zones):
-    """Escolhe posição para a caixa ETO/EFOB variando ângulo (360°) e raio crescente."""
-    bearings = [preferred_brg + k for k in (-90,-60,-45,-30,-15,0,15,30,45,60,90,120,150,180,-120,-150,180)]
-    bearings = [wrap360(b) for b in bearings]
-    radii = [0.55, 0.8, 1.1, 1.4, 1.7, 2.0, 2.3]
+    # procura 360° com raios crescentes
+    bearings = [wrap360(preferred_brg + k) for k in (-90,-60,-45,-30,-15,0,15,30,45,60,90,120,150,180,-120,-150)]
+    radii = [0.9, 1.2, 1.5, 1.8, 2.1, 2.4]
     best_pt=None; best_score=-1e9
-    for pt in _search_ring(center_lat, center_lon, bearings, radii):
-        clr = zones.clearance(pt[0], pt[1])
-        score = clr - 0.1*radii.index(min(radii, key=lambda r: abs(gc_dist_nm(center_lat,center_lon,pt[0],pt[1])-r)))  # leve bias para menos raio
-        if score > best_score:
-            best_score=score; best_pt=pt
+    for r in radii:
+        for b in bearings:
+            pt = dest_point(center_lat, center_lon, b, r)
+            clr = zones.clearance(pt[0], pt[1])
+            score = clr - 0.06*r  # leve penalização por raio grande
+            if score > best_score:
+                best_score=score; best_pt=pt
     return best_pt
+
+# -------- Hubs (clusters de WPs) --------
+def cluster_nodes(nodes, radius_nm=1.1):
+    """Greedy clustering simples."""
+    used=set(); clusters=[]
+    for i,n in enumerate(nodes):
+        if i in used: continue
+        members=[i]
+        for j in range(i+1, len(nodes)):
+            if gc_dist_nm(n["lat"],n["lon"],nodes[j]["lat"],nodes[j]["lon"]) <= radius_nm:
+                members.append(j)
+        for k in members: used.add(k)
+        lat = sum(nodes[k]["lat"] for k in members)/len(members)
+        lon = sum(nodes[k]["lon"] for k in members)/len(members)
+        clusters.append({"members":members,"center":(lat,lon),"radius":radius_nm,"is_hub":len(members)>=3})
+    return clusters
+
+def ring_callouts_for_hub(hub, zones: Zones):
+    """Distribui as caixas dos membros do hub num anel, evitando colisões."""
+    k=len(hub["members"])
+    center=hub["center"]
+    base = 0.0  # não interessa a orientação absoluta — vamos só distribuir
+    ring = max(1.2, 0.9 + 0.25*(k-1))  # cresce com nº de membros
+    angles=[wrap360(base + i*(360.0/k)) for i in range(k)]
+    out={}
+    for idx, ang in zip(hub["members"], angles):
+        # procura local melhor em torno do ângulo alvo
+        candidates=[]
+        for d_ang in (0, -18, +18, -36, +36, -54, +54):
+            for r_plus in (0.0, 0.3, 0.6, 0.9):
+                pt = dest_point(center[0], center[1], wrap360(ang+d_ang), ring+r_plus)
+                clr = zones.clearance(pt[0], pt[1])
+                candidates.append((clr - 0.05*r_plus - 0.01*abs(d_ang), pt))
+        best = max(candidates, key=lambda x:x[0])[1]
+        out[idx]=best
+        zones.add(best[0],best[1], ZONE_BOX_R)
+    return out
 
 # ======== STATE ========
 def ens(k, v): return st.session_state.setdefault(k, v)
@@ -191,6 +219,7 @@ ens("mag_var", 1.0); ens("mag_is_e", False)
 ens("roc_fpm", 600); ens("desc_angle", 3.0)
 ens("start_clock", ""); ens("start_efob", 85.0)
 ens("ck_default", 2)
+ens("super_declutter", True)
 ens("wps", []); ens("legs", []); ens("route_nodes", [])
 ens("map_base", "OpenTopoMap (VFR-ish)")
 ens("maptiler_key", "")
@@ -214,15 +243,17 @@ with st.form("globals"):
         st.session_state.start_efob= st.number_input("EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
         st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
         st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
-    b1,b2,b3 = st.columns([1.2,1,1])
+    b1,b2,b3,b4 = st.columns([1.2,1,1,1])
     with b1:
         bases = ["OpenTopoMap (VFR-ish)","EOX Sentinel-2 (satélite)","Esri World Imagery (satélite + labels)","Esri World TopoMap (topo)","OSM Standard","MapTiler Satellite Hybrid (requer key)"]
         st.session_state.map_base = st.selectbox("Base do mapa", bases, index=bases.index(st.session_state.map_base) if st.session_state.map_base in bases else 0)
     with b2:
         st.session_state.show_labels = st.toggle("Mostrar pílulas", value=st.session_state.show_labels)
-        st.session_state.show_ticks  = st.toggle("Mostrar riscas CP", value=st.session_state.show_ticks)
+        st.session_state.show_ticks  = st.toggle("Riscas CP", value=st.session_state.show_ticks)
     with b3:
         st.session_state.text_scale  = st.slider("Tamanho do texto", 0.9, 1.8, float(st.session_state.text_scale), 0.05)
+    with b4:
+        st.session_state.super_declutter = st.toggle("Declutter agressivo", value=st.session_state.super_declutter)
     st.form_submit_button("Aplicar")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
@@ -341,7 +372,7 @@ with tab_csv:
             )
             st.session_state.search_selected_idxs = picks
 
-            # >>> Sem verificação de duplicados: pode adicionar o mesmo fix várias vezes
+            # Permite duplicados
             def add_wp(name, lat, lon, alt):
                 st.session_state.wps.append({"name": str(name), "lat": float(lat), "lon": float(lon), "alt": float(alt)})
 
@@ -421,8 +452,7 @@ if st.session_state.wps:
             if (name,lat,lon,alt) != (w["name"],w["lat"],w["lon"],w["alt"]):
                 st.session_state.wps[i] = {"name":name,"lat":float(lat),"lon":float(lon),"alt":float(alt)}
             if st.button("Remover", key=f"delwp_{i}"):
-                st.session_state.wps.pop(i)
-                st.experimental_rerun()
+                st.session_state.wps.pop(i); st.experimental_rerun()
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ======== TOC/TOD COMO WPs ========
@@ -442,8 +472,9 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, desc_angle_deg):
                 lat_toc, lon_toc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need)
                 nodes.append({"name": f"TOC L{i+1}", "lat": lat_toc, "lon": lon_toc, "alt": B["alt"]})
         elif B["alt"] < A["alt"]:
-            rod_fpm = max(100.0, gs_de * 5.0 * (desc_angle_deg/3.0))
-            dh = A["alt"] - B["alt"]; t_need = dh / max(rod_fpm, 1); d_need = gs_de * (t_need/60.0)
+            _, _, gs_de2 = wind_triangle(tc, DESCENT_TAS, wind_from, wind_kt)
+            rod_fpm = max(100.0, gs_de2 * 5.0 * (desc_angle_deg/3.0))
+            dh = A["alt"] - B["alt"]; t_need = dh / max(rod_fpm, 1); d_need = gs_de2 * (t_need/60.0)
             if d_need < dist - 0.05:
                 pos_from_start = max(0.0, dist - d_need)
                 lat_tod, lon_tod = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], pos_from_start)
@@ -455,16 +486,13 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, desc_angle_deg):
 def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every_min):
     legs = []
     if len(nodes) < 2: return legs
-
     base_time = None
     if st.session_state.start_clock.strip():
         try:
             h,m = map(int, st.session_state.start_clock.split(":"))
             base_time = dt.datetime.combine(dt.date.today(), dt.time(h,m))
         except: base_time = None
-
-    carry_efob = float(st.session_state.start_efob)
-    t_cursor = 0
+    carry_efob = float(st.session_state.start_efob); t_cursor = 0
 
     for i in range(len(nodes)-1):
         A, B = nodes[i], nodes[i+1]
@@ -495,7 +523,7 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         t_cursor += time_sec; carry_efob = efob_end
     return legs
 
-# ======== GERAR ROTA/LEGS ========
+# ======== GERAR ========
 cgen,_ = st.columns([2,6])
 with cgen:
     if st.button("Gerar/Atualizar rota (insere TOC/TOD) ✅", type="primary", use_container_width=True):
@@ -573,15 +601,14 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         folium.TileLayer("https://{s}.tile.openstreetmap.org/{z}/{y}/{x}.png",
                          attr="© OpenStreetMap", name="OSM", overlay=False).add_to(m)
 
-    # Fullscreen
     Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
 
-    # Rota com halo
+    # rota
     for latlngs in _route_latlngs(legs):
         folium.PolyLine(latlngs, color="#ffffff", weight=10, opacity=1.0).add_to(m)
         folium.PolyLine(latlngs, color="#C000FF", weight=4, opacity=1.0).add_to(m)
 
-    # CP Ticks
+    # ticks
     if st.session_state.show_ticks:
         for L in legs:
             if L["GS"]<=0 or not L["cps"]: continue
@@ -592,29 +619,43 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
 
-    # ----- Zonas base (WPs) -----
+    # Zonas base (WPs) + hubs
     zones = Zones()
+    hubs = cluster_nodes(nodes, radius_nm=1.1)
+    node2hub = {}
+    for h_id, h in enumerate(hubs):
+        for idx in h["members"]: node2hub[idx]=h_id
+        # zona morta no centro do hub (se for mesmo hub)
+        if h["is_hub"]:
+            zones.add(h["center"][0], h["center"][1], h["radius"]+0.6)
     for N in nodes: zones.add(N["lat"], N["lon"], ZONE_WP_R)
 
-    # PÍLULAS DAS LEGS (com declutter 2D)
+    # Pílulas das legs
     if st.session_state.show_labels:
-        for L in legs:
+        for i, L in enumerate(legs):
             is_toc = str(L["A"]["name"]).startswith(("TOC","TOD")) or str(L["B"]["name"]).startswith(("TOC","TOD"))
             is_profile = L["profile"] in ("CLIMB","DESCENT")
-            must_show = is_toc or is_profile
-            min_len = LABEL_MIN_NM_NORMAL if not must_show else 0.0
-            if L["GS"]<=0 or L["time_sec"]<=0 or L["Dist"] < min_len: continue
+            super_mode = st.session_state.super_declutter
 
-            s, Lnm, Wnm, Hnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale)
+            # regras de supressão dentro do hub
+            A_idx = i
+            B_idx = i+1
+            same_hub = (A_idx in node2hub) and (B_idx in node2hub) and (node2hub[A_idx]==node2hub[B_idx]) and hubs[node2hub[A_idx]]["is_hub"]
+            min_len = LABEL_MIN_NM_NORMAL
+            if same_hub and not (is_toc or is_profile):
+                min_len = 7.0 if super_mode else 5.0
+            if L["GS"]<=0 or L["time_sec"]<=0 or L["Dist"] < min_len: 
+                continue
+
+            s, Lnm, Wnm, Hnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale, super_mode)
             label_r = ZONE_LABEL_BASE_R + 0.25*(Lnm-2.0)
-            anchor, side = choose_leg_anchor(L, zones, side_off, label_radius_nm=label_r)
-
+            anchor, _ = choose_leg_anchor(L, zones, side_off, label_radius_nm=label_r)
             poly = arrow_polygon(anchor[0], anchor[1], L["TC"], Lnm, Wnm, Hnm)
             folium.Polygon(poly, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.96).add_to(m)
             txt = f"{deg3(L['MH'])}M/{deg3(L['TC'])}T • {rint(L['GS'])}kt • {mmss(L['time_sec'])} • {L['Dist']:.1f}nm • {L['burn']:.1f}L"
             html_marker(m, anchor[0], anchor[1], rotated_text_html(txt, L["TC"], scale=s))
 
-    # WPs + nomes + ETO/EFOB (caixa com líder e busca 360°)
+    # WPs + nomes + ETO/EFOB (caixas)
     info = _wp_time_fuel(nodes, legs)
 
     def name_halo_html(text, scale=1.0):
@@ -628,6 +669,12 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                     padding:2px 6px; font-size:{fs}px; font-weight:800; color:#111; white-space:nowrap;">{text}</div>
         """
 
+    # pre-coloca caixas para hubs (anéis)
+    hub_box_pos = {}
+    for h in hubs:
+        if not h["is_hub"]: continue
+        hub_box_pos.update(ring_callouts_for_hub(h, zones))
+
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
         color = "#FF5050" if is_toc_tod else "#007AFF"
@@ -635,15 +682,18 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                             weight=2, fill=True, fill_color=color, fill_opacity=1).add_to(m)
         html_marker(m, N["lat"], N["lon"], name_halo_html(f"{idx+1}. {N['name']}", scale=float(st.session_state.text_scale)))
 
-        tc_ref = legs[idx]["TC"] if idx < len(legs) else legs[-1]["TC"]
-        best_pt = best_callout_position(N["lat"], N["lon"], preferred_brg=tc_ref+90, zones=zones)
-        # líder
-        folium.PolyLine([(N["lat"],N["lon"]), best_pt], color="#111111", weight=1.5, opacity=1).add_to(m)
+        # caixa
+        if idx in hub_box_pos:
+            bx,by = hub_box_pos[idx]
+        else:
+            tc_ref = legs[idx]["TC"] if idx < len(legs) else legs[-1]["TC"]
+            bx,by = best_callout_position(N["lat"], N["lon"], preferred_brg=tc_ref+90, zones=zones)
+            zones.add(bx,by, ZONE_BOX_R)
+
+        folium.PolyLine([(N["lat"],N["lon"]),(bx,by)], color="#111111", weight=1.5, opacity=1).add_to(m)
         eto = info[idx]["eto"] or "-"
-        efb = info[idx]["efob"]
-        efb_txt = f"{efb:.1f}L" if efb is not None else "-"
-        html_marker(m, best_pt[0], best_pt[1], box_html(f"ETO {eto} • EFOB {efb_txt}", scale=float(st.session_state.text_scale)))
-        zones.add(best_pt[0], best_pt[1], ZONE_BOX_R)
+        efb = info[idx]["efob"]; efb_txt = f"{efb:.1f}L" if efb is not None else "-"
+        html_marker(m, bx, by, box_html(f"ETO {eto} • EFOB {efb_txt}", scale=float(st.session_state.text_scale)))
 
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
