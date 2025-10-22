@@ -1,10 +1,10 @@
-# app.py — NAVLOG — rev17
-# - Pílulas SEM “setas”, texto SEMPRE horizontal (wrapper roda, conteúdo contra-roda)
-# - Barra direcional discreta por trás da pílula
-# - Removidos líderes/“espetos”; info do fix por baixo do ponto: "T+MM:SS · 83.3L"
+# app.py — NAVLOG — rev18
+# - Pílulas alinhadas com a perna; texto roda junto (vira 180° quando necessário p/ ficar legível)
+# - Fundo branco + contorno/halo p/ máxima legibilidade sobre o mapa
+# - Removidos líderes/“espetos”; info do fix por baixo do ponto: "HH:MM · 83.3L" ou "T+MM:SS · 83.3L"
 # - Sem legenda CLIMB/CRUISE/DESCENT por defeito (toggle opcional)
-# - Tamanho dos textos ajusta com o zoom (JS Leaflet -> CSS var --navlog-z + clamp)
-# - Legs coloridas por perfil
+# - Tamanho dos textos ajusta com o zoom (Leaflet -> CSS var --navlog-z + clamp)
+# - Legs coloridas por perfil; riscas de CP opcionais
 # - Seleção CSV em cards + botão ➕
 # - Permite WPs repetidos (sufixo #2, #3, …)
 
@@ -39,14 +39,17 @@ st.markdown("""
 .row{display:flex;gap:8px;align-items:center}
 .badge{font-weight:700;border:1px solid #111;border-radius:8px;padding:2px 6px;margin-right:6px}
 
-/* ===== Pílulas legíveis (wrapper roda, conteúdo fica horizontal) ===== */
+/* ===== Pílulas ALINHADAS com a perna (legíveis) ===== */
 .nav-pill-wrap{
   position: relative;
   transform: translate(-50%,-50%) rotate(var(--rot, 0deg));
   transform-origin: center center;
+  pointer-events: none;            /* não bloqueia cliques no mapa */
+  will-change: transform;
+  backface-visibility: hidden;
 }
 
-/* barra direcional discreta, alinhada com a perna (atrás do cartão) */
+/* barra direcional discreta (atrás do cartão) */
 .nav-pill-wrap::before{
   content:"";
   position:absolute; left:50%; top:50%;
@@ -55,32 +58,38 @@ st.markdown("""
   transform: translate(-50%,-50%);
 }
 
-/* cartão: mantém-se horizontal via contra-rotação, com escala opcional */
+/* cartão: roda com o wrapper (sem contra-rotação) */
 .nav-pill{ 
-  font-weight:900; color:#111; background:rgba(255,255,255,0.96);
-  padding:4px 6px; border-radius:10px; border:2px solid #111;
-  box-shadow:0 0 0 2px rgba(255,255,255,0.96);
-  line-height:1.05; letter-spacing:.2px; text-align:center; white-space:nowrap;
+  display:inline-block;
+  width:max-content;
+  white-space:nowrap;
+  transform: scale(var(--scale, 1));
 
-  -webkit-font-smoothing: antialiased; text-rendering:optimizeLegibility;
+  font-weight:900; letter-spacing:.2px; line-height:1.12; text-align:center;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-stroke: .6px #fff;     /* contorno p/ contraste (WebKit) */
+  text-shadow: 0 0 1px #fff, 0 0 2px #fff; /* fallback */
 
-  /* escala com o zoom, mas com limites */
-  font-size: clamp(11px, calc(14px * var(--navlog-z, 1)), 18px);
+  color:#111; background:#fff;
+  padding:4px 8px; border-radius:10px;
+  border:2.5px solid #000; box-shadow:0 0 0 2px #fff;
 
-  /* contra-rotação + escala */
-  transform: rotate(calc(-1 * var(--rot, 0deg))) scale(var(--scale, 1));
+  /* escala com o zoom (um pouco maior) */
+  font-size: clamp(13px, calc(16px * var(--navlog-z, 1)), 22px);
 }
 
-/* nomes e info com limites de tamanho */
+/* nomes e info dos WPs */
 .nav-wpname{
-  font-size: clamp(12px, calc(16px * var(--navlog-z, 1)), 22px); color:#111; font-weight:900;
+  font-size: clamp(13px, calc(17px * var(--navlog-z, 1)), 24px);
+  color:#111; font-weight:900;
   text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;
   white-space:nowrap;
 }
 .nav-wpinfo{
-  font-size: clamp(10px, calc(12px * var(--navlog-z, 1)), 16px); font-weight:800; color:#111;
-  background:rgba(255,255,255,0.96); border:2px solid #111; border-radius:8px;
-  padding:1px 5px; white-space:nowrap;
+  font-size: clamp(11px, calc(13px * var(--navlog-z, 1)), 17px);
+  font-weight:800; color:#111; background:#fff;
+  border:2px solid #111; border-radius:8px; padding:1px 6px; white-space:nowrap;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -137,6 +146,14 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
 def _nm_dist(a,b): return gc_dist_nm(a[0],a[1],b[0],b[1])
+
+def upright_angle(angle_deg: float) -> float:
+    """
+    Alinha com a perna, mas evita texto invertido.
+    Se o rumo está entre 90° e 270°, soma 180°.
+    """
+    a = wrap360(angle_deg)
+    return a if abs(angdiff(a, 0)) <= 90 else wrap360(a + 180)
 
 # ======== STATE ========
 def ens(k, v): return st.session_state.setdefault(k, v)
@@ -257,8 +274,7 @@ def make_unique_name(name: str) -> str:
     if name not in names:
         return name
     k = 2
-    while f"{name} #{k}" in names:
-        k += 1
+    while f"{name} #{k}" in names: k += 1
     return f"{name} #{k}"
 
 def append_wp(name: str, lat: float, lon: float, alt: float) -> None:
@@ -496,22 +512,22 @@ if st.session_state.legs:
     )
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== LABEL ENGINE (sem setas, só “placas”) ========
+# ======== LABEL ENGINE ========
 LABEL_MIN_NM_NORMAL = 0.3
 ZONE_WP_R, ZONE_LABEL_BASE_R = 0.85, 1.0
-LABEL_MIN_CLEAR = 0.8  # ligeiro aumento para reduzir overlaps
+LABEL_MIN_CLEAR = 0.85  # ligeiro aumento para reduzir overlaps
 
 def html_marker(m, lat, lon, html):
     folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
 
 def pill_html(line1, line2, angle_deg, scale=1.0):
-    # wrapper roda com a perna; conteúdo contra-roda e mantém-se horizontal.
+    # Wrapper roda com a perna; conteúdo NÃO contra-roda (texto fica inclinado).
     return f"""
     <div class="nav-pill-wrap" style="--rot:{angle_deg}deg">
-        <div class="nav-pill" style="--rot:{angle_deg}deg; --scale:{scale}">
-            <div>{line1}</div>
-            <div>{line2}</div>
-        </div>
+      <div class="nav-pill" style="--scale:{scale}">
+        <div>{line1}</div>
+        <div>{line2}</div>
+      </div>
     </div>
     """
 
@@ -611,7 +627,8 @@ class ZoomScaler(MacroElement):
     var map = {{this._parent.get_name()}};
     function navlogSetScale(){
       var z = map.getZoom();
-      var s = Math.max(0.6, Math.min(1.6, 0.6 + (z-6)*0.14)); // z=6→0.6, z=12→1.44
+      // escala um pouco mais agressiva para melhorar legibilidade em zooms baixos
+      var s = Math.max(0.8, Math.min(1.9, 0.8 + (z-6)*0.18));
       document.documentElement.style.setProperty('--navlog-z', s);
     }
     map.on('zoomend', navlogSetScale); navlogSetScale();
@@ -647,7 +664,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         folium.TileLayer(f"https://api.maptiler.com/maps/hybrid/256/{{z}}/{{x}}/{{y}}.jpg?key={maptiler_key}",
                          attr="© MapTiler", name="MapTiler Hybrid", overlay=False).add_to(m)
     else:
-        folium.TileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        folium.TileLayer("https://{s}.tile.openstreetmap.org/{z}/{y}/{x}.png",
                          attr="© OpenStreetMap", name="OSM", overlay=False).add_to(m)
 
     # halo + cor por perfil
@@ -683,7 +700,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
     for N in nodes: zones.add(N["lat"], N["lon"], ZONE_WP_R)
     for L in legs:  zones.add_leg_corridor(L["A"], L["B"])
 
-    # pílulas (placas) — SEM setas, texto horizontal
+    # pílulas (placas) — ALINHADAS com a perna
     if st.session_state.show_labels:
         prev_side=None
         for idx, L in enumerate(legs):
@@ -691,14 +708,26 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
             # tamanho relativo à distância e ao slider
             base = min(1.25, max(0.85, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
-            side_off = min(2.2, max(1.1, 1.10*s))
-            label_r = ZONE_LABEL_BASE_R + 0.40*(s-1.0)  # ligeiro aumento
-            prefer = preferred_side_outside_turn(legs, idx) or prev_side
+
+            # afastamento e raio de colisão
+            side_off = min(2.8, max(1.6, 1.20*s))
+            label_r  = ZONE_LABEL_BASE_R + 0.45*(s-1.0)
+            prefer   = preferred_side_outside_turn(legs, idx) or prev_side
             anchor, side = choose_anchor_teimoso(L, zones, side_off, label_r, prefer=prefer)
             prev_side = side
+
+            # ângulo que mantém o texto legível (vira +180° quando preciso)
+            rot = upright_angle(L["TC"])
+
+            # linhas com NBSP para não quebrar tokens
             line1 = f"{deg3(L['MH'])}M / {deg3(L['TC'])}T"
-            line2 = f"{rint(L['GS'])} kt · {mmss(L['time_sec'])} · {L['Dist']:.1f} nm · {L['burn']:.1f} L"
-            html_marker(m, anchor[0], anchor[1], pill_html(line1, line2, L["TC"], scale=s))
+            line2 = (
+                f"{rint(L['GS'])}&nbsp;kt · "
+                f"{mmss(L['time_sec'])} · "
+                f"{L['Dist']:.1f}&nbsp;nm · "
+                f"{L['burn']:.1f}&nbsp;L"
+            )
+            html_marker(m, anchor[0], anchor[1], pill_html(line1, line2, rot, scale=s))
 
     # nomes e info por baixo do fix (sem líder)
     info = _wp_time_fuel(nodes, legs)
