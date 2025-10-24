@@ -1,25 +1,16 @@
 # app.py — NAVLOG — rev17
-# Objetivo:
-# 1) “Fixes” com info compacta e limpa, sem leader-lines:
-#       EX.:  LPSO
-#             84L • 10:05
-#             81L • 11:30
-#    - Se o ponto for visitado várias vezes, novas linhas em ordem cronológica.
-# 2) “Dog houses” mais legíveis:
-#    - Conteúdo em 3 linhas (menos largura).
-#    - Declutter agressivo (empurra/outboard + desliza ao longo da perna).
-#    - Escala DINÂMICA com o zoom do mapa (não só o texto).
-#    - Toggle para desligar as dog houses; nesse modo mostram-se setas “›” ao longo da perna.
-# 3) Pernas repetidas (ida/volta) renderizadas com deslocamento lateral (sem alterar cálculos).
-# 4) UI da pesquisa CSV simplificada (apenas botão ➕ por card).
-# 5) Removida qualquer legenda/caixa desnecessária no mapa.
+# Novidades:
+# - Fix label compacto no próprio ponto: "NOME" + linhas "xL • hh:mm" (acumula visitas por ordem cronológica)
+# - Dog houses multi-linha (declutter) + tamanho dependente de zoom e slider
+# - Toggle "Mostrar dog houses" → se OFF desenha setas ">" alinhadas à leg
+# - Pernas repetidas continuam deslocadas (render-only); ticks/chevrons/dog houses seguem a geometria deslocada
+# - Removidos leader-lines e caixas ETO/EFOB junto aos WPs; legenda CLIMB/CRUISE/DESCENT não é mostrada
 
 import streamlit as st
 import pandas as pd
 import folium, math, re, datetime as dt, difflib
 from streamlit_folium import st_folium
-from folium.plugins import Fullscreen, PolyLineTextPath
-from branca.element import MacroElement, Template
+from folium.plugins import Fullscreen
 from math import degrees
 
 # ======== CONSTANTES ========
@@ -33,8 +24,7 @@ PROFILE_COLORS = {
     "DESCENT": "#00B386",  # verde água
 }
 
-# deslocamento visual para pernas repetidas
-REPEAT_LEG_BASE_OFFSET_NM = 0.35  # 0.35 nm por “nível” de repetição
+REPEAT_LEG_BASE_OFFSET_NM = 0.35  # afastamento visual entre duas pernas no mesmo eixo
 
 # ======== PAGE / STYLE ========
 st.set_page_config(page_title="NAVLOG", layout="wide", initial_sidebar_state="collapsed")
@@ -50,29 +40,6 @@ st.markdown("""
 .small{font-size:12px;color:#555}
 .row{display:flex;gap:8px;align-items:center}
 .badge{font-weight:700;border:1px solid #111;border-radius:8px;padding:2px 6px;margin-right:6px}
-
-/* Fix labels (stack acima do ponto) */
-.nav-fixstack{
-  transform: translate(-50%,-110%); /* acima do ponto, sem “perna”/leader */
-  background: rgba(255,255,255,0.96);
-  border: 2px solid #111; border-radius: 10px;
-  padding: 4px 6px; color:#111; font-weight:900; line-height:1.1; letter-spacing:.2px;
-  box-shadow: 0 0 0 2px rgba(255,255,255,0.96);
-  white-space:nowrap; text-align:center;
-}
-.nav-fixstack .title{font-size:16px}
-.nav-fixstack .visit{font-size:13px}
-
-/* Doghouse base (tamanho será reajustado por JS ao fazer zoom) */
-.nav-doghouse{
-  transform: translate(-50%,-50%);  /* rotação é adicionada inline; a escala é aplicada por JS */
-  transform-origin: center center;
-  font-weight:900; color:#111;
-  background: rgba(255,255,255,0.96); padding:4px 6px;
-  border-radius:10px; border:2px solid #111;
-  box-shadow:0 0 0 2px rgba(255,255,255,0.96);
-  line-height:1.05; letter-spacing:.2px; text-align:center; white-space:nowrap;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -141,11 +108,12 @@ ens("roc_fpm", 600); ens("desc_angle", 3.0)
 ens("start_clock", ""); ens("start_efob", 85.0)
 ens("ck_default", 2)
 ens("force_all_labels", True)
-ens("show_doghouses", True)      # <— toggle novo
 ens("wps", []); ens("legs", []); ens("route_nodes", [])
 ens("map_base", "OpenTopoMap (VFR-ish)")
 ens("maptiler_key", "")
 ens("show_labels", True); ens("show_ticks", True); ens("text_scale", 1.25)
+ens("show_doghouses", True)           # <— novo
+ens("map_zoom", 8)                    # <— usado para escalar as dog houses
 ens("db_points", None); ens("qadd", ""); ens("alt_qadd", 3000.0)
 ens("search_rows", []); ens("last_q", "")
 
@@ -165,16 +133,17 @@ with st.form("globals"):
         st.session_state.start_efob= st.number_input("EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
         st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
         st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
-    b1,b2,b3,b4 = st.columns([1.6,1.1,1.1,1.2])
+    b1,b2,b3,b4 = st.columns([1.4,1.2,1,1])
     with b1:
         bases = ["OpenTopoMap (VFR-ish)","EOX Sentinel-2 (satélite)","Esri World Imagery (satélite + labels)","Esri World TopoMap (topo)","OSM Standard","MapTiler Satellite Hybrid (requer key)"]
         st.session_state.map_base = st.selectbox("Base do mapa", bases, index=bases.index(st.session_state.map_base) if st.session_state.map_base in bases else 0)
     with b2:
         st.session_state.show_doghouses = st.toggle("Mostrar dog houses", value=st.session_state.show_doghouses)
+        st.session_state.show_labels = st.toggle("Mostrar pílulas (texto)", value=st.session_state.show_labels)
     with b3:
         st.session_state.show_ticks  = st.toggle("Mostrar riscas CP", value=st.session_state.show_ticks)
     with b4:
-        st.session_state.text_scale  = st.slider("Tamanho do texto (global)", 0.9, 1.8, float(st.session_state.text_scale), 0.05)
+        st.session_state.text_scale  = st.slider("Tamanho do texto", 0.9, 1.8, float(st.session_state.text_scale), 0.05)
     st.form_submit_button("Aplicar")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
@@ -415,7 +384,6 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
     carry_efob = float(st.session_state.start_efob)
     t_cursor = 0
 
-    # contar repetições de pares (independente do sentido)
     pair_counts = {}
 
     for i in range(len(nodes)-1):
@@ -441,9 +409,9 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
                 cps.append({"t":t,"min":int(t/60),"nm":round(d,1),"eto":eto})
                 k+=1
 
-        # ===== deslocamento visual p/ pernas repetidas =====
+        # deslocamento visual p/ pernas repetidas
         key = tuple(sorted([_basename(A.get("name")), _basename(B.get("name"))]))
-        occ = pair_counts.get(key, 0)   # 0 para a 1ª ocorrência => sem deslocamento
+        occ = pair_counts.get(key, 0)
         pair_counts[key] = occ + 1
         render_off_nm = 0.0
         render_side = 0
@@ -496,25 +464,30 @@ if st.session_state.legs:
     )
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== LABEL ENGINE ========
+# ======== LABEL ENGINE / UI ========
 LABEL_MIN_NM_NORMAL = 0.2
 CP_TICK_HALF        = 0.38
 ZONE_WP_R           = 0.85
-ZONE_FIXSTACK_R     = 0.95
 ZONE_LABEL_BASE_R   = 1.0
 LABEL_MIN_CLEAR     = 0.7
 
 def html_marker(m, lat, lon, html):
     folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
 
-def rotated_dog_html(lines, angle_deg):
-    # 3 linhas, mais estreito; escala dinâmica por JS com classe .nav-doghouse
-    l1, l2, l3 = lines
+def doghouse_html(lines, angle_deg, scale=1.0):
+    fs = int(14*scale)
+    # até 4-5 linhas curtas
+    inner = "".join([f"<div style='white-space:nowrap'>{ln}</div>" for ln in lines])
     return f"""
-    <div class="nav-doghouse" style="transform: translate(-50%,-50%) rotate({angle_deg}deg);" data-base-transform="translate(-50%,-50%) rotate({angle_deg}deg)">
-        <div style="font-size:15px;font-weight:900">{l1}</div>
-        <div style="font-size:13px;font-weight:900">{l2}</div>
-        <div style="font-size:13px;font-weight:900">{l3}</div>
+    <div style="
+        transform: translate(-50%,-50%) rotate({angle_deg}deg);
+        transform-origin:center center;
+        font-size:{fs}px; font-weight:900; color:#111;
+        background: rgba(255,255,255,0.96); padding:4px 6px;
+        border-radius:10px; border:2px solid #111;
+        box-shadow:0 0 0 2px rgba(255,255,255,0.96);
+        line-height:1.05; letter-spacing:.2px; text-align:center;">
+        {inner}
     </div>
     """
 
@@ -530,13 +503,15 @@ def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head
     NR = lat_off(neck_lat, neck_lon, +1, half)
     return [BL, NL, (F_lat, F_lon), NR, BR, BL]
 
-def dynamic_label_params(dist_nm, global_scale):
+def dynamic_label_params(dist_nm, global_scale, zoom):
+    # escala com distância e zoom (8 ~ referência)
+    zf = max(0.6, min(1.6, (zoom/8.0)**0.95))
     base = min(1.25, max(0.85, dist_nm/7.0))
-    s = base * float(global_scale)
-    L = min(2.8, max(2.0, 2.2*s))
-    W = min(0.85, max(0.55, 0.60*s))
+    s = base * float(global_scale) * zf
+    L = min(2.9, max(2.0, 2.2*s))
+    W = min(0.95, max(0.55, 0.60*s))
     H = min(0.70, max(0.45, 0.48*s))
-    side_off = min(2.2, max(1.1, 1.10*s))
+    side_off = min(2.3, max(1.1, 1.10*s))
     return s, L, W, H, side_off
 
 class Zones:
@@ -545,12 +520,6 @@ class Zones:
     def clearance(self, lat, lon):
         if not self.z: return 9e9
         return min(_nm_dist((lat,lon),(a,b)) - r for a,b,r in self.z)
-    def fit_anchor(self, base_lat, base_lon, normal_bearing, step_nm=0.22, max_iter=8):
-        lat, lon = base_lat, base_lon
-        i=0
-        while self.clearance(lat,lon) < LABEL_MIN_CLEAR and i<max_iter:
-            lat, lon = dest_point(lat, lon, normal_bearing, step_nm); i+=1
-        return (lat,lon), i
     def add_leg_corridor(self, A, B, spacing_nm=0.9, r_nm=0.38):
         dist = _nm_dist((A["lat"],A["lon"]), (B["lat"],B["lon"]))
         if dist <= spacing_nm: return
@@ -564,19 +533,55 @@ def _leg_endpoints(L, rendered=True):
         return L["A_r"], L["B_r"]
     return {"lat":L["A"]["lat"], "lon":L["A"]["lon"]}, {"lat":L["B"]["lat"], "lon":L["B"]["lon"]}
 
-def label_candidates(L, side_off):
-    A_v, B_v = _leg_endpoints(L, rendered=True)
-    cands=[]
-    fracs = (0.22,0.34,0.46,0.58,0.70,0.82) if L["Dist"] >= 6.0 else (0.30,0.50,0.70)
-    lateral = (side_off, side_off+0.35, side_off+0.7, side_off+1.1, side_off+1.5)
-    for frac in fracs:
-        base_d = max(0.35, min(L["Dist"]-0.35, L["Dist"]*frac))
-        base = point_along_gc(A_v["lat"], A_v["lon"], B_v["lat"], B_v["lon"], base_d)
-        for side in (-1, +1):
-            for off in lateral:
-                anchor = dest_point(base[0], base[1], L["TC"]+90*side, off)
-                cands.append((anchor, side, off))
-    return cands
+# ======== WPs: LABEL COM VISITAS ACUMULADAS ========
+def _wp_time_fuel(nodes, legs):
+    info = [{"eto": None, "efob": None} for _ in nodes]
+    if not legs: return info
+    info[0]["eto"]  = legs[0]["clock_start"]
+    info[0]["efob"] = legs[0]["efob_start"]
+    for i in range(1, len(nodes)):
+        Lprev = legs[i-1]
+        info[i]["eto"]  = Lprev["clock_end"]
+        info[i]["efob"] = Lprev["efob_end"]
+    return info
+
+def _is_toc_tod(name:str) -> bool:
+    return str(name).startswith(("TOC","TOD"))
+
+def build_fix_visit_labels(nodes, legs):
+    """Agrupa visitas em cada FIX e devolve {key: {name, lat, lon, lines:[...]}}"""
+    info = _wp_time_fuel(nodes, legs)
+    grouped = {}
+    for idx, N in enumerate(nodes):
+        if _is_toc_tod(N["name"]):  # só fixes “reais”
+            continue
+        key = (round(N["lat"],6), round(N["lon"],6), _basename(N["name"]))
+        if key not in grouped:
+            grouped[key] = {"name": _basename(N["name"]), "lat": N["lat"], "lon": N["lon"], "lines":[]}
+        eto  = info[idx]["eto"]; efb = info[idx]["efob"]
+        if efb is not None:
+            grouped[key]["lines"].append(f"{efb:.1f}L • {eto or '-'}")
+        else:
+            grouped[key]["lines"].append(f"— • {eto or '-'}")
+    return list(grouped.values())
+
+def fix_label_html(name, visit_lines, scale=1.0):
+    fs_name = int(16*scale)
+    fs_line = int(13*scale)
+    body = "".join([f"<div style='font-size:{fs_line}px;white-space:nowrap'>{ln}</div>" for ln in visit_lines])
+    return f"""
+    <div style="transform:translate(-50%,-105%); text-align:center;
+                color:#111; font-weight:900; text-shadow:
+                -1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;">
+        <div style="font-size:{fs_name}px; white-space:nowrap">{name}</div>
+        {body}
+    </div>
+    """
+
+# ======== MAPA ========
+def _bounds_from_nodes(nodes):
+    lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
+    return [(min(lats),min(lons)), (max(lats),max(lons))]
 
 def preferred_side_outside_turn(legs, idx_leg, thr=12):
     if idx_leg < 0 or idx_leg >= len(legs)-1: return None
@@ -586,105 +591,18 @@ def preferred_side_outside_turn(legs, idx_leg, thr=12):
     if turn < -thr: return -1
     return None
 
-def choose_anchor_teimoso(L, zones: Zones, side_off, label_radius_nm, prefer=None):
-    sides_order = []
-    if prefer in (-1,+1): sides_order = [prefer, -prefer]
-    else:                  sides_order = [+1, -1]
-
-    base_cands = label_candidates(L, side_off)
-
-    def try_place_at(anchor_lat, anchor_lon, side, max_out_nm=6.0):
-        normal = L["TC"] + 90*side
-        lat,lon = anchor_lat, anchor_lon
-        steps = int(max_out_nm/0.25)
-        for _ in range(steps):
-            if zones.clearance(lat,lon) >= LABEL_MIN_CLEAR:
-                zones.add(lat,lon,label_radius_nm); return (lat,lon), side, True
-            lat,lon = dest_point(lat,lon, normal, 0.25)
-        for along in (0.4, 0.8, 1.2, 1.6, 2.2):
-            p = dest_point(anchor_lat, anchor_lon, L["TC"], along)
-            lat,lon = p
-            for _ in range(steps):
-                if zones.clearance(lat,lon) >= LABEL_MIN_CLEAR:
-                    zones.add(lat,lon,label_radius_nm); return (lat,lon), side, True
-                lat,lon = dest_point(lat,lon, normal, 0.25)
-            p = dest_point(anchor_lat, anchor_lon, wrap360(L["TC"]+180), along)
-            lat,lon = p
-            for _ in range(steps):
-                if zones.clearance(lat,lon) >= LABEL_MIN_CLEAR:
-                    zones.add(lat,lon,label_radius_nm); return (lat,lon), side, True
-                lat,lon = dest_point(lat,lon, normal, 0.25)
-        return (anchor_lat, anchor_lon), side, False
-
-    for side in sides_order:
-        cands_side = [c for c in base_cands if c[1]==side] + [c for c in base_cands if c[1]!=side]
-        cands_side.sort(key=lambda c: zones.clearance(c[0][0], c[0][1]), reverse=True)
-        for (anchor, s, _off) in cands_side:
-            (lat,lon), s2, ok = try_place_at(anchor[0], anchor[1], side)
-            if ok: return (lat,lon), s2
-
-    for k in range(6, 16):
-        extra = k*0.4
-        for side in sides_order:
-            A_v,B_v = _leg_endpoints(L, rendered=True)
-            mid = point_along_gc(A_v["lat"], A_v["lon"], B_v["lat"], B_v["lon"], 0.5*L["Dist"])
-            anchor = dest_point(mid[0], mid[1], L["TC"]+90*side, side_off+extra)
-            (lat,lon), s2, ok = try_place_at(anchor[0], anchor[1], side, max_out_nm=6.0)
-            if ok: return (lat,lon), s2
-
-    A_v,B_v = _leg_endpoints(L, rendered=True)
-    mid = point_along_gc(A_v["lat"], A_v["lon"], B_v["lat"], B_v["lon"], 0.5*L["Dist"])
-    anchor = dest_point(mid[0], mid[1], L["TC"]+90, side_off+6.0)
-    zones.add(anchor[0], anchor[1], max(label_radius_nm, 1.4))
-    return (anchor[0], anchor[1]), +1
-
-# ==== VISITAS POR FIX ====
-def _visits_by_fix(nodes, legs):
-    """
-    Consolida passagens por cada fix (mesma “base” de nome), em ordem cronológica:
-    { 'LPSO': {'lat':..., 'lon':..., 'lines': [ ('84L','10:05'), ('81L','11:30') ] }, ... }
-    """
-    visits = {}
-    def add_visit(node_idx, efob, eto):
-        nm_full = nodes[node_idx]["name"]; base = _basename(nm_full)
-        lat,lon = nodes[node_idx]["lat"], nodes[node_idx]["lon"]
-        if base not in visits:
-            visits[base] = {"lat":lat,"lon":lon,"lines":[]}
-        visits[base]["lines"].append((f"{rint(efob)}L", eto or "-"))
-
-    if not nodes or not legs: return visits
-    # 1ª passagem no WP0
-    add_visit(0, legs[0]["efob_start"], legs[0]["clock_start"])
-    # passagens nos seguintes (fim de cada perna)
-    for i in range(1, len(nodes)):
-        Lprev = legs[i-1]
-        add_visit(i, Lprev["efob_end"], Lprev["clock_end"])
-    return visits
-
-def fixstack_html(title, lines):
-    # title em cima, depois cada visita “xL • hh:mm”
-    visits_html = "".join([f"<div class='visit'>{l} • {t}</div>" for (l,t) in lines])
-    return f"""
-    <div class="nav-fixstack">
-      <div class="title">{title}</div>
-      {visits_html}
-    </div>
-    """
-
-# ======== MAPA ========
-def _bounds_from_nodes(nodes):
-    lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
-    return [(min(lats),min(lons)), (max(lats),max(lons))]
-
 def render_map(nodes, legs, base_choice, maptiler_key=""):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**.")
         return
 
+    # centro e zoom de referência
     mean_lat = sum(n["lat"] for n in nodes)/len(nodes)
     mean_lon = sum(n["lon"] for n in nodes)/len(nodes)
-    m = folium.Map(location=[mean_lat, mean_lon], zoom_start=8, tiles=None, control_scale=True, prefer_canvas=True)
+    m = folium.Map(location=[mean_lat, mean_lon], zoom_start=st.session_state.map_zoom,
+                   tiles=None, control_scale=True, prefer_canvas=True)
 
+    # camadas de base
     if base_choice == "EOX Sentinel-2 (satélite)":
         folium.TileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
                          attr="© EOX Sentinel-2", name="Sentinel-2", overlay=False).add_to(m)
@@ -710,22 +628,15 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
 
     Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
 
-    # Pernas — usar geometria deslocada quando existir
-    polylines_for_arrows = []
+    # Desenho das pernas (usar geometria deslocada)
     for L in legs:
         A_v, B_v = _leg_endpoints(L, rendered=True)
         latlngs = [(A_v["lat"],A_v["lon"]), (B_v["lat"],B_v["lon"])]
         color = PROFILE_COLORS.get(L["profile"], "#C000FF")
         folium.PolyLine(latlngs, color="#ffffff", weight=10, opacity=1.0).add_to(m)
-        pl = folium.PolyLine(latlngs, color=color, weight=4, opacity=1.0).add_to(m)
-        polylines_for_arrows.append((pl, L))
+        folium.PolyLine(latlngs, color=color, weight=4, opacity=1.0).add_to(m)
 
-    # Se doghouses estiverem desligadas, colocar setas “›” alinhadas com a direção
-    if not st.session_state.show_doghouses:
-        for pl, L in polylines_for_arrows:
-            PolyLineTextPath(pl, '›', repeat=True, offset=12, attributes={'font-weight':'900', 'font-size':'18'}).add_to(m)
-
-    # CP ticks (independentes de doghouses)
+    # Ticks CP
     if st.session_state.show_ticks:
         for L in legs:
             if L["GS"]<=0 or not L["cps"]: continue
@@ -737,77 +648,87 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
 
-    # Zonas base para declutter (WPs, corredores de perna e fixstacks)
+    # Zonas para declutter das dog houses
     zones = Zones()
-    for N in nodes:
-        zones.add(N["lat"], N["lon"], ZONE_WP_R)
     for L in legs:
         A_v, B_v = _leg_endpoints(L, rendered=True)
         zones.add_leg_corridor(A_v, B_v)
 
-    # Pílulas/doghouses das pernas (com 3 linhas, escala dinâmica via JS)
-    if st.session_state.show_labels and st.session_state.show_doghouses:
+    # Dog houses (multi-linha) OU setas
+    zoom = st.session_state.map_zoom
+    if st.session_state.show_doghouses and st.session_state.show_labels:
         prev_side = None
         for idx, L in enumerate(legs):
-            if L["Dist"] < (0.0 if st.session_state.force_all_labels else LABEL_MIN_NM_NORMAL):
+            if L["Dist"] < LABEL_MIN_NM_NORMAL:  # ainda assim evita mini-pílulas
                 continue
-            _s, Lnm, Wnm, Hnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale)
-            label_r = ZONE_LABEL_BASE_R + 0.30*(Lnm-2.0)
-            prefer = preferred_side_outside_turn(legs, idx) or prev_side
-            anchor, side = choose_anchor_teimoso(L, zones, side_off, label_r, prefer=prefer)
-            prev_side = side
+            s, Lnm, Wnm, Hnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale, zoom)
+            label_r = ZONE_LABEL_BASE_R + 0.25*(Lnm-2.0)
 
-            # nova disposição em 3 linhas (mais estreito)
-            line1 = f"{deg3(L['MH'])}M / {deg3(L['TC'])}T"
-            line2 = f"{rint(L['GS'])} kt • {mmss(L['time_sec'])}"
-            line3 = f"{L['Dist']:.1f} nm • {L['burn']:.1f} L"
-            html_marker(m, anchor[0], anchor[1], rotated_dog_html((line1,line2,line3), L["TC"]))
+            # candidato: meio-da-perna deslocado para o lado preferido da curva
+            prefer = preferred_side_outside_turn(legs, idx) or prev_side or +1
+            A_v, B_v = _leg_endpoints(L, rendered=True)
+            mid = point_along_gc(A_v["lat"],A_v["lon"],B_v["lat"],B_v["lon"], 0.50*L["Dist"])
+            anchor = dest_point(mid[0], mid[1], L["TC"] + 90*prefer, side_off)
+            if zones.clearance(anchor[0], anchor[1]) < LABEL_MIN_CLEAR:
+                # empurra um pouco para fora se estiver apertado
+                for extra in (0.4,0.8,1.2,1.6,2.0):
+                    cand = dest_point(anchor[0], anchor[1], L["TC"] + 90*prefer, extra)
+                    if zones.clearance(cand[0], cand[1]) >= LABEL_MIN_CLEAR:
+                        anchor = cand; break
+            zones.add(anchor[0], anchor[1], label_r)
+            prev_side = prefer
 
-    # FIX STACKS (sem “perna”): LPSO + linhas xL • hh:mm em ordem cronológica
-    fix_vis = _visits_by_fix(nodes, legs)
-    for base_name, data in fix_vis.items():
-        lat,lon = data["lat"], data["lon"]
-        # marcador do ponto
-        folium.CircleMarker((lat,lon), radius=6, color="#FFFFFF",
+            # linhas curtas (declutter)
+            lines = [
+                f"{deg3(L['MH'])}M | {deg3(L['TC'])}T",
+                f"{rint(L['GS'])} kt",
+                f"{mmss(L['time_sec'])} | {L['Dist']:.1f} nm",
+                f"{L['burn']:.1f} L"
+            ]
+
+            # polígono + HTML
+            poly = arrow_polygon(anchor[0], anchor[1], L["TC"], Lnm, Wnm, Hnm)
+            folium.Polygon(poly, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.97).add_to(m)
+            html_marker(m, anchor[0], anchor[1], doghouse_html(lines, L["TC"], scale=s))
+
+    elif not st.session_state.show_doghouses:
+        # modo SETAS ">" distribuídas ao longo da perna
+        for L in legs:
+            A_v, B_v = _leg_endpoints(L, rendered=True)
+            count = max(2, int(L["Dist"]/8)+1)
+            for k in range(1, count):
+                d = L["Dist"]*k/(count)
+                latm, lonm = point_along_gc(A_v["lat"],A_v["lon"],B_v["lat"],B_v["lon"], d)
+                # HTML seta
+                fs = int(18 * st.session_state.text_scale * max(0.8, min(1.4, zoom/8.0)))
+                html = f"""<div style="transform:translate(-50%,-50%) rotate({L['TC']}deg);
+                                      font-size:{fs}px;font-weight:900;color:#111;
+                                      text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff">></div>"""
+                html_marker(m, latm, lonm, html)
+
+    # FIXES: marcador + etiqueta compacta com TODAS as visitas
+    fix_labels = build_fix_visit_labels(nodes, legs)
+    used_keys=set()
+    for f in fix_labels:
+        key=(round(f["lat"],6),round(f["lon"],6),f["name"])
+        if key in used_keys: continue
+        used_keys.add(key)
+        # ponto
+        folium.CircleMarker((f["lat"],f["lon"]), radius=6, color="#FFFFFF",
                             weight=2, fill=True, fill_color="#007AFF", fill_opacity=1).add_to(m)
-        html_marker(m, lat, lon, fixstack_html(base_name, data["lines"]))
-        zones.add(lat, lon, ZONE_FIXSTACK_R)  # reserva espaço p/ declutter das doghouses
+        # etiqueta sem leader, por cima do ponto
+        html_marker(m, f["lat"], f["lon"], fix_label_html(f["name"], f["lines"], scale=float(st.session_state.text_scale)))
 
-    # Auto-ajuste de bounds
+    # enquadramento
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
 
-    # ===== JS: ESCALA DINÂMICA DAS DOGHOUSES E FIXSTACKS COM O ZOOM =====
-    zoom_macro = Template("""
-    {% macro script(this, kwargs) %}
-    (function(){
-      var map = {{this._parent.get_name()}};
-      function rescale(){
-        var z = map.getZoom();
-        // base em z=8 → s≈0.75; cresce ~9% por nível; clamp 0.7..1.9
-        var s = Math.max(0.70, Math.min(1.90, 0.75 + 0.09*(z-8)));
-        // doghouses
-        document.querySelectorAll('.nav-doghouse').forEach(function(el){
-          var base = el.getAttribute('data-base-transform') || el.style.transform || '';
-          el.style.transform = base + ' scale(' + s + ')';
-        });
-        // fixstacks: apenas font-size (mantém caixa estável)
-        document.querySelectorAll('.nav-fixstack .title').forEach(function(el){
-          el.style.fontSize = (16*s).toFixed(0) + 'px';
-        });
-        document.querySelectorAll('.nav-fixstack .visit').forEach(function(el){
-          el.style.fontSize = (13*s).toFixed(0) + 'px';
-        });
-      }
-      map.on('zoomend', rescale);
-      rescale();
-    })();
-    {% endmacro %}
-    """)
-    macro = MacroElement(); macro._template = zoom_macro
-    m.get_root().add_child(macro)
-
-    st_folium(m, width=None, height=760)
+    # render e captar o zoom atual (para próxima iteração ajustar tamanho)
+    out = st_folium(m, width=None, height=760)
+    try:
+        if isinstance(out, dict) and "zoom" in out and isinstance(out["zoom"], (int,float)):
+            st.session_state.map_zoom = int(out["zoom"])
+    except: pass
 
 # ---- render ----
 if st.session_state.wps and st.session_state.route_nodes and st.session_state.legs:
@@ -817,5 +738,6 @@ elif st.session_state.wps:
     st.info("Carrega em **Gerar/Atualizar rota** para inserir TOC/TOD e criar as legs.")
 else:
     st.info("Adiciona pelo menos 2 waypoints.")
+
 
 
