@@ -1,9 +1,13 @@
-# app.py — NAVLOG — rev16
-# Alterações:
-# - Pesquisa CSV: remover checkboxes e ação "Adicionar selecionados" (fica só o botão ➕ por linha)
-# - Evitar sobreposição de pernas repetidas (ex.: ida/volta no mesmo troço) com deslocamento lateral na renderização
-# - Ticks CP e pílulas passam a considerar a geometria deslocada quando existir
-# - Remover a legenda "CLIMB / CRUISE / DESCENT" do mapa
+# app.py — NAVLOG — rev17
+# Alterações desta revisão:
+# - "Limpar UI" nos WPs: cada fix mostra um rótulo compacto com:
+#       <NOME>
+#       <EFOB>L • <HH:MM>
+#   Ex.:  LPSO  /  83.1L • 12:34
+# - Sem a “perna” (linha) a ligar o WP ao rótulo; o grupo (nome+info) é colocado
+#   perto do WP, no lado mais desimpedido (usa o motor de zonas).
+# - Mantidas as melhorias anteriores: sem checkboxes nos resultados CSV e
+#   deslocamento visual de pernas repetidas para evitar sobreposição.
 
 import streamlit as st
 import pandas as pd
@@ -525,7 +529,6 @@ class Zones:
             lat, lon = dest_point(lat, lon, normal_bearing, step_nm); i+=1
         return (lat,lon), i
     def add_leg_corridor(self, A, B, spacing_nm=0.9, r_nm=0.38):
-        # A e B são dicts com lat/lon (podem já ser deslocados)
         dist = _nm_dist((A["lat"],A["lon"]), (B["lat"],B["lon"]))
         if dist <= spacing_nm: return
         steps = max(2, int(dist/spacing_nm))
@@ -612,6 +615,22 @@ def choose_anchor_teimoso(L, zones: Zones, side_off, label_radius_nm, prefer=Non
     zones.add(anchor[0], anchor[1], max(label_radius_nm, 1.4))
     return (anchor[0], anchor[1]), +1
 
+# ------- W P  R Ó T U L O   C O M P A C T O -------
+def wp_compact_html(name, efob, eto, scale=1.0):
+    fs1 = int(15*scale)      # nome
+    fs2 = int(13*scale)      # info
+    info = f"{efob:.1f}L • {eto}" if (efob is not None and eto) else (
+           f"{efob:.1f}L" if efob is not None else (eto or "-"))
+    return f"""
+    <div style="transform:translate(-50%,-50%);
+                background:rgba(255,255,255,0.96); border:2px solid #111;
+                border-radius:12px; padding:4px 8px; color:#111;
+                box-shadow:0 0 0 2px rgba(255,255,255,0.96); text-align:center">
+        <div style="font-weight:900;font-size:{fs1}px;line-height:1.05;white-space:nowrap">{name}</div>
+        <div style="font-weight:800;font-size:{fs2}px;opacity:.95;white-space:nowrap">{info}</div>
+    </div>
+    """
+
 # ======== MAPA ========
 def _bounds_from_nodes(nodes):
     lats = [n["lat"] for n in nodes]; lons = [n["lon"] for n in nodes]
@@ -679,8 +698,6 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         folium.PolyLine(latlngs, color="#ffffff", weight=10, opacity=1.0).add_to(m)
         folium.PolyLine(latlngs, color=color, weight=4, opacity=1.0).add_to(m)
 
-    # (Legenda removida conforme pedido)
-
     # CP ticks — também ao longo da geometria deslocada
     if st.session_state.show_ticks:
         for L in legs:
@@ -720,41 +737,39 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
             line2 = f"{rint(L['GS'])} kt • {mmss(L['time_sec'])} • {L['Dist']:.1f} nm • {L['burn']:.1f} L"
             html_marker(m, anchor[0], anchor[1], rotated_text_html(line1, line2, L["TC"], scale=s))
 
-    # WPs + nomes + ETO/EFOB
+    # ======= WPs: rótulo compacto (NOME / EFOB L • HH:MM) sem “perna” =======
     info = _wp_time_fuel(nodes, legs)
 
-    def name_halo_html(text, scale=1.0):
-        fs = int(16*scale)
-        return f"<div style='transform:translate(-50%,-50%);font-size:{fs}px;color:#111;font-weight:900;text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;white-space:nowrap;'>{text}</div>"
+    def best_anchor_near_wp(N, tc_ref, zones: Zones):
+        # tenta pontos crescentes em dois lados da suposta "fora da curva",
+        # mais 8 direções de fallback
+        base_side = node_outside_turn_side(legs, nodes.index(N)) or (-1 if nodes.index(N) % 2 == 0 else +1)
+        candidates=[]
+        for side in (base_side, -base_side):
+            for k in range(0,6):
+                off = 0.52 + 0.28*k
+                candidates.append(dest_point(N["lat"], N["lon"], tc_ref + 90*side, off))
+        for ang in [0,45,90,135,180,225,270,315]:
+            for r in (0.55,0.85,1.15):
+                candidates.append(dest_point(N["lat"], N["lon"], ang, r))
+        # escolhe maior clearance
+        return max(candidates, key=lambda p: zones.clearance(p[0],p[1]))
 
-    def box_html(text, scale=1.0):
-        fs = int(13*scale)
-        return f"""
-        <div style="transform:translate(-50%,-50%); background:rgba(255,255,255,0.96); border:2px solid #111; border-radius:10px;
-                    padding:2px 6px; font-size:{fs}px; font-weight:800; color:#111; white-space:nowrap;">{text}</div>
-        """
-
+    scale = float(st.session_state.text_scale)
     for idx, N in enumerate(nodes):
         is_toc_tod = str(N["name"]).startswith(("TOC","TOD"))
         color = "#FF5050" if is_toc_tod else "#007AFF"
         folium.CircleMarker((N["lat"],N["lon"]), radius=6, color="#FFFFFF",
                             weight=2, fill=True, fill_color=color, fill_opacity=1).add_to(m)
-        html_marker(m, N["lat"], N["lon"], name_halo_html(f"{idx+1}. {N['name']}", scale=float(st.session_state.text_scale)))
 
         tc_ref = legs[idx]["TC"] if idx < len(legs) else legs[-1]["TC"]
-        base_side = node_outside_turn_side(legs, idx) or (-1 if idx % 2 == 0 else +1)
-        candidates=[]
-        for side in (base_side, -base_side):
-            for k in range(0,6):
-                off = 0.60 + 0.28*k
-                candidates.append(dest_point(N["lat"], N["lon"], tc_ref + 90*side, off))
-        best_pt=max(candidates, key=lambda p: zones.clearance(p[0],p[1]))
-        (bx,by), _ = zones.fit_anchor(best_pt[0], best_pt[1], normal_bearing=tc_ref + 90*(+1 if zones.clearance(best_pt[0],best_pt[1])<LABEL_MIN_CLEAR else 0), step_nm=0.24, max_iter=3)
-        folium.PolyLine([(N["lat"],N["lon"]),(bx,by)], color="#111111", weight=1.5, opacity=1).add_to(m)
         eto = info[idx]["eto"] or "-"
-        efb = info[idx]["efob"]; efb_txt = f"{efb:.1f}L" if efb is not None else "-"
-        html_marker(m, bx, by, box_html(f"ETO {eto} • EFOB {efb_txt}", scale=float(st.session_state.text_scale)))
-        zones.add(bx, by, ZONE_BOX_R)
+        efb = info[idx]["efob"]
+
+        # coloca o grupo (nome + info) perto do WP, sem linha
+        ax, ay = best_anchor_near_wp(N, tc_ref, zones)
+        html_marker(m, ax, ay, wp_compact_html(str(N['name']).split(' #')[0], efb, eto, scale=scale))
+        zones.add(ax, ay, ZONE_BOX_R)  # reserva espaço
 
     try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
     except: pass
