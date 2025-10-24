@@ -1,15 +1,11 @@
 # app.py — NAVLOG — rev24
-# - Text scale: 0.5–1.5 (default 1.0)
-# - Legs pintadas por perfil (CLIMB/LEVEL/DESCENT)
-# - Dog house compacta (rot. TC-90°, sem descrições, linhas verticais curtas)
-# - FIX labels discretas: NOME em cima; 2.ª linha “85.0 L”; 3.ª linha “T+00:00”
-#   • agora inclui também TOC/TOD com L e hora (tratados como “fixes”)
-#   • posicionadas ao “lado de fora da curva” com pequeno offset (sem linha de ligação)
-# - Sem offset artificial para pernas repetidas (sem “descolar” as rotas)
+# - TOC/TOD também com label de FIX (nome + EFOB + hora, múltiplas passagens em novas linhas)
+# - Labels de FIX com deslocação leve e declutter (sem leader), fonte menor e halo suave
+# - Dog house cápsula compacta (valores apenas), alinhada a TC-90°, com declutter
+# - Pernas pintadas por perfil; sem offset para pernas repetidas
 # - CP ticks mais grossas (3 px)
+# - "Adicionar no mapa" mostra todos os pontos do CSV (MarkerCluster)
 # - Sem experimental_rerun
-# - Aba “Adicionar no mapa”: mostra TODOS os pontos dos CSVs (MarkerCluster) + clique para adicionar
-# - Pesquisa múltipla: “LPSO VACOR VARGE” adiciona todos por ordem
 
 import streamlit as st
 import pandas as pd
@@ -25,7 +21,7 @@ EARTH_NM  = 3440.065
 
 PROFILE_COLORS = {
     "CLIMB":   "#FF7A00",  # laranja
-    "LEVEL":   "#C000FF",  # púrpura (cruise)
+    "LEVEL":   "#C000FF",  # púrpura
     "DESCENT": "#00B386",  # verde-água
 }
 
@@ -313,7 +309,7 @@ with tab_map:
     m0 = folium.Map(location=list(st.session_state.map_center), zoom_start=st.session_state.map_zoom,
                     tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
                     attr="© OpenTopoMap", control_scale=True)
-    # CSV points em cluster
+    # pontos do CSV em cluster
     cl = MarkerCluster().add_to(m0)
     for _, r in db.iterrows():
         lat, lon = float(r["lat"]), float(r["lon"])
@@ -458,7 +454,7 @@ if st.session_state.legs:
     )
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== LABELS / DOGHOUSES ========
+# ======== LABEL ENGINE / DOGHOUSES ========
 LABEL_MIN_NM_NORMAL = 0.2
 ZONE_LABEL_BASE_R   = 1.0
 LABEL_MIN_CLEAR     = 0.7
@@ -466,36 +462,44 @@ LABEL_MIN_CLEAR     = 0.7
 def html_marker(m, lat, lon, html):
     folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
 
-def node_turn_side(legs, idx_node, thr=12):
-    if idx_node <= 0 or idx_node-1 >= len(legs): return None
-    prev_tc = legs[idx_node-1]["TC"]
-    next_tc = legs[idx_node]["TC"] if idx_node < len(legs) else prev_tc
-    turn = angdiff(next_tc, prev_tc)
-    if turn > thr:  return +1    # vira à esquerda → etiqueta do lado esquerdo da perna seguinte
-    if turn < -thr: return -1
-    return None
-
-def doghouse_html(lines, angle_tc, scale=1.0):
-    # Rotação coerente (CSS 0°=E): usar TC-90°
+def doghouse_html_capsule(lines, angle_tc, scale=1.0):
+    # rotação corrigida (CSS 0°=E → usar TC-90°). Números tabulares.
     rot = angle_tc - 90.0
     fs  = int(13*scale)
     inner = "".join([f"<div style='white-space:nowrap'>{ln}</div>" for ln in lines])
     return f"""
-    <div style="transform:translate(-50%,-50%) rotate({rot}deg);
-                transform-origin:center center;
-                font-size:{fs}px; color:#111; background:rgba(255,255,255,0.97);
-                border:2px solid #111; border-radius:12px; padding:6px 8px;
-                box-shadow:0 0 0 2px rgba(255,255,255,0.97); text-align:center">
+    <div style="
+        transform: translate(-50%,-50%) rotate({rot}deg);
+        transform-origin:center center;
+        font-size:{fs}px; color:#111; letter-spacing:.1px; line-height:1.06;
+        font-variant-numeric: tabular-nums;
+        background: rgba(255,255,255,0.97);
+        padding:6px 8px; border-radius:999px; border:2px solid #111;
+        box-shadow:0 0 0 2px rgba(255,255,255,0.97); text-align:center;">
         {inner}
     </div>
     """
 
+def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head_nm):
+    F_lat, F_lon = dest_point(center_lat, center_lon, heading_deg,  length_nm/2.0)
+    B_lat, B_lon = dest_point(center_lat, center_lon, heading_deg, -length_nm/2.0)
+    neck_lat, neck_lon = dest_point(F_lat, F_lon, heading_deg, -head_nm)
+    def lat_off(lat, lon, side, off_nm): return dest_point(lat, lon, heading_deg + 90*side, off_nm)
+    half = width_nm/2.0
+    BL = lat_off(B_lat, B_lon, -1, half)
+    BR = lat_off(B_lat, B_lon, +1, half)
+    NL = lat_off(neck_lat, neck_lon, -1, half*0.85)
+    NR = lat_off(neck_lat, neck_lon, +1, half*0.85)
+    return [BL, NL, (F_lat, F_lon), NR, BR, BL]
+
 def dynamic_label_params(dist_nm, global_scale):
     base = min(1.25, max(0.85, dist_nm/7.0))
     s = base * float(global_scale)
-    L = min(2.6, max(1.9, 2.10*s))   # usado só para espaçar âncora; não desenhamos polígono
-    side_off = min(2.2, max(1.0, 1.05*s))
-    return s, L, side_off
+    L = min(2.6, max(1.9, 2.05*s))      # comprimento seta
+    W = min(0.72, max(0.46, 0.52*s))    # largura
+    H = min(0.55, max(0.36, 0.42*s))    # cabeça
+    side_off = min(2.1, max(0.9, 1.0*s))
+    return s, L, W, H, side_off
 
 class Zones:
     def __init__(self): self.z=[]
@@ -511,6 +515,16 @@ class Zones:
             p = point_along_gc(A["lat"],A["lon"],B["lat"],B["lon"], dist*k/steps)
             self.add(p[0], p[1], r_nm)
 
+# --- Node helpers para orientar labels de FIX
+def node_outside_turn_side(legs, idx_node, thr=12):
+    if idx_node <= 0 or idx_node-1 >= len(legs): return None
+    prev_tc = legs[idx_node-1]["TC"]
+    next_tc = legs[idx_node]["TC"] if idx_node < len(legs) else prev_tc
+    turn = angdiff(next_tc, prev_tc)
+    if turn > thr:  return +1
+    if turn < -thr: return -1
+    return None
+
 def _wp_time_fuel(nodes, legs):
     info = [{"eto": None, "efob": None} for _ in nodes]
     if not legs: return info
@@ -522,35 +536,40 @@ def _wp_time_fuel(nodes, legs):
         info[i]["efob"] = Lprev["efob_end"]
     return info
 
-def build_node_visit_labels(nodes, legs):
-    """Agrupa passagens (inclui TOC/TOD)."""
+# Agrupa passagens por FIX (inclui TOC/TOD), e guarda índice da primeira ocorrência para orientar
+def build_fix_visit_labels(nodes, legs):
     info = _wp_time_fuel(nodes, legs)
     grouped = {}
     for idx, N in enumerate(nodes):
         base = re.sub(r"\s+#\d+$","",str(N["name"]))
         key = (round(N["lat"],6), round(N["lon"],6), base)
         if key not in grouped:
-            grouped[key] = {"idx_first": idx, "name": base, "lat": N["lat"], "lon": N["lon"], "pairs":[]}
-        grouped[key]["pairs"].append((info[idx]["efob"], info[idx]["eto"]))
-    # devolve por ordem cronológica do 1.º aparecimento
-    return [grouped[k] for k in sorted(grouped, key=lambda k: grouped[k]["idx_first"])]
+            grouped[key] = {"name": base, "lat": N["lat"], "lon": N["lon"], "pairs":[], "first_idx": idx}
+        eto  = info[idx]["eto"]; efb = info[idx]["efob"]
+        grouped[key]["pairs"].append((efb, eto))
+    # anota orientação preferida
+    for g in grouped.values():
+        i = g["first_idx"]
+        g["side"] = node_outside_turn_side(legs, i)
+        g["tc_ref"] = legs[i]["TC"] if i < len(legs) else legs[-1]["TC"]
+    return list(grouped.values())
 
-def fix_label_html(name, pairs, scale=1.0):
-    fs_name = int(15*scale)
-    fs_line = int(12*scale)
-    rows=[]
+def fix_label_html_compact(name, pairs, scale=1.0):
+    fs_name = int(14*scale)
+    fs_line = int(11.5*scale)
+    visits=[]
     for efb, eto in pairs:
-        top = f"{(efb if efb is not None else 0):.1f}&nbsp;L"   # L na MESMA linha
+        top = f"{(efb if efb is not None else 0):.1f} L"
         bot = f"{eto or '-'}"
-        rows.append(
+        visits.append(
             f"<div style='text-align:center;margin-top:1px'>"
             f"<div style='white-space:nowrap;font-size:{fs_line}px'>{top}</div>"
             f"<div style='white-space:nowrap;font-size:{fs_line-1}px'>{bot}</div>"
             f"</div>"
         )
-    body = "".join(rows)
+    body = "".join(visits)
     return f"""
-    <div style="transform:translate(-50%,-50%); text-align:center;
+    <div style="text-align:center;
                 color:#111; font-weight:900; text-shadow:
                 -1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;">
         <div style="font-size:{fs_name}px; white-space:nowrap">{name}</div>
@@ -558,6 +577,30 @@ def fix_label_html(name, pairs, scale=1.0):
     </div>
     """
 
+def icon_fix_html(scale=1.0):
+    sz = int(10*scale); ring = int(18*scale)
+    return f"""
+    <div style="transform:translate(-50%,-50%);
+                width:{ring}px;height:{ring}px;border:2px solid #111;border-radius:50%;
+                background:#fff;display:flex;align-items:center;justify-content:center">
+        <div style="width:{sz}px;height:{sz}px;border-radius:50%;background:#1D4ED8;"></div>
+    </div>
+    """
+
+def icon_toc_html(scale=1.0):
+    s = int(16*scale)
+    return f"<div style='transform:translate(-50%,-50%) rotate(45deg); width:{s}px; height:{s}px; background:#FF7A00;border:2px solid #111;'></div>"
+
+def icon_tod_html(scale=1.0):
+    b = int(18*scale); h = int(14*scale)
+    return f"""
+    <div style="transform:translate(-50%,-40%); width:0; height:0;
+                border-left:{b//2}px solid transparent;
+                border-right:{b//2}px solid transparent;
+                border-top:{h}px solid #00B386;"></div>
+    """
+
+# ======== MAPA ========
 def render_map(nodes, legs, base_choice, maptiler_key=""):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**.")
@@ -593,7 +636,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
 
     Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
 
-    # Pernas com halo — cores por perfil
+    # Pernas (halo + cor do perfil)
     for L in legs:
         latlngs = [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])]
         color = PROFILE_COLORS.get(L["profile"], "#C000FF")
@@ -611,82 +654,99 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=3, opacity=1).add_to(m)
 
-    # Zonas para declutter (evita colisões)
+    # Zonas (para declutter de tudo)
     zones = Zones()
-    for L in legs: zones.add_leg_corridor(L["A"], L["B"])
+    for L in legs:
+        zones.add_leg_corridor(L["A"], L["B"])
 
-    # DOG HOUSES (valores apenas), colocadas ao lado de fora da curva
+    # Dog houses compactas (1 por perna)
     if st.session_state.show_doghouses:
         prev_side = None
-        for i, L in enumerate(legs):
-            if L["Dist"] < LABEL_MIN_NM_NORMAL: continue
-            s, Lnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale)
-            cur = L["TC"]; nxt = legs[i+1]["TC"] if i < len(legs)-1 else L["TC"]
+        for idx, L in enumerate(legs):
+            if L["Dist"] < LABEL_MIN_NM_NORMAL:  # pernas muito curtas não recebem
+                continue
+            s, Lnm, Wnm, Hnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale)
+
+            # lado preferido = fora da curva seguinte (ou anterior) ou herdado
+            cur = L["TC"]
+            nxt = legs[idx+1]["TC"] if idx < len(legs)-1 else L["TC"]
             turn = angdiff(nxt, cur)
             prefer = +1 if turn>12 else (-1 if turn<-12 else (prev_side or +1))
+
             mid = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], 0.50*L["Dist"])
             anchor = dest_point(mid[0], mid[1], L["TC"] + 90*prefer, side_off)
-            # empurra um pouco se estiver apertado
+
+            # empurrões para descolar de rotas/outros
             if zones.clearance(anchor[0], anchor[1]) < LABEL_MIN_CLEAR:
-                for extra in (0.35,0.7,1.1,1.5):
+                for extra in (0.35,0.7,1.1,1.5,1.9):
                     cand = dest_point(anchor[0], anchor[1], L["TC"] + 90*prefer, extra)
                     if zones.clearance(cand[0], cand[1]) >= LABEL_MIN_CLEAR:
                         anchor = cand; break
             zones.add(anchor[0], anchor[1], ZONE_LABEL_BASE_R); prev_side = prefer
 
-            # linhas minimalistas (sem descrições)
+            # valores apenas, linhas curtas (tabular-nums)
             lines = [
-                f"{deg3(L['MH'])} | {deg3(L['TC'])}",
+                f"{deg3(L['MH'])}|{deg3(L['TC'])}",
                 f"{rint(L['GS'])}kt",
                 f"{mmss(L['time_sec'])}",
-                f"{L['Dist']:.1f}nm · {L['burn']:.1f}L",
+                f"{L['Dist']:.1f}nm",
+                f"{L['burn']:.1f}L",
             ]
-            html_marker(m, anchor[0], anchor[1], doghouse_html(lines, L["TC"], scale=s))
+            poly = arrow_polygon(anchor[0], anchor[1], L["TC"], Lnm, Wnm, Hnm)
+            folium.Polygon(poly, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.96).add_to(m)
+            html_marker(m, anchor[0], anchor[1], doghouse_html_capsule(lines, L["TC"], scale=s))
+    else:
+        # modo setas minimal (sem dog houses)
+        for L in legs:
+            count = max(2, int(L["Dist"]/6)+1)
+            for k in range(1, count):
+                d = L["Dist"]*k/(count)
+                latm, lonm = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], d)
+                fs = int(22 * st.session_state.text_scale)
+                html = f"""
+                <div style="transform:translate(-50%,-50%) rotate({L['TC']-90}deg);
+                            font-size:{fs}px;font-weight:900;color:#111;
+                            text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff">➤</div>
+                """
+                html_marker(m, latm, lonm, html)
 
-    # ÍCONES de FIX / TOC / TOD
-    def icon_fix_html(scale=1.0):
-        sz = int(10*scale); ring = int(18*scale)
-        return f"""
-        <div style="transform:translate(-50%,-50%);
-                    width:{ring}px;height:{ring}px;border:2px solid #111;border-radius:50%;
-                    background:#fff;display:flex;align-items:center;justify-content:center">
-            <div style="width:{sz}px;height:{sz}px;border-radius:50%;background:#1D4ED8;"></div>
-        </div>
-        """
-    def icon_toc_html(scale=1.0):
-        s = int(16*scale)
-        return f"<div style='transform:translate(-50%,-50%) rotate(45deg); width:{s}px; height:{s}px; background:#FF7A00;border:2px solid #111;'></div>"
-    def icon_tod_html(scale=1.0):
-        b = int(18*scale); h = int(14*scale)
-        return f"""
-        <div style="transform:translate(-50%,-40%); width:0; height:0;
-                    border-left:{b//2}px solid transparent;
-                    border-right:{b//2}px solid transparent;
-                    border-top:{h}px solid #00B386;"></div>
-        """
-
-    for idx, N in enumerate(nodes):
-        nm = str(N["name"])
-        if nm.startswith("TOC"):
+    # Ícones
+    for N in nodes:
+        if str(N["name"]).startswith("TOC"):
             html_marker(m, N["lat"], N["lon"], icon_toc_html(scale=st.session_state.text_scale))
-        elif nm.startswith("TOD"):
+        elif str(N["name"]).startswith("TOD"):
             html_marker(m, N["lat"], N["lon"], icon_tod_html(scale=st.session_state.text_scale))
         else:
             html_marker(m, N["lat"], N["lon"], icon_fix_html(scale=st.session_state.text_scale))
 
-    # Labels de passagem (inclui TOC/TOD), posicionadas fora da curva com offset; SEM linha de ligação
-    visits = build_node_visit_labels(nodes, legs)
-    for v in visits:
-        # escolher lado de fora baseado no 1.º aparecimento
-        idx0 = v["idx_first"]
-        tc_ref = legs[idx0]["TC"] if idx0 < len(legs) else legs[-1]["TC"]
-        side = node_turn_side(legs, idx0) or (-1 if idx0 % 2 == 0 else +1)
-        s, Lnm, side_off = dynamic_label_params( max(3.0, legs[idx0]["Dist"]) , st.session_state.text_scale)
-        anchor = dest_point(v["lat"], v["lon"], tc_ref + 90*side, 0.55 + 0.25*(s-1.0) + 0.15)
-        html_marker(m, anchor[0], anchor[1], fix_label_html(v["name"], v["pairs"], scale=float(st.session_state.text_scale)))
-        zones.add(anchor[0], anchor[1], 0.9)
+    # Labels “leves” dos FIXES (inclui TOC/TOD), deslocadas sem leader
+    grouped = build_fix_visit_labels(nodes, legs)
 
-    # Render do mapa principal sem devolver estado (mantém zoom/pan)
+    def place_label_near_fix(fix, zones: Zones, base_off_nm=0.22):
+        # tenta fora da curva; se None alterna; depois varre 8 direções em 3 distâncias
+        side = fix.get("side"); tc = fix.get("tc_ref", 0.0)
+        dirs = []
+        if side in (-1,+1):
+            # normal preferida e ±30°
+            dirs.extend([tc+90*side, tc+90*side+30, tc+90*side-30])
+        # complementares
+        dirs.extend([tc-90, tc+90, tc, tc+180, tc+45, tc-45])
+        dists = [base_off_nm, base_off_nm+0.12, base_off_nm+0.26]
+        best = None; best_clear = -9e9
+        for d in dists:
+            for hdg in dirs:
+                p = dest_point(fix["lat"], fix["lon"], hdg, d)
+                c = zones.clearance(p[0], p[1])
+                if c > best_clear:
+                    best_clear = c; best = p
+        zones.add(best[0], best[1], 0.55)
+        return best
+
+    for fx in grouped:
+        anchor = place_label_near_fix(fx, zones, base_off_nm=0.22)
+        html_marker(m, anchor[0], anchor[1], fix_label_html_compact(fx["name"], fx["pairs"], scale=float(st.session_state.text_scale)))
+
+    # Render final (mantém o zoom/pan que escolheres)
     st_folium(m, width=None, height=760, key="mainmap", returned_objects=[])
 
 # ---- render ----
