@@ -3,3 +3,4 @@ folium>=0.15
 streamlit-folium>=0.20
 pandas>=2.2
 numpy>=1.26
+pypdf
