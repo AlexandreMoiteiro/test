@@ -1,6 +1,5 @@
-streamlit>=1.33,<2
+streamlit>=1.30
 folium>=0.15
-streamlit-folium>=0.20
-pandas>=2.2
-numpy>=1.26
-pypdf
+streamlit-folium>=0.18.0
+pandas>=1.5
+pdfrw>=0.4
