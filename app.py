@@ -1,10 +1,9 @@
-# app.py — NAVLOG — rev16
-# Alterações principais:
-# - Pesquisa CSV: removidos checkboxes; fica só o botão ➕ por card
-# - Legs duplicadas (mesmos pontos A<->B em sentidos opostos): desenhadas com offset lateral
-#   • padrão de offsets: [-1,+1,-2,+2,…] × 0.35 NM (configurável)
-# - Removida a "legenda" CLIMB/CRUISE/DESCENT no mapa (evita texto a meio do mapa)
-# - Pílulas e riscas CP passam a seguir a geometria deslocada (quando houver offset)
+# app.py — NAVLOG — rev17
+# - Separação real de pernas colineares (mesmo corredor) com offsets laterais
+# - Offsets aplicados a linhas, pílulas e riscas CP
+# - ETO/EFOB mais afastados e zonas maiores para minimizar colisões
+# - Pesquisa CSV sem checkboxes (só botão ➕)
+# - Legenda CLIMB/CRUISE/DESCENT removida do mapa
 
 import streamlit as st
 import pandas as pd
@@ -24,7 +23,8 @@ PROFILE_COLORS = {
     "DESCENT": "#00B386",  # verde água
 }
 
-LEG_OFFSET_STEP_NM = 0.35   # deslocamento lateral para separar legs coincidentes
+# Maior separação entre pernas coincidentes/colineares
+LEG_OFFSET_STEP_NM = 0.55
 
 # ======== PAGE / STYLE ========
 st.set_page_config(page_title="NAVLOG", layout="wide", initial_sidebar_state="collapsed")
@@ -100,22 +100,50 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
 
 def _nm_dist(a,b): return gc_dist_nm(a[0],a[1],b[0],b[1])
 
-# --- util p/ leg offsets (separar rotas coincidentes) ---
-def _node_key(N, places=5):
-    return (round(float(N["lat"]), places), round(float(N["lon"]), places))
+# ---------- Conversão local e agrupamento por corredor ----------
+def ll_to_xy_nm(lat, lon, lat0, lon0):
+    """Equiretangular simples (nm) centrado em (lat0,lon0)."""
+    x = (lon - lon0) * math.cos(math.radians(lat0)) * 60.0
+    y = (lat - lat0) * 60.0
+    return x, y
 
-def compute_leg_offsets(legs, step_nm=LEG_OFFSET_STEP_NM):
+def corridor_signature(A, B, lat0, lon0):
+    """Devolve (theta_0_180, abs(d)), onde d é a distância perpendicular da linha ao (0,0)."""
+    x1,y1 = ll_to_xy_nm(A["lat"],A["lon"], lat0,lon0)
+    x2,y2 = ll_to_xy_nm(B["lat"],B["lon"], lat0,lon0)
+    vx, vy = (x2-x1, y2-y1)
+    L = math.hypot(vx, vy)
+    if L < 1e-6:
+        return None
+    theta = (math.degrees(math.atan2(vy, vx)) + 180.0) % 180.0  # 0..180 (ignora direção)
+    nx, ny = (-vy/L, vx/L)  # normal unitário
+    d = abs(nx*x1 + ny*y1)  # distância perpendicular ao (0,0)
+    return theta, d
+
+def compute_leg_offsets_corridor(legs, lat0, lon0, step_nm=LEG_OFFSET_STEP_NM, tol_deg=2.0, tol_nm=0.12):
     """
-    Agrupa legs por par de nós (A<->B ignorando ordem).
-    Para grupos com N>1 devolve offsets [-1,+1,-2,+2,…]*step_nm.
+    Agrupa pernas colineares (mesmo corredor) com base em ângulo (0..180) e distância perpendicular.
+    A cada grupo com N>1 atribui offsets [-1,+1,-2,+2,…] × step_nm.
     """
-    groups = {}
+    groups = []  # cada item: {"theta":θ,"d":d,"idxs":[...]}
+    sigs = []
     for idx, L in enumerate(legs):
-        k = tuple(sorted([_node_key(L["A"]), _node_key(L["B"])]))
-        groups.setdefault(k, []).append(idx)
+        sig = corridor_signature(L["A"], L["B"], lat0, lon0)
+        sigs.append(sig)
+        if sig is None: 
+            continue
+        θ, d = sig
+        placed = False
+        for g in groups:
+            if abs(θ - g["theta"]) <= tol_deg and abs(d - g["d"]) <= tol_nm:
+                g["idxs"].append(idx); placed = True; break
+        if not placed:
+            groups.append({"theta":θ, "d":d, "idxs":[idx]})
+
     offsets = {i: 0.0 for i in range(len(legs))}
-    for _, idxs in groups.items():
-        if len(idxs) <= 1: 
+    for g in groups:
+        idxs = g["idxs"]
+        if len(idxs) <= 1:
             continue
         pattern = []
         n = 1
@@ -124,8 +152,9 @@ def compute_leg_offsets(legs, step_nm=LEG_OFFSET_STEP_NM):
             if len(pattern) < len(idxs):
                 pattern.append(+n*step_nm)
             n += 1
-        for j, leg_idx in enumerate(idxs):
-            offsets[leg_idx] = pattern[j]
+        # ordem estável: mantém a ordem das legs, mas distribui sinais
+        for k, leg_idx in enumerate(idxs):
+            offsets[leg_idx] = pattern[k]
     return offsets
 
 def offset_coord(lat, lon, tc, offset_nm):
@@ -475,9 +504,9 @@ if st.session_state.legs:
 LABEL_MIN_NM_NORMAL = 0.2
 CP_TICK_HALF        = 0.38
 ZONE_WP_R           = 0.85
-ZONE_BOX_R          = 0.75
-ZONE_LABEL_BASE_R   = 1.0
-LABEL_MIN_CLEAR     = 0.7
+ZONE_BOX_R          = 0.95   # ↑ mais largo para evitar colisão com pílulas
+ZONE_LABEL_BASE_R   = 1.15   # ↑ pílulas "contam" mais na zona
+LABEL_MIN_CLEAR     = 0.85   # ↑ tolerância mínima de afastamento
 
 def html_marker(m, lat, lon, html):
     folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
@@ -669,8 +698,8 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
 
     Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
 
-    # --- calcular offsets para legs coincidentes ---
-    leg_offsets = compute_leg_offsets(legs, step_nm=LEG_OFFSET_STEP_NM)
+    # --- calcular offsets por corredor colinear ---
+    leg_offsets = compute_leg_offsets_corridor(legs, mean_lat, mean_lon, step_nm=LEG_OFFSET_STEP_NM)
 
     # Pernas com halo e cor por perfil (usando geometria deslocada quando aplicável)
     draw_legs = []  # guardamos A/B desenhadas para ticks/pílulas
@@ -683,7 +712,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         folium.PolyLine([(Ax,Ay), (Bx,By)], color="#ffffff", weight=10, opacity=1.0).add_to(m)
         folium.PolyLine([(Ax,Ay), (Bx,By)], color=color, weight=4, opacity=1.0).add_to(m)
 
-    # (Legendas removidas a pedido)
+    # (Sem legenda textual no mapa)
 
     # CP ticks (ao longo da geometria desenhada)
     if st.session_state.show_ticks:
@@ -697,7 +726,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
 
-    # Zonas base
+    # Zonas base (usam a geometria deslocada)
     zones = Zones()
     for N in nodes:
         zones.add(N["lat"], N["lon"], ZONE_WP_R)
@@ -751,8 +780,8 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         base_side = node_outside_turn_side(legs, idx) or (-1 if idx % 2 == 0 else +1)
         candidates=[]
         for side in (base_side, -base_side):
-            for k in range(0,6):
-                off = 0.60 + 0.28*k
+            for k in range(0,7):
+                off = 0.75 + 0.30*k   # ↑ começa mais longe e dá mais passos
                 candidates.append(dest_point(N["lat"], N["lon"], tc_ref + 90*side, off))
         best_pt=max(candidates, key=lambda p: zones.clearance(p[0],p[1]))
         (bx,by), _ = zones.fit_anchor(best_pt[0], best_pt[1], normal_bearing=tc_ref + 90*(+1 if zones.clearance(best_pt[0],best_pt[1])<LABEL_MIN_CLEAR else 0), step_nm=0.24, max_iter=3)
