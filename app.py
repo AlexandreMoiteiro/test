@@ -1,10 +1,10 @@
-# app.py — NAVLOG — rev18
-# Foco desta revisão:
-# - Bloquear re-zoom automático (fit_bounds) depois de interações do utilizador; toggle e botão para recentrar quando quiser
-# - Setas orientadas corretamente (TC-90°)
-# - Dog houses multi-linha com declutter e escala por zoom
-# - Fix labels com passagens acumuladas, sem “leader line”
-# - Legs repetidas com deslocamento visual, refletido em ticks/setas/dog houses
+# app.py — NAVLOG — rev19
+# - Sem auto-zoom: o mapa mantém centro/zoom do utilizador entre interações.
+# - Botão "Enquadrar percurso" faz fitBounds apenas quando pedido.
+# - Setas no modo sem dog houses orientadas por TC-90° (CSS 0°=Este).
+# - Dog houses multi-linha (declutter) com escala por zoom + slider.
+# - Fix labels no próprio ponto, empilhando passagens (EFOB • hora).
+# - Pernas repetidas desenhadas com deslocamento lateral (visual).
 
 import streamlit as st
 import pandas as pd
@@ -24,7 +24,7 @@ PROFILE_COLORS = {
     "DESCENT": "#00B386",
 }
 
-REPEAT_LEG_BASE_OFFSET_NM = 0.35  # afastamento entre pernas repetidas (visual)
+REPEAT_LEG_BASE_OFFSET_NM = 0.35  # afastamento visual entre pernas paralelas/repetidas
 
 # ======== PAGE / STYLE ========
 st.set_page_config(page_title="NAVLOG", layout="wide", initial_sidebar_state="collapsed")
@@ -115,11 +115,13 @@ ens("maptiler_key", "")
 ens("text_scale", 1.25)
 ens("show_ticks", True)
 ens("show_doghouses", True)
-ens("map_zoom", 8)
+
+# vista fixa entre renders (anti auto-zoom)
 ens("map_center", (39.7, -8.1))
-ens("auto_fit", False)            # <— por defeito não força fit
-ens("user_interacted", False)
-ens("do_fit_now", False)
+ens("map_zoom", 8)
+ens("auto_fit_on_route_change", False)  # só se quiseres
+ens("fit_requested", False)             # botão "Enquadrar percurso"
+ens("last_route_sig", None)             # para detetar alterações reais de rota
 
 ens("db_points", None); ens("qadd", ""); ens("alt_qadd", 3000.0)
 ens("search_rows", []); ens("last_q", "")
@@ -150,16 +152,15 @@ with st.form("globals"):
     with b3:
         st.session_state.text_scale  = st.slider("Tamanho do texto", 0.9, 1.8, float(st.session_state.text_scale), 0.05)
     with b4:
-        st.session_state.auto_fit = st.toggle("Ajustar automaticamente ao percurso", value=st.session_state.auto_fit)
+        st.session_state.auto_fit_on_route_change = st.toggle("Enquadrar automaticamente quando a rota muda", value=st.session_state.auto_fit_on_route_change)
     st.form_submit_button("Aplicar")
 
-cfit1, cfit2, _ = st.columns([1.2,1,6])
-with cfit1:
-    if st.button("Recentrar agora"):
-        st.session_state.user_interacted = False
-        st.session_state.do_fit_now = True
-with cfit2:
-    st.caption("Quando interages no mapa, o auto-zoom é desativado até clicares em **Recentrar agora**.")
+cf1, cf2, _ = st.columns([1.4,1,6])
+with cf1:
+    if st.button("Enquadrar percurso"):
+        st.session_state.fit_requested = True
+with cf2:
+    st.caption("O mapa mantém o teu zoom/centro. Só re-enquadra quando clicas no botão ou quando a rota muda (se o toggle estiver ON).")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
@@ -452,20 +453,26 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         t_cursor += time_sec; carry_efob = efob_end
     return legs
 
+def route_signature(nodes):
+    return tuple((round(n["lat"],5), round(n["lon"],5), round(n["alt"],0), n["name"][:8]) for n in nodes)
+
 # ======== GERAR ROTA ========
 cgen,_ = st.columns([2,6])
 with cgen:
     if st.button("Gerar/Atualizar rota (insere TOC/TOD) ✅", type="primary", use_container_width=True):
-        st.session_state.route_nodes = build_route_nodes(
+        rn = build_route_nodes(
             st.session_state.wps, st.session_state.wind_from, st.session_state.wind_kt,
             st.session_state.roc_fpm, st.session_state.desc_angle
         )
+        st.session_state.route_nodes = rn
         st.session_state.legs = build_legs_from_nodes(
-            st.session_state.route_nodes, st.session_state.wind_from, st.session_state.wind_kt,
+            rn, st.session_state.wind_from, st.session_state.wind_kt,
             st.session_state.mag_var, st.session_state.mag_is_e, st.session_state.ck_default
         )
-        # ao gerar, permite um único fit se o utilizador o quiser
-        st.session_state.user_interacted = False
+        sig = route_signature(rn)
+        if st.session_state.auto_fit_on_route_change and sig != st.session_state.last_route_sig:
+            st.session_state.fit_requested = True
+        st.session_state.last_route_sig = sig
 
 # ======== RESUMO ========
 if st.session_state.legs:
@@ -481,10 +488,9 @@ if st.session_state.legs:
     )
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== LABEL ENGINE / UI ========
+# ======== LABELS / DOGHOUSES ========
 LABEL_MIN_NM_NORMAL = 0.2
 CP_TICK_HALF        = 0.38
-ZONE_WP_R           = 0.85
 ZONE_LABEL_BASE_R   = 1.0
 LABEL_MIN_CLEAR     = 0.7
 
@@ -520,7 +526,6 @@ def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head
     return [BL, NL, (F_lat, F_lon), NR, BR, BL]
 
 def dynamic_label_params(dist_nm, global_scale, zoom):
-    # 8 é zoom de referência; zf corrige tamanho
     zf = max(0.6, min(1.6, (zoom/8.0)**0.95))
     base = min(1.25, max(0.85, dist_nm/7.0))
     s = base * float(global_scale) * zf
@@ -549,7 +554,7 @@ def _leg_endpoints(L, rendered=True):
         return L["A_r"], L["B_r"]
     return {"lat":L["A"]["lat"], "lon":L["A"]["lon"]}, {"lat":L["B"]["lat"], "lon":L["B"]["lon"]}
 
-# ======== WPs: LABEL COM VISITAS ACUMULADAS ========
+# ======== FIX LABELS (passagens acumuladas) ========
 def _wp_time_fuel(nodes, legs):
     info = [{"eto": None, "efob": None} for _ in nodes]
     if not legs: return info
@@ -568,11 +573,12 @@ def build_fix_visit_labels(nodes, legs):
     info = _wp_time_fuel(nodes, legs)
     grouped = {}
     for idx, N in enumerate(nodes):
-        if _is_toc_tod(N["name"]):  # só etiquetas para fixes reais
+        if _is_toc_tod(N["name"]):  # só fixes reais
             continue
-        key = (round(N["lat"],6), round(N["lon"],6), re.sub(r"\s+#\d+$","",str(N["name"])))
+        base = re.sub(r"\s+#\d+$","",str(N["name"]))
+        key = (round(N["lat"],6), round(N["lon"],6), base)
         if key not in grouped:
-            grouped[key] = {"name": re.sub(r"\s+#\d+$","",str(N["name"])), "lat": N["lat"], "lon": N["lon"], "lines":[]}
+            grouped[key] = {"name": base, "lat": N["lat"], "lon": N["lon"], "lines":[]}
         eto  = info[idx]["eto"]; efb = info[idx]["efob"]
         grouped[key]["lines"].append(f"{(efb if efb is not None else 0):.1f}L • {eto or '-'}")
     return list(grouped.values())
@@ -608,19 +614,17 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**.")
         return
 
-    # centro/zoom atuais (não forçar fit se o utilizador já mexeu)
-    mean_lat = sum(n["lat"] for n in nodes)/len(nodes)
-    mean_lon = sum(n["lon"] for n in nodes)/len(nodes)
-    start_center = st.session_state.map_center if st.session_state.user_interacted else (mean_lat, mean_lon)
-    m = folium.Map(location=list(start_center), zoom_start=st.session_state.map_zoom,
+    # cria SEM fit; usa sempre vista guardada (anti auto-zoom)
+    m = folium.Map(location=list(st.session_state.map_center),
+                   zoom_start=st.session_state.map_zoom,
                    tiles=None, control_scale=True, prefer_canvas=True)
 
-    # camadas
+    # base
     if base_choice == "EOX Sentinel-2 (satélite)":
         folium.TileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
-                         attr="© EOX Sentinel-2", name="Sentinel-2", overlay=False).add_to(m)
+                         attr="© EOX Sentinel-2").add_to(m)
         folium.TileLayer("https://tiles.maps.eox.at/wmts/1.0.0/overlay_bright/GoogleMapsCompatible/{z}/{y}/{x}.png",
-                         attr="© EOX Overlay", name="Labels", overlay=True).add_to(m)
+                         attr="© EOX Overlay", overlay=True).add_to(m)
     elif base_choice == "Esri World Imagery (satélite + labels)":
         folium.TileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                          attr="© Esri").add_to(m)
@@ -661,7 +665,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=2, opacity=1).add_to(m)
 
-    # Zonas p/ declutter
+    # Zonas p/ declutter de labels
     zones = Zones()
     for L in legs:
         A_v, B_v = _leg_endpoints(L, rendered=True)
@@ -672,7 +676,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
     if st.session_state.show_doghouses:
         prev_side = None
         for idx, L in enumerate(legs):
-            if L["Dist"] < LABEL_MIN_NM_NORMAL:  # evita mini-pílulas
+            if L["Dist"] < LABEL_MIN_NM_NORMAL:  # filtra micro-legs
                 continue
             s, Lnm, Wnm, Hnm, side_off = dynamic_label_params(L["Dist"], st.session_state.text_scale, zoom)
             label_r = ZONE_LABEL_BASE_R + 0.25*(Lnm-2.0)
@@ -697,7 +701,7 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
             folium.Polygon(poly, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.97).add_to(m)
             html_marker(m, anchor[0], anchor[1], doghouse_html(lines, L["TC"], scale=s))
     else:
-        # modo SETAS ">" – orientação correta: TC-90° (0° CSS = Este)
+        # modo SETAS ">" (CSS 0° = Este) → rotação = TC-90°
         for L in legs:
             A_v, B_v = _leg_endpoints(L, rendered=True)
             count = max(2, int(L["Dist"]/8)+1)
@@ -710,36 +714,32 @@ def render_map(nodes, legs, base_choice, maptiler_key=""):
                                       text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff">></div>"""
                 html_marker(m, latm, lonm, html)
 
-    # FIXES: ponto + etiqueta compacta com TODAS as visitas (cronológico)
+    # FIXES: ponto + etiqueta compacta com todas as passagens
     fix_labels = build_fix_visit_labels(nodes, legs)
     for f in fix_labels:
         folium.CircleMarker((f["lat"],f["lon"]), radius=6, color="#FFFFFF",
                             weight=2, fill=True, fill_color="#007AFF", fill_opacity=1).add_to(m)
         html_marker(m, f["lat"], f["lon"], fix_label_html(f["name"], f["lines"], scale=float(st.session_state.text_scale)))
 
-    # Fit apenas quando explicitamente pedido
-    if (st.session_state.auto_fit and not st.session_state.user_interacted) or st.session_state.do_fit_now:
-        try:
-            m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
+    # Enquadrar APENAS quando pedido
+    if st.session_state.fit_requested:
+        try: m.fit_bounds(_bounds_from_nodes(nodes), padding=(30,30))
         except: pass
-        st.session_state.do_fit_now = False  # consome o pedido
 
-    # Render e registo da interação (zoom/centro)
-    out = st_folium(m, width=None, height=760)
+    # Render e capturar vista atual (para persistir entre reruns)
+    out = st_folium(m, width=None, height=760, key="mainmap")
     try:
         if isinstance(out, dict):
             if "zoom" in out and isinstance(out["zoom"], (int,float)):
-                if int(out["zoom"]) != st.session_state.map_zoom:
-                    st.session_state.user_interacted = True
                 st.session_state.map_zoom = int(out["zoom"])
             if "center" in out and isinstance(out["center"], dict):
-                new_center = (float(out["center"].get("lat", start_center[0])),
-                              float(out["center"].get("lng", start_center[1])))
-                if new_center != st.session_state.map_center:
-                    st.session_state.user_interacted = True
-                st.session_state.map_center = new_center
+                st.session_state.map_center = (float(out["center"].get("lat", st.session_state.map_center[0])),
+                                               float(out["center"].get("lng", st.session_state.map_center[1])))
     except:
         pass
+
+    # consumimos o pedido de fit (para não repetir)
+    st.session_state.fit_requested = False
 
 # ---- render ----
 if st.session_state.wps and st.session_state.route_nodes and st.session_state.legs:
