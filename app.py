@@ -1,11 +1,10 @@
-# app.py — NAVLOG — rev28
+# app.py — NAVLOG — rev29
 # ---------------------------------------------------------------
-# - Dog houses e labels reativados (com declutter).
-# - Flight Plan: sem DeltaGenerator print; if/else correto.
-# - Navlog: linhas usam A; adiciona linha de chegada (B) se couber.
-# - PDF principal: NAVLOG_FORM.pdf (2 págs); continuação só se >22 legs.
-# - Alternate preenchido (campos Alternate_* + Airfields).
-# - TOD usa ROD (ft/min) definido pelo utilizador.
+# - Dog houses e labels dos FIX sem quebras de unidade (kt/nm/L).
+# - Flight Plan: render limpo.
+# - Navlog PDF: linhas usam A; linha extra de chegada com B se couber.
+# - PDF principal (2 págs). Continuação só se >22 legs.
+# - Alternate preenchido (Alternate_*), ROD (ft/min) configurável.
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -96,6 +95,12 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     if total <= 0: return lat1, lon1
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
+
+# ======== FORMATAÇÃO UNIDADES (anti-quebra) ========
+NBSP_THIN = "&#8239;"  # U+202F
+def fmt_kt(v):  return f"{int(round(float(v)))}{NBSP_THIN}kt"
+def fmt_nm(v):  return f"{float(v):.1f}{NBSP_THIN}nm"
+def fmt_L(v):   return f"{float(v):.1f}{NBSP_THIN}L"
 
 # ======== STATE ========
 def ens(k, v): return st.session_state.setdefault(k, v)
@@ -431,38 +436,6 @@ def arrow_polygon(center_lat, center_lon, heading_deg, length_nm, width_nm, head
     BL = lat_off(B_lat, B_lon, -1, half); BR = lat_off(B_lat, B_lon, +1, half)
     NL = lat_off(neck_lat, neck_lon, -1, half*0.85); NR = lat_off(neck_lat, neck_lon, +1, half*0.85)
     return [BL, NL, (F_lat, F_lon), NR, BR, BL]
-def dynamic_label_params(dist_nm, global_scale):
-    base = min(1.25, max(0.85, dist_nm/7.0)); s = base * float(global_scale)
-    L = min(2.6, max(1.9, 2.05*s)); W = min(0.72, max(0.46, 0.52*s)); H = min(0.55, max(0.36, 0.42*s))
-    side_off = min(2.1, max(0.9, 1.0*s)); return s, L, W, H, side_off
-class Zones:
-    def __init__(self): self.z=[]
-    def add(self, lat, lon, r): self.z.append((lat,lon,float(r)))
-    def clearance(self, lat, lon):
-        if not self.z: return 9e9
-        return min(gc_dist_nm(lat,lon,a,b) - r for a,b,r in self.z)
-    def add_leg_corridor(self, A, B, spacing_nm=0.9, r_nm=0.38):
-        dist = gc_dist_nm(A["lat"],A["lon"],B["lat"],B["lon"])
-        if dist <= spacing_nm: return
-        steps = max(2, int(dist/spacing_nm))
-        for k in range(1, steps):
-            p = point_along_gc(A["lat"],A["lon"],B["lat"],B["lon"], dist*k/steps)
-            self.add(p[0], p[1], r_nm)
-
-def build_fix_visit_labels(nodes, legs):
-    info = [{"eto": None, "efob": None} for _ in nodes]
-    if legs:
-        info[0]["eto"]  = legs[0]["clock_start"]; info[0]["efob"] = legs[0]["efob_start"]
-        for i in range(1, len(nodes)):
-            Lprev = legs[i-1]; info[i]["eto"]  = Lprev["clock_end"]; info[i]["efob"] = Lprev["efob_end"]
-    grouped = {}
-    for idx, N in enumerate(nodes):
-        base = re.sub(r"\s+#\d+$","",str(N["name"]))
-        key = (round(N["lat"],6), round(N["lon"],6), base)
-        if key not in grouped: grouped[key] = {"name": base, "lat": N["lat"], "lon": N["lon"], "pairs":[], "first_idx": idx}
-        grouped[key]["pairs"].append((info[idx]["efob"], info[idx]["eto"]))
-    return list(grouped.values())
-
 def render_map(nodes, legs, base_choice):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**."); return
@@ -481,7 +454,7 @@ def render_map(nodes, legs, base_choice):
 
     Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
 
-    # legs
+    # legs + halo
     for L in legs:
         latlngs = [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])]
         color = PROFILE_COLORS.get(L["profile"], "#C000FF")
@@ -499,25 +472,23 @@ def render_map(nodes, legs, base_choice):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=3, opacity=1).add_to(m)
 
-    # declutter zones
-    class Z: pass
-    zones = Z(); zones.z=[]
-    def z_add(lat,lon,r): zones.z.append((lat,lon,r))
-    def z_clear(lat,lon):
-        if not zones.z: return 9e9
-        return min(gc_dist_nm(lat,lon,a,b)-r for a,b,r in zones.z)
-    for L in legs:
-        dist = gc_dist_nm(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"])
-        steps = max(2, int(dist/0.9))
-        for k in range(1, steps):
-            p = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], dist*k/steps)
-            z_add(p[0], p[1], 0.38)
-
     # dog houses
     if st.session_state.show_doghouses:
+        def z_clear(lat,lon,zs): 
+            if not zs: return 9e9
+            return min(gc_dist_nm(lat,lon,a,b) - r for a,b,r in zs)
+        zones=[]
+        for L in legs:
+            # corridor points para declutter
+            dist = gc_dist_nm(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"])
+            steps = max(2, int(dist/0.9))
+            for k in range(1, steps):
+                p = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], dist*k/steps)
+                zones.append((p[0],p[1],0.38))
+
         prev_side = None
         for idx, L in enumerate(legs):
-            if L["Dist"] < 0.2:  # pernas curtas
+            if L["Dist"] < 0.2:
                 continue
             base = min(1.25, max(0.85, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
@@ -532,14 +503,20 @@ def render_map(nodes, legs, base_choice):
 
             mid = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], 0.50*L["Dist"])
             anchor = dest_point(mid[0], mid[1], L["TC"] + 90*prefer, side_off)
-            if z_clear(anchor[0], anchor[1]) < LABEL_MIN_CLEAR:
+            if z_clear(anchor[0], anchor[1], zones) < LABEL_MIN_CLEAR:
                 for extra in (0.35,0.7,1.1,1.5,1.9):
                     cand = dest_point(anchor[0], anchor[1], L["TC"] + 90*prefer, extra)
-                    if z_clear(cand[0], cand[1]) >= LABEL_MIN_CLEAR: anchor = cand; break
-            z_add(anchor[0], anchor[1], 1.0); prev_side = prefer
+                    if z_clear(cand[0], cand[1], zones) >= LABEL_MIN_CLEAR:
+                        anchor = cand; break
+            zones.append((anchor[0], anchor[1], 1.0)); prev_side = prefer
 
-            lines = [f"{deg3(L['MH'])}|{deg3(L['TC'])}", f"{rint(L['GS'])}kt", f"{mmss(L['time_sec'])}",
-                     f"{L['Dist']:.1f}nm", f"{L['burn']:.1f}L"]
+            lines = [
+                f"{deg3(L['MH'])}|{deg3(L['TC'])}",
+                fmt_kt(L['GS']),
+                f"{mmss(L['time_sec'])}",
+                fmt_nm(L['Dist']),
+                fmt_L(L['burn']),
+            ]
             poly = arrow_polygon(anchor[0], anchor[1], L["TC"], Lnm, Wnm, Hnm)
             folium.Polygon(poly, color="#000000", weight=2, fill=True, fill_color="#FFFFFF", fill_opacity=0.96).add_to(m)
             html_marker(m, anchor[0], anchor[1], doghouse_html_capsule(lines, L["TC"], scale=s))
@@ -548,12 +525,36 @@ def render_map(nodes, legs, base_choice):
     for N in nodes:
         html_marker(m, N["lat"], N["lon"],
                     "<div style='transform:translate(-50%,-50%);width:18px;height:18px;border:2px solid #111;border-radius:50%;background:#fff'></div>")
-    grouped = build_fix_visit_labels(nodes, legs)
+    grouped = []
+    # build simple grouped labels (no quebrar linhas em unidades)
+    info = [{"eto": None, "efob": None} for _ in nodes]
+    if legs:
+        info[0]["eto"]  = legs[0]["clock_start"]; info[0]["efob"] = legs[0]["efob_start"]
+        for i in range(1, len(nodes)):
+            Lprev = legs[i-1]; info[i]["eto"]  = Lprev["clock_end"]; info[i]["efob"] = Lprev["efob_end"]
+    seen=set()
+    for idx,N in enumerate(nodes):
+        key=(round(N["lat"],6),round(N["lon"],6),re.sub(r"\s+#\d+$","",str(N["name"])))
+        if key not in seen:
+            seen.add(key)
+            grouped.append({"name": key[2], "lat": N["lat"], "lon": N["lon"], "pairs":[(info[idx]["efob"], info[idx]["eto"])]})
+        else:
+            for g in grouped:
+                if g["name"]==key[2] and abs(g["lat"]-N["lat"])<1e-6 and abs(g["lon"]-N["lon"])<1e-6:
+                    g["pairs"].append((info[idx]["efob"], info[idx]["eto"]))
+                    break
     for g in grouped:
         fs_name = int(14*st.session_state.text_scale); fs_line = int(11.5*st.session_state.text_scale)
-        body = "".join([f"<div style='text-align:center;margin-top:1px'><div style='font-size:{fs_line}px'>{(p[0] or 0):.1f} L</div><div style='font-size:{fs_line-1}px'>{p[1] or '-'}</div></div>" for p in g["pairs"]])
-        label = f"""<div style="text-align:center;color:#111;font-weight:900;text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;">
-        <div style="font-size:{fs_name}px; white-space:nowrap">{g['name']}</div>{body}</div>"""
+        body = "".join([
+            f"<div style='text-align:center;margin-top:1px;white-space:nowrap'>"
+            f"<div style='font-size:{fs_line}px;white-space:nowrap'>{fmt_L(p[0] if p[0] is not None else 0)}</div>"
+            f"<div style='font-size:{fs_line-1}px;white-space:nowrap'>{p[1] or '-'}</div>"
+            f"</div>"
+            for p in g["pairs"]
+        ])
+        label = f"""<div style="text-align:center;color:#111;font-weight:900;
+            text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff; white-space:nowrap;">
+            <div style="font-size:{fs_name}px; white-space:nowrap">{g['name']}</div>{body}</div>"""
         html_marker(m, g["lat"], g["lon"], label)
 
     st_folium(m, width=None, height=760, key="mainmap", returned_objects=[])
@@ -694,7 +695,6 @@ def _build_payloads_main(legs, *, callsign, registration, student, lesson, instr
     obs = f"Climb {_pdf_mmss(_sum_time(legs,'CLIMB'))} / Cruise {_pdf_mmss(_sum_time(legs,'LEVEL'))} / Descent {_pdf_mmss(_sum_time(legs,'DESCENT'))}"
     climb_burn = _sum_burn(legs,'CLIMB')
 
-    # até 22 linhas de pernas
     N = min(len(legs), 22)
     legs_main = legs[:N]
     d = {
@@ -726,7 +726,7 @@ def _build_payloads_main(legs, *, callsign, registration, student, lesson, instr
         d[f"Leg{j:02d}_ETO"] = legs_main[-1]["clock_end"]
         d[f"Leg{j:02d}_Estimated_FOB"] = f"{legs_main[-1]['efob_end']:.1f}"
 
-    # totais
+    # totais (linha 23)
     d["Leg23_Leg_Distance"] = f"{total_dist:.1f}"
     d["Leg23_Leg_ETE"]      = _pdf_mmss(total_sec)
     d["Leg23_Planned_Burnoff"] = f"{total_burn:.1f}"
@@ -825,4 +825,5 @@ if make_pdfs:
             out_cont = _fill_pdf(TEMPLATE_CONT, "NAVLOG_FILLED_1.pdf", d_cont)
             with open(out_cont, "rb") as f:
                 st.download_button("⬇️ NAVLOG (continuação)", f.read(), file_name="NAVLOG_FILLED_1.pdf", use_container_width=True)
+
 
