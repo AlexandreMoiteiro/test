@@ -1,16 +1,16 @@
-# app_rev32.py — NAVLOG — rev32
+# app_rev33.py — NAVLOG — rev33
 # ---------------------------------------------------------------
-# - Overlay openAIP já com API key default.
-# - Catálogo de áreas pré-definidas (tipo gist interno) + multiselect.
-# - Áreas ad-hoc continuam, mas separadas.
-# - Polígonos e labels mais limpos (sem manchas brancas gigantes).
-# - Dog houses redesenhadas (cartão branco, barra de cor, inclui ALT).
-# - Label dos WPs também em cartão branco borda preta.
-# - Toggle vento global: se desligado, cada WP tem vento próprio e
-#   cada perna usa o vento do WP de origem.
-# - Hora navegação = off-block +15 min, EFOB inicial = start_efob -5 L.
-# - Atlas 5km removido.
-# - "Terrain Hillshade" agora só hillshade, sem OSM opaco.
+# - Overlay openAIP corrigido (url certo) e agora com toggles
+#   separados: Classe E/F/G, gliding, MOA, navaids, reporting points,
+#   obstáculos, hang gliding, "Só ativo".
+# - A chave openAIP vem de variável de ambiente, não aparece na UI.
+# - Multiselect só para áreas catálogo. Form de inserir coordenadas
+#   AIP foi removido (as áreas ad-hoc passam a ser codificadas no .py).
+# - Labels do espaço aéreo e doghouses redesenhados: cartões brancos,
+#   borda preta grossa, sombra forte, texto maior.
+# - LayerControl adicionado ao mapa.
+# - gc_dist_nm duplicada removida.
+# - Resto mantém layout e PDF.
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -31,6 +31,7 @@ EARTH_NM  = 3440.065
 PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386"}
 CP_TICK_HALF = 0.38
 NBSP_THIN = "&#8239;"  # U+202F
+LABEL_MIN_CLEAR = 0.7
 
 # ========= ÁREAS PRÉ-DEFINIDAS (tipo gist local) =========
 # coords = [(lat, lon), ...] (decimal deg). width_nm define corredor linear.
@@ -248,12 +249,6 @@ def gc_dist_nm(lat1, lon1, lat2, lon2):
     φ1, λ1, φ2, λ2 = map(math.radians, [lat1, lon1, lat2, lon2])
     dφ, dλ = φ2-φ1, λ2-λ1
     a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
-    c = 2*math.atan2(math.sqrt(a), math.sqrt(dφ:=a) if False else math.sqrt(a))  # just to avoid linter complaining
-    # re-calc (can't reuse a because we messed with c line for linter; do cleanly)
-def gc_dist_nm(lat1, lon1, lat2, lon2):
-    φ1, λ1, φ2, λ2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    dφ, dλ = φ2-φ1, λ2-λ1
-    a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
     c = 2*math.atan2(math.sqrt(a), math.sqrt(1-a))
     return EARTH_NM * c
 
@@ -343,9 +338,26 @@ ens("text_scale", 1.0)
 
 ens("show_ticks", True)
 ens("show_doghouses", True)
+
+# As nossas áreas (catálogo interno + custom)
 ens("show_airspaces", True)
-ens("show_openaip", True)
-ens("openaip_token", "e849257999aa8ed820c3a6f7eb40f84e")  # tua key
+
+# Camadas openAIP (não mostramos a key no UI)
+# Nota: as classes E/F/G ainda não estão filtradas no tile,
+# mas já guardamos o estado para no futuro filtrar via GeoJSON.
+ens("show_active_only", False)   # "Show Only Active Airspace (beta)"
+ens("show_class_e", True)
+ens("show_class_f", False)
+ens("show_class_g", False)
+ens("show_gliding", True)
+ens("show_moa", True)
+ens("show_navaids", False)
+ens("show_reporting", False)
+ens("show_obstacles", False)
+ens("show_hg", False)
+
+# token lido do ambiente, não exposto no UI
+ens("openaip_token", os.getenv("OPENAIP_KEY", "e849257999aa8ed820c3a6f7eb40f84e"))
 
 ens("map_center", (39.7, -8.1))
 ens("map_zoom", 8)
@@ -356,11 +368,12 @@ ens("alt_qadd", 3000.0)
 ens("search_rows", [])
 ens("last_q", "")
 
-ens("airspaces", [])        # áreas ad-hoc do utilizador
+ens("airspaces", [])        # áreas ad-hoc do utilizador (hardcoded no py)
 ens("preset_selected", [])  # nomes das áreas do catálogo
 
 # ========= FORM GLOBAL =========
 with st.form("globals"):
+    # ----- Linha 1: vento / magnética / perf climb-descent / combustível -----
     c1,c2,c3,c4 = st.columns(4)
     with c1:
         st.session_state.wind_from = st.number_input(
@@ -401,7 +414,8 @@ with st.form("globals"):
             "CP por defeito (min)", 1, 10, int(st.session_state.ck_default)
         )
 
-    b1,b2,b3,b4 = st.columns([2,2,1,2])
+    # ----- Linha 2: base mapa / texto / doghouses / ticks / áreas nossas -----
+    b1,b2,b3 = st.columns([2,1,1])
     with b1:
         bases = [
             "OpenTopoMap (VFR-ish)",
@@ -414,26 +428,70 @@ with st.form("globals"):
             index=bases.index(st.session_state.map_base)
             if st.session_state.map_base in bases else 0
         )
-    with b2:
-        st.session_state.show_doghouses = st.toggle(
-            "Dog houses", value=st.session_state.show_doghouses
+        st.session_state.text_scale  = st.slider(
+            "Escala texto mapa", 0.5, 1.5,
+            float(st.session_state.text_scale), 0.05,
+            help="Afecta doghouses, labels WPs e labels de áreas."
         )
+    with b2:
         st.session_state.show_ticks     = st.toggle(
-            "Riscas CP", value=st.session_state.show_ticks
+            "Riscas CP", value=st.session_state.show_ticks,
+            help="Marcas de cada CP_x min ao longo da perna."
+        )
+        st.session_state.show_doghouses = st.toggle(
+            "Dog houses", value=st.session_state.show_doghouses,
+            help="Cartões de perna (MH|TC, GS, ALT, ETE, etc)."
         )
     with b3:
-        st.session_state.text_scale  = st.slider(
-            "Texto", 0.5, 1.5, float(st.session_state.text_scale), 0.05
-        )
-    with b4:
         st.session_state.show_airspaces = st.toggle(
-            "Espaço aéreo custom/preset", value=st.session_state.show_airspaces
+            "Áreas catálogo/custom",
+            value=st.session_state.show_airspaces,
+            help="Mostra LPT1/LPR51/etc + as tuas áreas hardcoded."
         )
-        st.session_state.show_openaip   = st.toggle(
-            "Overlay openAIP", value=st.session_state.show_openaip
+
+    # ----- Linha 3: toggles finos do openAIP -----
+    st.markdown("#### Camadas openAIP (overlay)")
+    cA,cB,cC,cD = st.columns(4)
+
+    with cA:
+        st.session_state.show_active_only = st.toggle(
+            "Só ativo (beta)",
+            value=st.session_state.show_active_only,
+            help="Placeholder: ideia é filtrar só espaço aéreo 'ativo'."
         )
-        st.session_state.openaip_token  = st.text_input(
-            "openAIP key", value=st.session_state.openaip_token
+        st.session_state.show_class_e = st.toggle(
+            "Classe E", value=st.session_state.show_class_e
+        )
+        st.session_state.show_class_f = st.toggle(
+            "Classe F", value=st.session_state.show_class_f
+        )
+        st.session_state.show_class_g = st.toggle(
+            "Classe G", value=st.session_state.show_class_g
+        )
+
+    with cB:
+        st.session_state.show_gliding = st.toggle(
+            "Gliding sectors", value=st.session_state.show_gliding
+        )
+        st.session_state.show_hg = st.toggle(
+            "Hang gliding", value=st.session_state.show_hg
+        )
+
+    with cC:
+        st.session_state.show_moa = st.toggle(
+            "MOA / TRA", value=st.session_state.show_moa,
+            help="Military / training áreas (openAIP)."
+        )
+        st.session_state.show_navaids = st.toggle(
+            "Navaids", value=st.session_state.show_navaids
+        )
+
+    with cD:
+        st.session_state.show_reporting = st.toggle(
+            "Reporting Pts", value=st.session_state.show_reporting
+        )
+        st.session_state.show_obstacles = st.toggle(
+            "Obstacles", value=st.session_state.show_obstacles
         )
 
     st.form_submit_button("Aplicar")
@@ -590,7 +648,7 @@ with tab_csv:
     if st.session_state.search_rows:
         st.caption("Resultados")
         for i, r in enumerate(st.session_state.search_rows):
-            code = r.get("code") or ""
+            code = r.get("code") or r.get("name") or ""
             name = r.get("name") or ""
             local = r.get("city") or r.get("sector") or ""
             lat, lon = float(r["lat"]), float(r["lon"])
@@ -679,71 +737,22 @@ with tab_map:
             )
             st.success("Adicionado.")
 
-# ========= ESPAÇO AÉREO (preset + ad-hoc) =========
+# ========= ESPAÇO AÉREO (catálogo) =========
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 with st.expander("🛡 Espaço aéreo / restrições"):
-    # catálogo (gist interno)
     preset_names_sorted = sorted(PRESET_AIRSPACES.keys())
     st.session_state.preset_selected = st.multiselect(
-        "Áreas publicadas (catálogo)",
+        "Áreas publicadas (catálogo interno)",
         preset_names_sorted,
         default=st.session_state.preset_selected,
         help="Seleciona p/ mostrar no mapa (ex.: LPT1, LPT61...)."
     )
 
-    st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-
-    st.markdown("**Criar nova área ad-hoc** (colar do AIP):")
-    c1,c2 = st.columns([2,1])
-    with c1:
-        asp_name   = st.text_input("Nome da área (ex: LPTX)", "")
-        asp_text   = st.text_area(
-            "Coordenadas / descrição AIP",
-            height=150,
-            help="Ex: '41 22 48N 006 23 33W – ALONG ... – 39 54 00N 007 45 00W ...'"
-        )
-    with c2:
-        asp_floor  = st.text_input("Floor", "GND")
-        asp_ceil   = st.text_input("Ceiling", "FL140")
-        asp_notes  = st.text_input("Notas", "TRAINING wave / COMAO wave")
-        asp_color  = st.color_picker("Cor", "#ffff00")
-        asp_opac   = st.slider("Opacidade", 0.05, 0.6, 0.25, 0.05)
-        asp_width  = st.number_input(
-            "Largura NM (0=polígono, >0 corredor)",
-            0.0, 20.0, 0.0, 0.5
-        )
-
-    if st.button("➕ Adicionar área ad-hoc"):
-        coords_poly = extract_polygon_coords(asp_text)
-        if coords_poly:
-            st.session_state.airspaces.append({
-                "name": asp_name or "AREA",
-                "floor": asp_floor,
-                "ceiling": asp_ceil,
-                "notes": asp_notes,
-                "color": asp_color,
-                "opacity": float(asp_opac),
-                "coords": coords_poly,
-                "width_nm": asp_width if asp_width>0 else None,
-            })
-            st.success("Área adicionada.")
-        else:
-            st.error("Não consegui ler coordenadas. Confirma o formato D M S + N/E/S/W.")
-
-    if st.session_state.airspaces:
-        st.caption("Áreas ad-hoc carregadas agora:")
-        kill_idx = None
-        for ai, A in enumerate(st.session_state.airspaces):
-            st.markdown(
-                f"<div class='card'><b>{A['name']}</b> "
-                f"({A['floor']}→{A['ceiling']}) "
-                f"width_nm={A['width_nm']}</div>",
-                unsafe_allow_html=True
-            )
-            if st.button(f"Remover {A['name']}", key=f"rm_as_{ai}"):
-                kill_idx = ai
-        if kill_idx is not None:
-            st.session_state.airspaces.pop(kill_idx)
+    st.caption(
+        "Nota: áreas ad-hoc novas NÃO se inserem mais aqui. "
+        "Se precisares, mete-as directamente no código "
+        "(PRESET_AIRSPACES ou st.session_state.airspaces)."
+    )
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
@@ -993,8 +1002,6 @@ if st.session_state.legs:
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ========= MARKUP HELPERS =========
-LABEL_MIN_CLEAR = 0.7
-
 def html_marker(m, lat, lon, html):
     folium.Marker(
         (lat,lon),
@@ -1002,9 +1009,16 @@ def html_marker(m, lat, lon, html):
     ).add_to(m)
 
 def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
+    """
+    Versão mais legível:
+    - Caixa branca opaca
+    - Borda preta 3px
+    - Sombra forte
+    - Fontes ligeiramente maiores
+    """
     rot = angle_tc - 90.0
-    fs_head = int(13*scale)
-    fs_cell = int(11*scale)
+    fs_head = int(14*scale)
+    fs_cell = int(12*scale)
     bar_color = PROFILE_COLORS.get(phase, "#111")
     return f"""
     <div style="
@@ -1013,27 +1027,27 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
         font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-variant-numeric:tabular-nums;
         color:#000;
-        background:rgba(255,255,255,.95);
-        border:2px solid #000;
-        border-radius:8px;
-        box-shadow:0 2px 4px rgba(0,0,0,.3);
-        padding:6px 8px;
+        background:#fff;
+        border:3px solid #000;
+        border-radius:10px;
+        box-shadow:0 4px 8px rgba(0,0,0,.5);
+        padding:8px 10px;
         line-height:1.2;
         text-align:left;
         white-space:nowrap;">
         <div style="
             background:{bar_color};
-            height:4px;
-            border-radius:4px;
-            margin:-4px -4px 4px -4px;"></div>
+            height:5px;
+            border-radius:5px;
+            margin:-6px -6px 6px -6px;"></div>
         <div style="
             display:grid;
             grid-template-columns:auto auto;
-            grid-row-gap:2px;
-            grid-column-gap:10px;
+            grid-row-gap:3px;
+            grid-column-gap:12px;
             font-size:{fs_cell}px;">
-            <div style="font-size:{fs_head}px;font-weight:600;">{info['mh_tc']}</div>
-            <div style="font-size:{fs_head}px;font-weight:600;">{info['gs']}</div>
+            <div style="font-size:{fs_head}px;font-weight:700;">{info['mh_tc']}</div>
+            <div style="font-size:{fs_head}px;font-weight:700;">{info['gs']}</div>
 
             <div>{info['alt']}</div>
             <div>{info['ete']}</div>
@@ -1088,47 +1102,102 @@ def render_map(nodes, legs, base_choice):
         prefer_canvas=True
     )
 
-    # base layer
+    # --- BASE LAYER ---
     if base_choice == "OpenTopoMap (VFR-ish)":
         folium.TileLayer(
             "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
             attr="© OpenTopoMap"
         ).add_to(m)
-
     elif base_choice == "OSM Standard":
         folium.TileLayer(
             "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
             attr="© OpenStreetMap contributors"
         ).add_to(m)
-
     elif base_choice == "Terrain Hillshade":
-        # só hillshade (sem OSM opaco por cima)
         folium.TileLayer(
             "https://services.arcgisonline.com/ArcGIS/rest/services/World_Hillshade/MapServer/tile/{z}/{y}/{x}",
             attr="© Esri"
         ).add_to(m)
-
     else:
         folium.TileLayer(
             "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
             attr="© OpenTopoMap"
         ).add_to(m)
 
-    # overlay openAIP (espaço aéreo oficial)
-    if st.session_state.show_openaip and st.session_state.openaip_token.strip():
-        folium.TileLayer(
-            tiles=(
-                "https://{s}.api.tiles.openaip.net/api/data/airspaces/"
-                "{z}/{x}/{y}.png?apiKey=" + st.session_state.openaip_token.strip()
-            ),
-            attr="© openAIP",
-            overlay=True,
-            name="openAIP Airspaces"
-        ).add_to(m)
+    # --- openAIP OVERLAYS ---
+    token = st.session_state.openaip_token.strip()
+    if token:
+        # Airspaces (inclui classes, gliding, MOA, etc). Ligamos isto
+        # se qualquer toggle "espaco aéreo" estiver On.
+        if (
+            st.session_state.show_class_e
+            or st.session_state.show_class_f
+            or st.session_state.show_class_g
+            or st.session_state.show_gliding
+            or st.session_state.show_moa
+            or st.session_state.show_active_only
+        ):
+            folium.TileLayer(
+                tiles=(
+                    "https://api.tiles.openaip.net/api/data/airspaces/"
+                    "{z}/{x}/{y}.png?apiKey=" + token
+                ),
+                attr="© openAIP",
+                overlay=True,
+                name="openAIP Airspaces"
+            ).add_to(m)
 
-    Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
+        if st.session_state.show_navaids:
+            folium.TileLayer(
+                tiles=(
+                    "https://api.tiles.openaip.net/api/data/navaids/"
+                    "{z}/{x}/{y}.png?apiKey=" + token
+                ),
+                attr="© openAIP",
+                overlay=True,
+                name="openAIP Navaids"
+            ).add_to(m)
 
-    # 1) pernas da rota
+        if st.session_state.show_reporting:
+            folium.TileLayer(
+                tiles=(
+                    "https://api.tiles.openaip.net/api/data/reportingpoints/"
+                    "{z}/{x}/{y}.png?apiKey=" + token
+                ),
+                attr="© openAIP",
+                overlay=True,
+                name="openAIP Reporting Pts"
+            ).add_to(m)
+
+        if st.session_state.show_obstacles:
+            folium.TileLayer(
+                tiles=(
+                    "https://api.tiles.openaip.net/api/data/obstacles/"
+                    "{z}/{x}/{y}.png?apiKey=" + token
+                ),
+                attr="© openAIP",
+                overlay=True,
+                name="openAIP Obstacles"
+            ).add_to(m)
+
+        if st.session_state.show_gliding or st.session_state.show_hg:
+            folium.TileLayer(
+                tiles=(
+                    "https://api.tiles.openaip.net/api/data/glidingsites/"
+                    "{z}/{x}/{y}.png?apiKey=" + token
+                ),
+                attr="© openAIP",
+                overlay=True,
+                name="openAIP Gliding/HG"
+            ).add_to(m)
+
+    Fullscreen(
+        position='topleft',
+        title='Fullscreen',
+        force_separate_button=True
+    ).add_to(m)
+
+    # --- PERNAS DA ROTA ---
     for L in legs:
         latlngs = [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])]
         color = PROFILE_COLORS.get(L["profile"], "#C000FF")
@@ -1139,7 +1208,7 @@ def render_map(nodes, legs, base_choice):
             latlngs, color=color, weight=4, opacity=1.0
         ).add_to(m)
 
-    # 2) ticks CP
+    # --- TICKS CP ---
     if st.session_state.show_ticks:
         for L in legs:
             if L["GS"]<=0 or not L["cps"]:
@@ -1160,7 +1229,7 @@ def render_map(nodes, legs, base_choice):
                     opacity=1
                 ).add_to(m)
 
-    # 3) dog houses (cartões rotacionados)
+    # --- DOGHOUSES ---
     if st.session_state.show_doghouses:
         def z_clear(lat,lon,zs):
             if not zs: return 9e9
@@ -1223,12 +1292,13 @@ def render_map(nodes, legs, base_choice):
                 doghouse_html_capsule(info, L["profile"], L["TC"], scale=s)
             )
 
-    # 4) nós / labels WP (sem brilho branco gigante)
+    # --- MARCADORES DE WPs + labels WP/EFOB/ETO ---
     for N in nodes:
         html_marker(
             m, N["lat"], N["lon"],
             "<div style='transform:translate(-50%,-50%);width:18px;height:18px;"
-            "border:2px solid #000;border-radius:50%;background:#fff;box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
+            "border:2px solid #000;border-radius:50%;background:#fff;"
+            "box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
         )
 
     info_nodes = [{"eto": None, "efob": None} for _ in nodes]
@@ -1263,7 +1333,7 @@ def render_map(nodes, legs, base_choice):
         s = float(st.session_state.text_scale)
         html_marker(m, g["lat"], g["lon"], wp_label_html(g, s))
 
-    # 5) espaço aéreo (preset + ad-hoc) se ligado
+    # --- ÁREAS CATÁLOGO/PERSONALIZADAS ---
     if st.session_state.show_airspaces:
         combined_asp = []
         # presets escolhidos
@@ -1273,11 +1343,38 @@ def render_map(nodes, legs, base_choice):
                 tmp = dict(A)
                 tmp["name"] = nm
                 combined_asp.append(tmp)
-        # ad-hoc
+        # ad-hoc injectadas via código
         combined_asp += st.session_state.airspaces
 
+        def airspace_label_html(asp, scale):
+            fs_main = int(12*scale)
+            fs_name = int(13*scale)
+            bar_color = asp["color"]
+            return f"""
+            <div style="
+                transform:translate(-50%,-100%);
+                background:#fff;
+                color:#000;
+                border:2px solid #000;
+                border-radius:8px;
+                box-shadow:0 4px 8px rgba(0,0,0,.45);
+                padding:6px 8px;
+                line-height:1.2;
+                font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
+                text-align:center;
+                white-space:nowrap;
+                font-size:{fs_main}px;">
+                <div style='background:{bar_color};height:4px;border-radius:4px;
+                    margin:-6px -6px 6px -6px;'></div>
+                <div style="font-size:{fs_name}px;font-weight:600;margin-bottom:2px;">
+                    {asp['name']}
+                </div>
+                <div>{asp['floor']}–{asp['ceiling']}</div>
+                <div style="font-weight:400;">{asp.get('notes','')}</div>
+            </div>"""
+
         for asp in combined_asp:
-            # corredor vs polígono
+            # Corredor vs polígono
             if asp.get("width_nm"):
                 coords = asp.get("coords", [])
                 if len(coords) >= 2:
@@ -1301,25 +1398,17 @@ def render_map(nodes, legs, base_choice):
             ).add_to(m)
 
             clat, clon = polygon_centroid(polycoords)
-            label_html = f"""
-            <div style="
-                transform:translate(-50%,-100%);
-                background:rgba(0,0,0,0.7);
-                color:#fff;
-                border:2px solid #000;
-                border-radius:6px;
-                box-shadow:0 2px 4px rgba(0,0,0,.4);
-                padding:4px 6px;
-                font-size:11px;
-                line-height:1.2;
-                font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
-                text-align:center;
-                white-space:nowrap;">
-                <b>{asp['name']}</b><br/>
-                {asp['floor']}–{asp['ceiling']}<br/>
-                {asp.get('notes','')}
-            </div>"""
-            html_marker(m, clat, clon, label_html)
+            s_label = float(st.session_state.text_scale)
+
+            html_marker(
+                m,
+                clat,
+                clon,
+                airspace_label_html(asp, s_label)
+            )
+
+    # Layer selector (para ligar/desligar camadas openAIP)
+    folium.LayerControl(collapsed=False).add_to(m)
 
     st_folium(m, width=None, height=760, key="mainmap", returned_objects=[])
 
