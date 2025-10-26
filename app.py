@@ -1,26 +1,27 @@
-# app_rev31.py — NAVLOG — rev31
+# app_rev32.py — NAVLOG — rev32
 # ---------------------------------------------------------------
-# - Dog houses redesenhadas (cartão com barra de fase, inclui ALT).
-# - Off-block +15 min antes de iniciar clocks de navegação.
-# - EFOB inicial efetiva = start_efob - 5 L.
-# - Espaço aéreo custom (LPT1/LPT2/...): parser e desenho no mapa.
-# - Toggle de camadas (dog houses / CP ticks / espaço aéreo / openAIP).
-# - Overlay openAIP airspaces (precisa API key). [tiles.openaip.net] :contentReference[oaicite:1]{index=1}
-# - Atlas 5 km para impressão (PDF multipágina, escala aproximada).
+# - Overlay openAIP já com API key default.
+# - Catálogo de áreas pré-definidas (tipo gist interno) + multiselect.
+# - Áreas ad-hoc continuam, mas separadas.
+# - Polígonos e labels mais limpos (sem manchas brancas gigantes).
+# - Dog houses redesenhadas (cartão branco, barra de cor, inclui ALT).
+# - Label dos WPs também em cartão branco borda preta.
+# - Toggle vento global: se desligado, cada WP tem vento próprio e
+#   cada perna usa o vento do WP de origem.
+# - Hora navegação = off-block +15 min, EFOB inicial = start_efob -5 L.
+# - Atlas 5km removido.
+# - "Terrain Hillshade" agora só hillshade, sem OSM opaco.
 # ---------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
-import folium, math, re, datetime as dt, difflib, os, io
+import folium, math, re, datetime as dt, difflib, os
 from streamlit_folium import st_folium
 from folium.plugins import Fullscreen, MarkerCluster
 from math import degrees
 from pdfrw import PdfReader, PdfWriter, PdfDict, PdfName
-from PIL import Image
-import matplotlib.pyplot as plt
-import numpy as np
 
-# ======== CONSTANTES ========
+# ========= CONSTANTES =========
 TEMPLATE_MAIN = "NAVLOG_FORM.pdf"
 TEMPLATE_CONT = "NAVLOG_FORM_1.pdf"
 
@@ -29,9 +30,173 @@ FUEL_FLOW = 20.0
 EARTH_NM  = 3440.065
 PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386"}
 CP_TICK_HALF = 0.38
-NBSP_THIN = "&#8239;"  # U+202F thin-ish space for units
+NBSP_THIN = "&#8239;"  # U+202F
 
-# ======== ESTILO STREAMLIT / UI BASE ========
+# ========= ÁREAS PRÉ-DEFINIDAS (tipo gist local) =========
+# coords = [(lat, lon), ...] (decimal deg). width_nm define corredor linear.
+PRESET_AIRSPACES = {
+    "LPT1": {
+        "floor": "GND", "ceiling": "FL280",
+        "notes": "TRAINING/COMAO",
+        "color": "#ffff00", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (41.38, -6.3925),
+            (39.899167, -6.899722),
+            (39.9, -7.75),
+            (40.731111, -7.75),
+            (41.3, -7.383333),
+            (41.38, -6.3925),
+        ],
+    },
+    "LPT2": {
+        "floor": "GND", "ceiling": "FL245",
+        "notes": "TRAINING/COMAO",
+        "color": "#ffff00", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (39.9, -7.75),
+            (39.893611, -6.899722),
+            (39.666667, -7.030556),
+            (39.666667, -7.75),
+            (39.9, -7.75),
+        ],
+    },
+    "LPT3": {
+        "floor": "GND", "ceiling": "FL190",
+        "notes": "TRAINING/COMAO",
+        "color": "#ffff00", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (39.666667, -8.0),
+            (39.666667, -7.533333),
+            (39.1, -7.083333),
+            (38.85, -7.75),
+            (39.333333, -7.75),
+            (39.666667, -8.0),
+        ],
+    },
+    "LPTRA57": {
+        "floor": "GND", "ceiling": "FL245",
+        "notes": "TRAINING/COMAO",
+        "color": "#ffdd00", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (39.099167, -7.115556),
+            (38.5525, -7.285278),
+            (38.548611, -8.048889),
+            (38.744444, -8.05),
+            (39.099167, -7.115556),
+        ],
+    },
+    "LPR51BN": {
+        "floor": "GND", "ceiling": "FL240",
+        "notes": "TRAINING/COMAO",
+        "color": "#d4ff00", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (38.548611, -8.048889),
+            (38.5525, -7.285278),
+            (38.125, -6.960278),
+            (38.115278, -8.171111),
+            (38.348611, -8.267778),
+            (38.548611, -8.048889),
+        ],
+    },
+    "LPR51BS1": {
+        "floor": "GND", "ceiling": "FL140",
+        "notes": "TRAINING",
+        "color": "#c8ff00", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (38.115278, -8.171111),
+            (38.125, -6.960278),
+            (37.597222, -7.499167),
+            (37.597222, -7.95),
+            (38.115278, -8.171111),
+        ],
+    },
+    "LPR51BS2": {
+        "floor": "GND", "ceiling": "FL060",
+        "notes": "TRAINING",
+        "color": "#baff00", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (37.597222, -7.95),
+            (37.597222, -7.499167),
+            (37.4175, -7.443333),
+            (37.415278, -7.884444),
+            (37.597222, -7.95),
+        ],
+    },
+    "LPT10": {
+        "floor": "GND", "ceiling": "FL140",
+        "notes": "TRAINING",
+        "color": "#fff000", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (39.666667, -8.333333),
+            (39.666667, -8.0),
+            (39.333333, -7.75),
+            (39.306944, -7.75),
+            (39.306944, -8.358333),
+            (39.383611, -8.358333),
+            (39.383611, -8.449444),
+            (39.425833, -8.494722),
+            (39.515278, -8.451389),
+            (39.666667, -8.333333),
+        ],
+    },
+    "LPT11": {
+        "floor": "GND", "ceiling": "FL140",
+        "notes": "TRAINING",
+        "color": "#fff000", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (39.9, -8.083333),
+            (39.9, -7.75),
+            (39.666667, -7.75),
+            (39.666667, -8.333333),
+            (39.9, -8.083333),
+        ],
+    },
+    "LPT12": {
+        "floor": "GND", "ceiling": "FL140",
+        "notes": "TRAINING",
+        "color": "#fff000", "opacity": 0.25,
+        "width_nm": None,
+        "coords": [
+            (39.9, -7.75),
+            (40.583333, -7.75),
+            (40.583333, -8.083333),
+            (39.9, -8.083333),
+            (39.9, -7.75),
+        ],
+    },
+    # Corredores (width_nm = 5 NM ~ 9.3km).
+    "LPT61": {
+        "floor": "GND", "ceiling": "2000FT AMSL",
+        "notes": "Transit Corridor",
+        "color": "#adff00", "opacity": 0.25,
+        "width_nm": 5.0,
+        "coords": [
+            (38.758333, -7.971667),
+            (39.325, -8.270833),
+        ],
+    },
+    "LPT63": {
+        "floor": "GND", "ceiling": "2000FT AMSL",
+        "notes": "Transit Corridor",
+        "color": "#adff00", "opacity": 0.25,
+        "width_nm": 5.0,
+        "coords": [
+            (38.366667, -8.233333),
+            (38.583333, -8.583333),
+        ],
+    },
+}
+
+# ========= ESTILO STREAMLIT =========
 st.set_page_config(page_title="NAVLOG", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
@@ -47,9 +212,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ======== PEQUENAS FUNÇÕES NUM/CALC ========
+# ========= FUNÇÕES NUM / GEO =========
 rt10 = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
-def mmss(t): 
+def mmss(t):
     t=int(t)
     return f"{t//60:02d}:{t%60:02d}"
 def hhmmss(t):
@@ -83,6 +248,12 @@ def gc_dist_nm(lat1, lon1, lat2, lon2):
     φ1, λ1, φ2, λ2 = map(math.radians, [lat1, lon1, lat2, lon2])
     dφ, dλ = φ2-φ1, λ2-λ1
     a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
+    c = 2*math.atan2(math.sqrt(a), math.sqrt(dφ:=a) if False else math.sqrt(a))  # just to avoid linter complaining
+    # re-calc (can't reuse a because we messed with c line for linter; do cleanly)
+def gc_dist_nm(lat1, lon1, lat2, lon2):
+    φ1, λ1, φ2, λ2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dφ, dλ = φ2-φ1, λ2-λ1
+    a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
     c = 2*math.atan2(math.sqrt(a), math.sqrt(1-a))
     return EARTH_NM * c
 
@@ -111,14 +282,12 @@ def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
-# Centroide simples de polígono (média dos vértices)
 def polygon_centroid(coords):
     if not coords: return (0.0,0.0)
     lats = [c[0] for c in coords]
     lons = [c[1] for c in coords]
     return (sum(lats)/len(lats), sum(lons)/len(lons))
 
-# Cria polígono para um "corredor" largura width_nm entre p1 e p2
 def corridor_polygon(p1, p2, width_nm):
     lat1, lon1 = p1
     lat2, lon2 = p2
@@ -128,10 +297,9 @@ def corridor_polygon(p1, p2, width_nm):
     right1 = dest_point(lat1, lon1, tc+90, half)
     left2  = dest_point(lat2, lon2, tc-90, half)
     right2 = dest_point(lat2, lon2, tc+90, half)
-    poly = [left1, left2, right2, right1, left1]
-    return poly
+    return [left1, left2, right2, right1, left1]
 
-# Parser de coordenadas de texto AIP (D M S + N/S + D M S + E/W ...)
+# parser AIP "38 22 00N 008 14 00W ..."
 coord_pattern = re.compile(
     r"(\d{2})\s+(\d{2})\s+(\d{2})([NS])\s+(\d{3})\s+(\d{2})\s+(\d{2})([EW])",
     re.IGNORECASE
@@ -150,11 +318,14 @@ def extract_polygon_coords(raw_text:str):
         coords.append(coords[0])
     return coords
 
-# ======== STATE DEFAULTS ========
-def ens(k, v): return st.session_state.setdefault(k, v)
+# ========= STATE DEFAULTS =========
+def ens(k, v):
+    return st.session_state.setdefault(k, v)
 
 ens("wind_from", 0)
 ens("wind_kt", 0)
+ens("use_global_wind", True)
+
 ens("mag_var", 1.0)
 ens("mag_is_e", False)
 ens("roc_fpm", 600)
@@ -162,17 +333,19 @@ ens("rod_fpm", 500)
 ens("start_clock", "")
 ens("start_efob", 85.0)
 ens("ck_default", 2)
-ens("wps", [])
+
+ens("wps", [])          # cada wp: {name,lat,lon,alt,wind_from,wind_kt}
 ens("legs", [])
 ens("route_nodes", [])
+
 ens("map_base", "OpenTopoMap (VFR-ish)")
 ens("text_scale", 1.0)
 
 ens("show_ticks", True)
 ens("show_doghouses", True)
 ens("show_airspaces", True)
-ens("show_openaip", False)
-ens("openaip_token", "")
+ens("show_openaip", True)
+ens("openaip_token", "e849257999aa8ed820c3a6f7eb40f84e")  # tua key
 
 ens("map_center", (39.7, -8.1))
 ens("map_zoom", 8)
@@ -183,53 +356,91 @@ ens("alt_qadd", 3000.0)
 ens("search_rows", [])
 ens("last_q", "")
 
-ens("airspaces", [])          # lista de áreas custom inseridas pelo utilizador
-ens("atlas_radius_km", 5.0)   # raio km para atlas 5km
+ens("airspaces", [])        # áreas ad-hoc do utilizador
+ens("preset_selected", [])  # nomes das áreas do catálogo
 
-# ======== PARÂMETROS GLOBAIS (form topo) ========
+# ========= FORM GLOBAL =========
 with st.form("globals"):
     c1,c2,c3,c4 = st.columns(4)
     with c1:
-        st.session_state.wind_from = st.number_input("Vento FROM (°T)", 0, 360, int(st.session_state.wind_from))
-        st.session_state.wind_kt   = st.number_input("Vento (kt)", 0, 150, int(st.session_state.wind_kt))
+        st.session_state.wind_from = st.number_input(
+            "Vento global FROM (°T)", 0, 360, int(st.session_state.wind_from)
+        )
+        st.session_state.wind_kt   = st.number_input(
+            "Vento global (kt)", 0, 150, int(st.session_state.wind_kt)
+        )
+        st.session_state.use_global_wind = st.toggle(
+            "Usar vento global", value=st.session_state.use_global_wind,
+            help="Desliga para meter vento individual em cada WP."
+        )
+
     with c2:
-        st.session_state.mag_var   = st.number_input("Variação magnética (±°)", -30.0, 30.0, float(st.session_state.mag_var))
-        st.session_state.mag_is_e  = st.toggle("Var. é EAST (subtrai)", value=st.session_state.mag_is_e)
+        st.session_state.mag_var   = st.number_input(
+            "Variação magnética (±°)", -30.0, 30.0, float(st.session_state.mag_var)
+        )
+        st.session_state.mag_is_e  = st.toggle(
+            "Var. é EAST (subtrai)", value=st.session_state.mag_is_e
+        )
+
     with c3:
-        st.session_state.roc_fpm   = st.number_input("ROC global (ft/min)", 200, 1500, int(st.session_state.roc_fpm), step=10)
-        st.session_state.rod_fpm   = st.number_input("ROD global (ft/min)", 200, 1500, int(st.session_state.rod_fpm), step=10)
+        st.session_state.roc_fpm   = st.number_input(
+            "ROC global (ft/min)", 200, 1500, int(st.session_state.roc_fpm), step=10
+        )
+        st.session_state.rod_fpm   = st.number_input(
+            "ROD global (ft/min)", 200, 1500, int(st.session_state.rod_fpm), step=10
+        )
+
     with c4:
-        st.session_state.start_efob= st.number_input("EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5)
-        st.session_state.start_clock = st.text_input("Hora off-blocks (HH:MM)", st.session_state.start_clock)
-        st.session_state.ck_default  = st.number_input("CP por defeito (min)", 1, 10, int(st.session_state.ck_default))
+        st.session_state.start_efob= st.number_input(
+            "EFOB inicial (L)", 0.0, 200.0, float(st.session_state.start_efob), step=0.5
+        )
+        st.session_state.start_clock = st.text_input(
+            "Hora off-blocks (HH:MM)", st.session_state.start_clock
+        )
+        st.session_state.ck_default  = st.number_input(
+            "CP por defeito (min)", 1, 10, int(st.session_state.ck_default)
+        )
 
     b1,b2,b3,b4 = st.columns([2,2,1,2])
     with b1:
         bases = [
             "OpenTopoMap (VFR-ish)",
             "OSM Standard",
-            "Terrain (Hillshade ft)"
+            "Terrain Hillshade"
         ]
         st.session_state.map_base = st.selectbox(
             "Base do mapa",
             bases,
-            index=bases.index(st.session_state.map_base) if st.session_state.map_base in bases else 0
+            index=bases.index(st.session_state.map_base)
+            if st.session_state.map_base in bases else 0
         )
     with b2:
-        st.session_state.show_doghouses = st.toggle("Dog houses", value=st.session_state.show_doghouses)
-        st.session_state.show_ticks     = st.toggle("Riscas CP", value=st.session_state.show_ticks)
+        st.session_state.show_doghouses = st.toggle(
+            "Dog houses", value=st.session_state.show_doghouses
+        )
+        st.session_state.show_ticks     = st.toggle(
+            "Riscas CP", value=st.session_state.show_ticks
+        )
     with b3:
-        st.session_state.text_scale  = st.slider("Texto", 0.5, 1.5, float(st.session_state.text_scale), 0.05)
+        st.session_state.text_scale  = st.slider(
+            "Texto", 0.5, 1.5, float(st.session_state.text_scale), 0.05
+        )
     with b4:
-        st.session_state.show_airspaces = st.toggle("Espaço aéreo custom", value=st.session_state.show_airspaces)
-        st.session_state.show_openaip   = st.toggle("Overlay openAIP", value=st.session_state.show_openaip)
-        st.session_state.openaip_token  = st.text_input("openAIP key", value=st.session_state.openaip_token)
+        st.session_state.show_airspaces = st.toggle(
+            "Espaço aéreo custom/preset", value=st.session_state.show_airspaces
+        )
+        st.session_state.show_openaip   = st.toggle(
+            "Overlay openAIP", value=st.session_state.show_openaip
+        )
+        st.session_state.openaip_token  = st.text_input(
+            "openAIP key", value=st.session_state.openaip_token
+        )
 
     st.form_submit_button("Aplicar")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== CSVs ========
+# ========= CSVs / DB pontos =========
 AD_CSV  = "AD-HEL-ULM.csv"
 LOC_CSV = "Localidades-Nova-versao-230223.csv"
 
@@ -261,16 +472,22 @@ def parse_ad_df(df: pd.DataFrame) -> pd.DataFrame:
         coord_toks = [t for t in tokens if re.match(r"^\d+(?:\.\d+)?[NSEW]$", t)]
         if len(coord_toks) >= 2:
             lat_tok = coord_toks[-2]; lon_tok = coord_toks[-1]
-            lat = dms_to_dd(lat_tok, is_lon=False); lon = dms_to_dd(lon_tok, is_lon=True)
+            lat = dms_to_dd(lat_tok, is_lon=False)
+            lon = dms_to_dd(lon_tok, is_lon=True)
             ident = tokens[0] if re.match(r"^[A-Z0-9]{4,}$", tokens[0]) else None
-            try:    name = " ".join(tokens[1:tokens.index(coord_toks[0])]).strip()
-            except: name = " ".join(tokens[1:]).strip()
+            try:
+                name = " ".join(tokens[1:tokens.index(coord_toks[0])]).strip()
+            except:
+                name = " ".join(tokens[1:]).strip()
             try:
                 lon_idx = tokens.index(lon_tok)
                 city = " ".join(tokens[lon_idx+1:]) or None
             except:
                 city = None
-            rows.append({"src":"AD","code":ident or name, "name":name, "city":city,"lat":lat,"lon":lon,"alt":0.0})
+            rows.append({
+                "src":"AD","code":ident or name,"name":name,"city":city,
+                "lat":lat,"lon":lon,"alt":0.0
+            })
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
 def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -282,13 +499,19 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
         coord_toks = [t for t in tokens if re.match(r"^\d{6,7}(?:\.\d+)?[NSEW]$", t)]
         if len(coord_toks) >= 2:
             lat_tok, lon_tok = coord_toks[0], coord_toks[1]
-            lat = dms_to_dd(lat_tok, is_lon=False); lon = dms_to_dd(lon_tok, is_lon=True)
-            try: lon_idx = tokens.index(lon_tok)
-            except ValueError: continue
+            lat = dms_to_dd(lat_tok, is_lon=False)
+            lon = dms_to_dd(lon_tok, is_lon=True)
+            try:
+                lon_idx = tokens.index(lon_tok)
+            except ValueError:
+                continue
             code = tokens[lon_idx+1] if lon_idx+1 < len(tokens) else None
             sector = " ".join(tokens[lon_idx+2:]) if lon_idx+2 < len(tokens) else None
             name = " ".join(tokens[:tokens.index(lat_tok)]).strip()
-            rows.append({"src":"LOC","code":code or name, "name":name, "sector":sector,"lat":lat,"lon":lon,"alt":0.0})
+            rows.append({
+                "src":"LOC","code":code or name,"name":name,"sector":sector,
+                "lat":lat,"lon":lon,"alt":0.0
+            })
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
 try:
@@ -317,10 +540,12 @@ def append_wp(name, lat, lon, alt):
         "name": make_unique_name(str(name)),
         "lat": float(lat),
         "lon": float(lon),
-        "alt": float(alt)
+        "alt": float(alt),
+        "wind_from": int(st.session_state.wind_from),
+        "wind_kt":   int(st.session_state.wind_kt),
     })
 
-# ======== ABAS ADIÇÃO WPs ========
+# ========= ABAS (CSV / MAPA / FPL) =========
 tab_csv, tab_map, tab_fpl = st.tabs(["🔎 Pesquisar CSV", "🗺️ Adicionar no mapa", "✈️ Flight Plan"])
 
 with tab_csv:
@@ -328,7 +553,10 @@ with tab_csv:
     with c1:
         q = st.text_input("Pesquisar único (carrega no ➕)", key="qadd").strip()
     with c2:
-        st.session_state.alt_qadd = st.number_input("Alt (ft) p/ novos WPs", 0.0, 18000.0, float(st.session_state.alt_qadd), step=100.0)
+        st.session_state.alt_qadd = st.number_input(
+            "Alt (ft) p/ novos WPs", 0.0, 18000.0,
+            float(st.session_state.alt_qadd), step=100.0
+        )
 
     def _score_row(row, tq, last_wp):
         code = str(row.get("code") or "").lower()
@@ -337,7 +565,9 @@ with tab_csv:
         starts = 1.0 if code.startswith(tq) or name.startswith(tq) else 0.0
         near = 0.0
         if last_wp:
-            near = 1.0 / (1.0 + gc_dist_nm(last_wp["lat"], last_wp["lon"], row["lat"], row["lon"]))
+            near = 1.0 / (1.0 + gc_dist_nm(
+                last_wp["lat"], last_wp["lon"], row["lat"], row["lon"]
+            ))
         return starts*2 + sim + near*0.25
 
     def _search_points(tq):
@@ -353,7 +583,9 @@ with tab_csv:
         return df_.sort_values("__score", ascending=False)
 
     results = _search_points(q)
-    st.session_state.search_rows = results.head(30).to_dict("records") if not results.empty else []
+    st.session_state.search_rows = (
+        results.head(30).to_dict("records") if not results.empty else []
+    )
 
     if st.session_state.search_rows:
         st.caption("Resultados")
@@ -378,7 +610,10 @@ with tab_csv:
         st.info("Sem resultados.")
 
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-    multi = st.text_input("Adicionar vários (ex: LPSO VACOR VARGE)", key="qadd_multi")
+
+    multi = st.text_input(
+        "Adicionar vários (ex: LPSO VACOR VARGE)", key="qadd_multi"
+    )
     if st.button("➕ Adicionar todos os termos"):
         terms = [t for t in re.split(r"\s+", multi.strip()) if t]
         added, misses = [], []
@@ -388,10 +623,16 @@ with tab_csv:
                 misses.append(t)
                 continue
             r = cand.iloc[0]
-            append_wp(r.get("code") or r.get("name"), float(r["lat"]), float(r["lon"]), float(st.session_state.alt_qadd))
+            append_wp(
+                r.get("code") or r.get("name"),
+                float(r["lat"]), float(r["lon"]),
+                float(st.session_state.alt_qadd)
+            )
             added.append(r.get("code") or r.get("name"))
-        if added: st.success(f"Adicionados: {', '.join(added)}")
-        if misses: st.warning(f"Sem match: {', '.join(misses)}")
+        if added:
+            st.success(f"Adicionados: {', '.join(added)}")
+        if misses:
+            st.warning(f"Sem match: {', '.join(misses)}")
 
 with tab_map:
     st.caption("Clica no mapa e depois em **Adicionar**.")
@@ -416,6 +657,7 @@ with tab_map:
             tooltip=w["name"]
         ).add_to(m0)
     map_out = st_folium(m0, width=None, height=480, key="pickmap")
+
     with st.form("add_by_click"):
         cA,cB,_ = st.columns([2,1,1])
         with cA:
@@ -430,49 +672,48 @@ with tab_map:
         clicked = map_out.get("last_clicked")
         st.write("Último clique:", clicked if clicked else "—")
         if st.form_submit_button("Adicionar do clique") and clicked:
-            append_wp(nm, float(clicked["lat"]), float(clicked["lng"]), float(alt))
+            append_wp(
+                nm,
+                float(clicked["lat"]), float(clicked["lng"]),
+                float(alt)
+            )
             st.success("Adicionado.")
 
-# ======== EDITOR WPs ========
+# ========= ESPAÇO AÉREO (preset + ad-hoc) =========
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-del_idx = None
-if st.session_state.wps:
-    st.subheader("Rota (Waypoints)")
-    for i, w in enumerate(st.session_state.wps):
-        with st.expander(f"WP {i+1} — {w['name']}", expanded=False):
-            c1,c2,c3,c4 = st.columns([2,2,2,1])
-            with c1:
-                name = st.text_input(f"Nome — WP{i+1}", w["name"], key=f"wpn_{i}")
-            with c2:
-                lat  = st.number_input(f"Lat — WP{i+1}", -90.0, 90.0, float(w["lat"]), step=0.0001, key=f"wplat_{i}")
-            with c3:
-                lon  = st.number_input(f"Lon — WP{i+1}", -180.0, 180.0, float(w["lon"]), step=0.0001, key=f"wplon_{i}")
-            with c4:
-                alt  = st.number_input(f"Alt (ft) — WP{i+1}", 0.0, 18000.0, float(w["alt"]), step=50.0, key=f"wpalt_{i}")
-            if (name,lat,lon,alt) != (w["name"],w["lat"],w["lon"],w["alt"]):
-                st.session_state.wps[i] = {"name":name,"lat":float(lat),"lon":float(lon),"alt":float(alt)}
-            if st.button("Remover", key=f"delwp_{i}"):
-                del_idx = i
-if del_idx is not None:
-    st.session_state.wps.pop(del_idx)
-st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+with st.expander("🛡 Espaço aéreo / restrições"):
+    # catálogo (gist interno)
+    preset_names_sorted = sorted(PRESET_AIRSPACES.keys())
+    st.session_state.preset_selected = st.multiselect(
+        "Áreas publicadas (catálogo)",
+        preset_names_sorted,
+        default=st.session_state.preset_selected,
+        help="Seleciona p/ mostrar no mapa (ex.: LPT1, LPT61...)."
+    )
 
-# ======== ESPAÇO AÉREO CUSTOM (LPT1, LPTRA57, corredores, etc.) ========
-with st.expander("🛡 Espaço aéreo custom"):
+    st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+
+    st.markdown("**Criar nova área ad-hoc** (colar do AIP):")
     c1,c2 = st.columns([2,1])
     with c1:
-        asp_name   = st.text_input("Nome da área (ex: LPT1)", "")
-        asp_text   = st.text_area("Coordenadas / descrição AIP", height=150,
-            help="Ex: '41 22 48N 006 23 33W – ALONG ... – 39 54 00N 007 45 00W ...'")
+        asp_name   = st.text_input("Nome da área (ex: LPTX)", "")
+        asp_text   = st.text_area(
+            "Coordenadas / descrição AIP",
+            height=150,
+            help="Ex: '41 22 48N 006 23 33W – ALONG ... – 39 54 00N 007 45 00W ...'"
+        )
     with c2:
         asp_floor  = st.text_input("Floor", "GND")
         asp_ceil   = st.text_input("Ceiling", "FL140")
-        asp_notes  = st.text_input("Notas", "TRAINING / COMAO / H24 ...")
-        asp_color  = st.color_picker("Cor", "#ff0000")
+        asp_notes  = st.text_input("Notas", "TRAINING wave / COMAO wave")
+        asp_color  = st.color_picker("Cor", "#ffff00")
         asp_opac   = st.slider("Opacidade", 0.05, 0.6, 0.25, 0.05)
-        asp_width  = st.number_input("Largura NM (0=polígono, >0 corredor)", 0.0, 20.0, 0.0, 0.5)
+        asp_width  = st.number_input(
+            "Largura NM (0=polígono, >0 corredor)",
+            0.0, 20.0, 0.0, 0.5
+        )
 
-    if st.button("➕ Adicionar área"):
+    if st.button("➕ Adicionar área ad-hoc"):
         coords_poly = extract_polygon_coords(asp_text)
         if coords_poly:
             st.session_state.airspaces.append({
@@ -490,7 +731,7 @@ with st.expander("🛡 Espaço aéreo custom"):
             st.error("Não consegui ler coordenadas. Confirma o formato D M S + N/E/S/W.")
 
     if st.session_state.airspaces:
-        st.caption("Áreas carregadas:")
+        st.caption("Áreas ad-hoc carregadas agora:")
         kill_idx = None
         for ai, A in enumerate(st.session_state.airspaces):
             st.markdown(
@@ -506,8 +747,84 @@ with st.expander("🛡 Espaço aéreo custom"):
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== NODES (TOC/TOD) ========
+# ========= EDITOR WPs (inclui vento por-WP se global OFF) =========
+del_idx = None
+if st.session_state.wps:
+    st.subheader("Rota (Waypoints)")
+    for i, w in enumerate(st.session_state.wps):
+        with st.expander(f"WP {i+1} — {w['name']}", expanded=False):
+            c1,c2,c3,c4 = st.columns([2,2,2,1])
+            with c1:
+                name = st.text_input(
+                    f"Nome — WP{i+1}",
+                    w["name"],
+                    key=f"wpn_{i}"
+                )
+            with c2:
+                lat  = st.number_input(
+                    f"Lat — WP{i+1}",
+                    -90.0, 90.0,
+                    float(w["lat"]),
+                    step=0.0001,
+                    key=f"wplat_{i}"
+                )
+            with c3:
+                lon  = st.number_input(
+                    f"Lon — WP{i+1}",
+                    -180.0, 180.0,
+                    float(w["lon"]),
+                    step=0.0001,
+                    key=f"wplon_{i}"
+                )
+            with c4:
+                alt  = st.number_input(
+                    f"Alt (ft) — WP{i+1}",
+                    0.0, 18000.0,
+                    float(w["alt"]),
+                    step=50.0,
+                    key=f"wpalt_{i}"
+                )
+
+            if not st.session_state.use_global_wind:
+                c5,c6 = st.columns(2)
+                with c5:
+                    wind_from_i = st.number_input(
+                        f"Wind FROM °T — WP{i+1}",
+                        0,360,
+                        int(w.get("wind_from", st.session_state.wind_from)),
+                        key=f"wpwindfrom_{i}"
+                    )
+                with c6:
+                    wind_kt_i = st.number_input(
+                        f"Wind kt — WP{i+1}",
+                        0,150,
+                        int(w.get("wind_kt", st.session_state.wind_kt)),
+                        key=f"wpwindkt_{i}"
+                    )
+            else:
+                wind_from_i = w.get("wind_from", st.session_state.wind_from)
+                wind_kt_i   = w.get("wind_kt",   st.session_state.wind_kt)
+
+            st.session_state.wps[i] = {
+                "name":name,
+                "lat":float(lat),
+                "lon":float(lon),
+                "alt":float(alt),
+                "wind_from": int(wind_from_i),
+                "wind_kt":   int(wind_kt_i),
+            }
+
+            if st.button("Remover", key=f"delwp_{i}"):
+                del_idx = i
+
+if del_idx is not None:
+    st.session_state.wps.pop(del_idx)
+
+st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+
+# ========= ROTA (TOC/TOD) =========
 def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
+    # TOC / TOD
     nodes = []
     if len(user_wps) < 2:
         return nodes
@@ -516,15 +833,22 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
         nodes.append(A)
         tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
         dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
-        _, _, gs_cl = wind_triangle(tc, CLIMB_TAS,   wind_from, wind_kt)
-        _, _, gs_de = wind_triangle(tc, DESCENT_TAS, wind_from, wind_kt)
+        # ground speed para climb/descent aproximada
+        _, _, gs_cl = wind_triangle(tc, CLIMB_TAS,   A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
+        _, _, gs_de = wind_triangle(tc, DESCENT_TAS, A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
         if B["alt"] > A["alt"]:
             dh = B["alt"] - A["alt"]
             t_need = dh / max(roc_fpm, 1.0)
             d_need = gs_cl * (t_need/60.0)
             if d_need < dist - 0.05:
                 lat_toc, lon_toc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need)
-                nodes.append({"name": f"TOC L{i+1}", "lat": lat_toc, "lon": lon_toc, "alt": B["alt"]})
+                nodes.append({
+                    "name": f"TOC L{i+1}",
+                    "lat": lat_toc, "lon": lon_toc,
+                    "alt": B["alt"],
+                    "wind_from": A.get("wind_from", wind_from),
+                    "wind_kt":   A.get("wind_kt", wind_kt),
+                })
         elif B["alt"] < A["alt"]:
             dh = A["alt"] - B["alt"]
             t_need = dh / max(rod_fpm, 1.0)
@@ -532,11 +856,17 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
             if d_need < dist - 0.05:
                 pos_from_start = max(0.0, dist - d_need)
                 lat_tod, lon_tod = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], pos_from_start)
-                nodes.append({"name": f"TOD L{i+1}", "lat": lat_tod, "lon": lon_tod, "alt": A["alt"]})
+                nodes.append({
+                    "name": f"TOD L{i+1}",
+                    "lat": lat_tod, "lon": lon_tod,
+                    "alt": A["alt"],
+                    "wind_from": A.get("wind_from", wind_from),
+                    "wind_kt":   A.get("wind_kt", wind_kt),
+                })
     nodes.append(user_wps[-1])
     return nodes
 
-def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every_min):
+def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
     legs = []
     if len(nodes) < 2:
         return legs
@@ -546,7 +876,10 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
     if st.session_state.start_clock.strip():
         try:
             h,m = map(int, st.session_state.start_clock.split(":"))
-            base_time = dt.datetime.combine(dt.date.today(), dt.time(h,m)) + dt.timedelta(minutes=15)
+            base_time = dt.datetime.combine(
+                dt.date.today(),
+                dt.time(h,m)
+            ) + dt.timedelta(minutes=15)
         except:
             base_time = None
 
@@ -558,30 +891,47 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
         A, B = nodes[i], nodes[i+1]
         tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
         dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
+
+        # vento para esta perna
+        if st.session_state.use_global_wind:
+            wind_from_used = st.session_state.wind_from
+            wind_kt_used   = st.session_state.wind_kt
+        else:
+            wind_from_used = A.get("wind_from", st.session_state.wind_from)
+            wind_kt_used   = A.get("wind_kt",   st.session_state.wind_kt)
+
         profile = "LEVEL" if abs(B["alt"]-A["alt"])<1e-6 else ("CLIMB" if B["alt"]>A["alt"] else "DESCENT")
         tas = CLIMB_TAS if profile=="CLIMB" else (DESCENT_TAS if profile=="DESCENT" else CRUISE_TAS)
-        _, th, gs = wind_triangle(tc, tas, wind_from, wind_kt)
+        _, th, gs = wind_triangle(tc, tas, wind_from_used, wind_kt_used)
+
         mh = apply_var(th, mag_var, mag_is_e)
+
         time_sec = rt10((dist / max(gs,1e-9)) * 3600.0) if gs>0 else 0
         burn = FUEL_FLOW * (time_sec/3600.0)
 
         efob_start = carry_efob
         efob_end = max(0.0, r10f(efob_start - burn))
 
-        clk_start = (base_time + dt.timedelta(seconds=t_cursor)).strftime('%H:%M') if base_time else f"T+{mmss(t_cursor)}"
-        clk_end   = (base_time + dt.timedelta(seconds=t_cursor+time_sec)).strftime('%H:%M') if base_time else f"T+{mmss(t_cursor+time_sec)}"
+        clk_start = (
+            (base_time + dt.timedelta(seconds=t_cursor)).strftime('%H:%M')
+            if base_time else f"T+{mmss(t_cursor)}"
+        )
+        clk_end   = (
+            (base_time + dt.timedelta(seconds=t_cursor+time_sec)).strftime('%H:%M')
+            if base_time else f"T+{mmss(t_cursor+time_sec)}"
+        )
 
         cps=[]
         if ck_every_min>0 and gs>0:
             k=1
             while k*ck_every_min*60 <= time_sec:
                 t=k*ck_every_min*60
-                d=gs*(t/3600.0)
+                d_nm=gs*(t/3600.0)
                 eto=(base_time + dt.timedelta(seconds=t_cursor+t)).strftime('%H:%M') if base_time else ""
                 cps.append({
                     "t":t,
                     "min":int(t/60),
-                    "nm":round(d,1),
+                    "nm":round(d_nm,1),
                     "eto":eto
                 })
                 k+=1
@@ -598,14 +948,16 @@ def build_legs_from_nodes(nodes, wind_from, wind_kt, mag_var, mag_is_e, ck_every
             "efob_end":r10f(efob_end),
             "clock_start":clk_start,
             "clock_end":clk_end,
-            "cps":cps
+            "cps":cps,
+            "wind_from":wind_from_used,
+            "wind_kt":wind_kt_used,
         })
 
         t_cursor += time_sec
         carry_efob = efob_end
     return legs
 
-# ======== BOTÃO GERAR ROTA (TOC/TOD, legs, etc.) ========
+# ========= BOTÃO GERAR ROTA =========
 cgen,_ = st.columns([2,6])
 with cgen:
     if st.button("Gerar/Atualizar rota (insere TOC/TOD) ✅", type="primary", use_container_width=True):
@@ -618,14 +970,12 @@ with cgen:
         )
         st.session_state.legs = build_legs_from_nodes(
             st.session_state.route_nodes,
-            st.session_state.wind_from,
-            st.session_state.wind_kt,
             st.session_state.mag_var,
             st.session_state.mag_is_e,
             st.session_state.ck_default
         )
 
-# ======== RESUMO ROTA ========
+# ========= RESUMO ROTA =========
 if st.session_state.legs:
     total_sec  = sum(L["time_sec"] for L in st.session_state.legs)
     total_burn = r10f(sum(L["burn"] for L in st.session_state.legs))
@@ -642,187 +992,19 @@ if st.session_state.legs:
     )
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ======== ATLAS 5 KM PARA IMPRESSÃO ========
-def sample_atlas_points(legs, radius_km):
-    pts = []
-    for L in legs:
-        # início da perna
-        pts.append( (L["A"]["lat"], L["A"]["lon"], f"L{L['i']} START") )
-        # meio da perna
-        mid_lat, mid_lon = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], L["Dist"]/2.0)
-        pts.append( (mid_lat, mid_lon, f"L{L['i']} MID") )
-        # CP ticks
-        for cp in L["cps"]:
-            d_nm = cp["nm"]
-            cplat, cplon = point_along_gc(
-                L["A"]["lat"],L["A"]["lon"],
-                L["B"]["lat"],L["B"]["lon"],
-                min(L["Dist"], d_nm)
-            )
-            pts.append( (cplat, cplon, f"L{L['i']} CP{cp['min']}") )
-    # dedup aproximado
-    uniq=[]
-    seen=set()
-    for lat,lon,label in pts:
-        key=(round(lat,4), round(lon,4))
-        if key not in seen:
-            seen.add(key)
-            uniq.append((lat,lon,label))
-    return uniq
-
-def bbox_from_center_km(lat, lon, radius_km):
-    # Aproximação geodésica simples: 1 NM = 1.852 km
-    nm = radius_km / 1.852
-    dlat_deg = (nm / 60.0)
-    dlon_deg = (nm / (60.0 * max(math.cos(math.radians(lat)), 1e-6)))
-    return (lat-dlat_deg, lat+dlat_deg, lon-dlon_deg, lon+dlon_deg)
-
-def draw_atlas_page(center_lat, center_lon, legs, airspaces, radius_km):
-    # bounding box
-    min_lat, max_lat, min_lon, max_lon = bbox_from_center_km(center_lat, center_lon, radius_km)
-
-    fig, ax = plt.subplots(figsize=(6,6), dpi=300)
-    ax.set_facecolor("white")
-
-    # desenhar áreas de espaço aéreo
-    for asp in airspaces:
-        # construir polígono real
-        if asp.get("width_nm"):
-            if len(asp["coords"]) >= 2:
-                polycoords = corridor_polygon(asp["coords"][0], asp["coords"][1], asp["width_nm"])
-            else:
-                polycoords = []
-        else:
-            polycoords = asp["coords"]
-
-        if not polycoords:
-            continue
-        poly_lats = [p[0] for p in polycoords]
-        poly_lons = [p[1] for p in polycoords]
-        ax.fill(
-            poly_lons, poly_lats,
-            alpha=asp["opacity"],
-            edgecolor=asp["color"],
-            facecolor=asp["color"],
-            linewidth=0.7
-        )
-        c_lat, c_lon = polygon_centroid(polycoords)
-        ax.text(
-            c_lon, c_lat,
-            f"{asp['name']}\n{asp['floor']}–{asp['ceiling']}",
-            fontsize=5,
-            ha='center', va='center',
-            color="#000000",
-            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="black", lw=0.5, alpha=0.8)
-        )
-
-    # desenhar rota total cinza claro
-    for L in legs:
-        ax.plot([L["A"]["lon"], L["B"]["lon"]],[L["A"]["lat"], L["B"]["lat"]],
-                linewidth=0.6, color="#999999")
-
-    # desenhar highlight da área central (círculo ~raio_km)
-    circle_nm = radius_km/1.852
-    circle_points_lon=[]
-    circle_points_lat=[]
-    for ang in np.linspace(0,360,181):
-        p_lat,p_lon = dest_point(center_lat,center_lon, ang, circle_nm)
-        circle_points_lat.append(p_lat)
-        circle_points_lon.append(p_lon)
-    ax.plot(circle_points_lon, circle_points_lat, color="#000000", linewidth=0.6, linestyle="--")
-
-    # cruz no centro
-    ax.plot([center_lon-0.01, center_lon+0.01],[center_lat, center_lat], color="black", linewidth=0.5)
-    ax.plot([center_lon, center_lon],[center_lat-0.01, center_lat+0.01], color="black", linewidth=0.5)
-
-    # escala 5 km (aprox) no canto inferior esquerdo
-    scalebar_km = 5.0
-    sb_nm = scalebar_km/1.852
-    sb_lat1, sb_lon1 = dest_point(min_lat, min_lon, 90, 0)  # canto inferior esquerdo approx
-    sb_lat2, sb_lon2 = dest_point(sb_lat1, sb_lon1, 90, sb_nm)
-    ax.plot([sb_lon1,sb_lon2],[sb_lat1,sb_lat2],
-            color="black", linewidth=1.2)
-    ax.text((sb_lon1+sb_lon2)/2.0, sb_lat1,
-            f"{int(round(scalebar_km))} km",
-            fontsize=6, ha="center", va="top",
-            color="black",
-            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="black", lw=0.4, alpha=0.8))
-
-    # limites e aspecto
-    ax.set_xlim(min_lon, max_lon)
-    ax.set_ylim(min_lat, max_lat)
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_title(f"ATLAS {radius_km:.1f} km — {center_lat:.4f}, {center_lon:.4f}", fontsize=8)
-
-    buf = io.BytesIO()
-    plt.tight_layout()
-    fig.savefig(buf, format='png', dpi=300)
-    plt.close(fig)
-    buf.seek(0)
-    img = Image.open(buf).convert("RGB")
-    return img
-
-def build_atlas_pdf(legs, airspaces, radius_km):
-    if not legs:
-        return None
-    pts = sample_atlas_points(legs, radius_km)
-    if not pts:
-        return None
-    pages = []
-    for (lat,lon,label) in pts:
-        img = draw_atlas_page(lat, lon, legs, airspaces, radius_km)
-        # podemos escrever label no canto superior esquerdo
-        draw = Image.fromarray(np.array(img))
-        pages.append(draw)
-    pdf_buf = io.BytesIO()
-    pages[0].save(
-        pdf_buf,
-        format="PDF",
-        save_all=True,
-        append_images=pages[1:]
-    )
-    pdf_buf.seek(0)
-    return pdf_buf.getvalue()
-
-with st.expander("🖨 Atlas 5 km para impressão"):
-    st.session_state.atlas_radius_km = st.slider(
-        "Raio (km) por folha",
-        2.0, 10.0,
-        st.session_state.atlas_radius_km,
-        0.5
-    )
-    atlas_btn = st.button("Gerar Atlas 5km (PDF)", type="primary")
-    if atlas_btn:
-        pdf_bytes = build_atlas_pdf(
-            st.session_state.legs,
-            st.session_state.airspaces if st.session_state.show_airspaces else [],
-            st.session_state.atlas_radius_km
-        )
-        if pdf_bytes:
-            st.download_button(
-                "⬇️ Atlas 5km (PDF)",
-                pdf_bytes,
-                file_name="ATLAS_5KM.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-        else:
-            st.error("Não consegui gerar o atlas (precisas de legs).")
-
-st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-
-# ======== LABEL ENGINE / MAP RENDER ========
+# ========= MARKUP HELPERS =========
 LABEL_MIN_CLEAR = 0.7
 
 def html_marker(m, lat, lon, html):
-    folium.Marker((lat,lon), icon=folium.DivIcon(html=html, icon_size=(0,0))).add_to(m)
+    folium.Marker(
+        (lat,lon),
+        icon=folium.DivIcon(html=html, icon_size=(0,0))
+    ).add_to(m)
 
 def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
     rot = angle_tc - 90.0
     fs_head = int(13*scale)
-    fs_cell = int(12*scale)
+    fs_cell = int(11*scale)
     bar_color = PROFILE_COLORS.get(phase, "#111")
     return f"""
     <div style="
@@ -830,46 +1012,74 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
         transform-origin:center center;
         font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-variant-numeric:tabular-nums;
-        color:#111;
-        background:rgba(255,255,255,.97);
-        border:2px solid #111;
-        border-radius:10px;
-        box-shadow:0 0 0 2px rgba(255,255,255,.97);
-        padding:6px 8px 8px 8px;
+        color:#000;
+        background:rgba(255,255,255,.95);
+        border:2px solid #000;
+        border-radius:8px;
+        box-shadow:0 2px 4px rgba(0,0,0,.3);
+        padding:6px 8px;
         line-height:1.2;
-        letter-spacing:.05em;
         text-align:left;
-        white-space:nowrap;
-    ">
+        white-space:nowrap;">
         <div style="
             background:{bar_color};
             height:4px;
-            border-radius:8px 8px 4px 4px;
-            margin:-4px -6px 6px -6px;
-        "></div>
+            border-radius:4px;
+            margin:-4px -4px 4px -4px;"></div>
         <div style="
             display:grid;
             grid-template-columns:auto auto;
             grid-row-gap:2px;
             grid-column-gap:10px;
-        ">
+            font-size:{fs_cell}px;">
             <div style="font-size:{fs_head}px;font-weight:600;">{info['mh_tc']}</div>
             <div style="font-size:{fs_head}px;font-weight:600;">{info['gs']}</div>
 
-            <div style="font-size:{fs_cell}px;">{info['alt']}</div>
-            <div style="font-size:{fs_cell}px;">{info['ete']}</div>
+            <div>{info['alt']}</div>
+            <div>{info['ete']}</div>
 
-            <div style="font-size:{fs_cell}px;">{info['dist']}</div>
-            <div style="font-size:{fs_cell}px;">{info['burn']}</div>
+            <div>{info['dist']}</div>
+            <div>{info['burn']}</div>
         </div>
     </div>"""
 
+def wp_label_html(g, scale):
+    fs_name = int(13*scale)
+    fs_line = int(11*scale)
+    parts=[]
+    for (efob, eto) in g["pairs"]:
+        efob_txt = fmt_L(efob if efob is not None else 0)
+        eto_txt  = eto or "-"
+        parts.append(
+            f"<div style='font-size:{fs_line}px;line-height:1.2;margin-top:2px;'>"
+            f"{efob_txt}<br/>{eto_txt}</div>"
+        )
+    body = "".join(parts)
+    return f"""
+    <div style="
+        transform:translate(-50%,-100%);
+        background:rgba(255,255,255,.95);
+        color:#000;
+        border:2px solid #000;
+        border-radius:8px;
+        box-shadow:0 2px 4px rgba(0,0,0,.3);
+        padding:4px 6px;
+        line-height:1.2;
+        text-align:center;
+        white-space:nowrap;
+        font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;">
+        <div style="font-size:{fs_name}px;font-weight:600;margin-bottom:2px;">
+            {g['name']}
+        </div>
+        {body}
+    </div>"""
+
+# ========= MAPA PRINCIPAL =========
 def render_map(nodes, legs, base_choice):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**.")
         return
 
-    # base map
     m = folium.Map(
         location=list(st.session_state.map_center),
         zoom_start=st.session_state.map_zoom,
@@ -878,6 +1088,7 @@ def render_map(nodes, legs, base_choice):
         prefer_canvas=True
     )
 
+    # base layer
     if base_choice == "OpenTopoMap (VFR-ish)":
         folium.TileLayer(
             "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
@@ -890,28 +1101,26 @@ def render_map(nodes, legs, base_choice):
             attr="© OpenStreetMap contributors"
         ).add_to(m)
 
-    elif base_choice == "Terrain (Hillshade ft)":
-        # Hillshade global Esri (boa leitura de relevo VFR baixa alt),
-        # pode complementar com labels OSM se quiseres.
+    elif base_choice == "Terrain Hillshade":
+        # só hillshade (sem OSM opaco por cima)
         folium.TileLayer(
             "https://services.arcgisonline.com/ArcGIS/rest/services/World_Hillshade/MapServer/tile/{z}/{y}/{x}",
             attr="© Esri"
         ).add_to(m)
-        folium.TileLayer(
-            "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-            attr="© OpenStreetMap contributors",
-            overlay=True
-        ).add_to(m)
+
     else:
         folium.TileLayer(
             "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
             attr="© OpenTopoMap"
         ).add_to(m)
 
-    # Overlay openAIP airspaces (tileset oficial openAIP; requer API key) :contentReference[oaicite:2]{index=2}
+    # overlay openAIP (espaço aéreo oficial)
     if st.session_state.show_openaip and st.session_state.openaip_token.strip():
         folium.TileLayer(
-            tiles=f"https://{{s}}.api.tiles.openaip.net/api/data/airspaces/{{z}}/{{x}}/{{y}}.png?apiKey={st.session_state.openaip_token.strip()}",
+            tiles=(
+                "https://{s}.api.tiles.openaip.net/api/data/airspaces/"
+                "{z}/{x}/{y}.png?apiKey=" + st.session_state.openaip_token.strip()
+            ),
             attr="© openAIP",
             overlay=True,
             name="openAIP Airspaces"
@@ -919,24 +1128,18 @@ def render_map(nodes, legs, base_choice):
 
     Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
 
-    # 1) Desenhar legs (perfil de voo)
+    # 1) pernas da rota
     for L in legs:
         latlngs = [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])]
         color = PROFILE_COLORS.get(L["profile"], "#C000FF")
         folium.PolyLine(
-            latlngs,
-            color="#ffffff",
-            weight=10,
-            opacity=1.0
+            latlngs, color="#ffffff", weight=10, opacity=1.0
         ).add_to(m)
         folium.PolyLine(
-            latlngs,
-            color=color,
-            weight=4,
-            opacity=1.0
+            latlngs, color=color, weight=4, opacity=1.0
         ).add_to(m)
 
-    # 2) CP ticks (riscas CP) se ativo
+    # 2) ticks CP
     if st.session_state.show_ticks:
         for L in legs:
             if L["GS"]<=0 or not L["cps"]:
@@ -957,19 +1160,22 @@ def render_map(nodes, legs, base_choice):
                     opacity=1
                 ).add_to(m)
 
-    # 3) Dog houses (cartões rotacionados) se ativo
+    # 3) dog houses (cartões rotacionados)
     if st.session_state.show_doghouses:
         def z_clear(lat,lon,zs):
             if not zs: return 9e9
             return min(gc_dist_nm(lat,lon,a,b) - r for a,b,r in zs)
 
         zones=[]
-        # "corridor" simplificado para declutter
         for L in legs:
             dist = gc_dist_nm(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"])
             steps = max(2, int(dist/0.9))
             for k in range(1, steps):
-                p = point_along_gc(L["A"]["lat"],L["A"]["lon"],L["B"]["lat"],L["B"]["lon"], dist*k/steps)
+                p = point_along_gc(
+                    L["A"]["lat"],L["A"]["lon"],
+                    L["B"]["lat"],L["B"]["lon"],
+                    dist*k/steps
+                )
                 zones.append((p[0],p[1],0.38))
 
         prev_side = None
@@ -977,10 +1183,8 @@ def render_map(nodes, legs, base_choice):
             if L["Dist"] < 0.2:
                 continue
 
-            # escala para layout
             base = min(1.25, max(0.85, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
-
             side_off = min(2.1, max(0.9, 1.0*s))
 
             cur = L["TC"]
@@ -1006,7 +1210,7 @@ def render_map(nodes, legs, base_choice):
             info = {
                 "mh_tc": f"{deg3(L['MH'])}|{deg3(L['TC'])}",
                 "gs":    fmt_kt(L['GS']),
-                "alt":   fmt_ft(L['A']['alt']),  # altitude do início da perna
+                "alt":   fmt_ft(L['A']['alt']),
                 "ete":   mmss(L['time_sec']),
                 "dist":  fmt_nm(L['Dist']),
                 "burn":  fmt_L(L['burn']),
@@ -1019,12 +1223,12 @@ def render_map(nodes, legs, base_choice):
                 doghouse_html_capsule(info, L["profile"], L["TC"], scale=s)
             )
 
-    # 4) Nós da rota + bolhas de EFOB/ETO
+    # 4) nós / labels WP (sem brilho branco gigante)
     for N in nodes:
         html_marker(
             m, N["lat"], N["lon"],
             "<div style='transform:translate(-50%,-50%);width:18px;height:18px;"
-            "border:2px solid #111;border-radius:50%;background:#fff'></div>"
+            "border:2px solid #000;border-radius:50%;background:#fff;box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
         )
 
     info_nodes = [{"eto": None, "efob": None} for _ in nodes]
@@ -1036,7 +1240,7 @@ def render_map(nodes, legs, base_choice):
             info_nodes[i]["eto"]  = Lprev["clock_end"]
             info_nodes[i]["efob"] = Lprev["efob_end"]
 
-    grouped = []
+    grouped=[]
     seen=set()
     for idx,N in enumerate(nodes):
         base_name = re.sub(r"\s+#\d+$","",str(N["name"]))
@@ -1056,32 +1260,32 @@ def render_map(nodes, legs, base_choice):
                     break
 
     for g in grouped:
-        fs_name = int(14*st.session_state.text_scale)
-        fs_line = int(11.5*st.session_state.text_scale)
-        body = "".join([
-            f"<div style='text-align:center;margin-top:1px;white-space:nowrap'>"
-            f"<div style='font-size:{fs_line}px;white-space:nowrap'>{fmt_L(p[0] if p[0] is not None else 0)}</div>"
-            f"<div style='font-size:{fs_line-1}px;white-space:nowrap'>{p[1] or '-'}</div>"
-            f"</div>"
-            for p in g["pairs"]
-        ])
-        label = f"""<div style="text-align:center;color:#111;font-weight:900;
-            text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;
-            white-space:nowrap;">
-            <div style="font-size:{fs_name}px; white-space:nowrap">{g['name']}</div>{body}</div>"""
-        html_marker(m, g["lat"], g["lon"], label)
+        s = float(st.session_state.text_scale)
+        html_marker(m, g["lat"], g["lon"], wp_label_html(g, s))
 
-    # 5) Espaço aéreo custom (polígonos desenhados pelo utilizador)
-    if st.session_state.show_airspaces and st.session_state.airspaces:
-        for asp in st.session_state.airspaces:
-            # gera polígono real (ou corredor)
+    # 5) espaço aéreo (preset + ad-hoc) se ligado
+    if st.session_state.show_airspaces:
+        combined_asp = []
+        # presets escolhidos
+        for nm in st.session_state.preset_selected:
+            A = PRESET_AIRSPACES.get(nm)
+            if A:
+                tmp = dict(A)
+                tmp["name"] = nm
+                combined_asp.append(tmp)
+        # ad-hoc
+        combined_asp += st.session_state.airspaces
+
+        for asp in combined_asp:
+            # corredor vs polígono
             if asp.get("width_nm"):
-                if len(asp["coords"]) >= 2:
-                    polycoords = corridor_polygon(asp["coords"][0], asp["coords"][1], asp["width_nm"])
+                coords = asp.get("coords", [])
+                if len(coords) >= 2:
+                    polycoords = corridor_polygon(coords[0], coords[1], asp["width_nm"])
                 else:
                     polycoords = []
             else:
-                polycoords = asp["coords"]
+                polycoords = asp.get("coords", [])
 
             if not polycoords:
                 continue
@@ -1096,31 +1300,30 @@ def render_map(nodes, legs, base_choice):
                 tooltip=f"{asp['name']} {asp['floor']}→{asp['ceiling']} {asp.get('notes','')}"
             ).add_to(m)
 
-            # label no centro
             clat, clon = polygon_centroid(polycoords)
             label_html = f"""
             <div style="
-                transform:translate(-50%,-50%);
+                transform:translate(-50%,-100%);
                 background:rgba(0,0,0,0.7);
                 color:#fff;
+                border:2px solid #000;
+                border-radius:6px;
+                box-shadow:0 2px 4px rgba(0,0,0,.4);
                 padding:4px 6px;
                 font-size:11px;
                 line-height:1.2;
-                border-radius:6px;
-                font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto;
+                font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
                 text-align:center;
-                white-space:nowrap;
-                box-shadow:0 0 4px rgba(0,0,0,.5);
-            ">
+                white-space:nowrap;">
                 <b>{asp['name']}</b><br/>
                 {asp['floor']}–{asp['ceiling']}<br/>
                 {asp.get('notes','')}
-            </div>
-            """
+            </div>"""
             html_marker(m, clat, clon, label_html)
 
     st_folium(m, width=None, height=760, key="mainmap", returned_objects=[])
 
+# render do mapa
 if st.session_state.wps and st.session_state.route_nodes and st.session_state.legs:
     render_map(st.session_state.route_nodes, st.session_state.legs, base_choice=st.session_state.map_base)
 elif st.session_state.wps:
@@ -1128,7 +1331,7 @@ elif st.session_state.wps:
 else:
     st.info("Adiciona pelo menos 2 waypoints.")
 
-# ================== ✈️ FLIGHT PLAN (Item 15) ==================
+# ========= FLIGHT PLAN =========
 with tab_fpl:
     st.subheader("Flight Plan — rota (Item 15)")
 
@@ -1139,7 +1342,8 @@ with tab_fpl:
     def icao_latlon(lat:float, lon:float) -> str:
         lat_abs = abs(lat); lon_abs = abs(lon)
         lat_deg = int(lat_abs); lon_deg = int(lon_abs)
-        lat_min = int(round((lat_abs - lat_deg)*60)); lon_min = int(round((lon_abs - lon_deg)*60))
+        lat_min = int(round((lat_abs - lat_deg)*60))
+        lon_min = int(round((lon_abs - lon_deg)*60))
         if lat_min == 60:
             lat_deg += 1; lat_min = 0
         if lon_min == 60:
@@ -1151,8 +1355,10 @@ with tab_fpl:
     def build_fpl_route(user_wps):
         if len(user_wps) < 2: return ""
         seq = user_wps[:]
-        if is_icao_aerodrome(seq[0]["name"]):  seq = seq[1:]
-        if seq and is_icao_aerodrome(seq[-1]["name"]): seq = seq[:-1]
+        if is_icao_aerodrome(seq[0]["name"]):
+            seq = seq[1:]
+        if seq and is_icao_aerodrome(seq[-1]["name"]):
+            seq = seq[:-1]
         tokens = []
         for w in seq:
             nm = re.sub(r"\s+#\d+$","",str(w["name"]).upper())
@@ -1165,7 +1371,7 @@ with tab_fpl:
     else:
         st.info("Adiciona WPs e volta aqui para gerar a rota.")
 
-# ================== 📄 NAVLOG / PDF ==================
+# ========= NAVLOG / PDF =========
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 st.header("📄 NAVLOG — Cabeçalho & PDF")
 
@@ -1226,17 +1432,15 @@ alt_leg_info = None
 if use_alt and alt_choice and st.session_state.wps:
     dest = st.session_state.wps[-1]
     tc_alt = gc_course_tc(dest["lat"], dest["lon"], alt_choice["lat"], alt_choice["lon"])
-    _, th_alt, gs_alt = wind_triangle(
-        tc_alt,
-        CRUISE_TAS,
-        st.session_state.wind_from,
-        st.session_state.wind_kt
-    )
-    mh_alt = apply_var(
-        th_alt,
-        st.session_state.mag_var,
-        st.session_state.mag_is_e
-    )
+    # vento da última perna (ou global)
+    if st.session_state.use_global_wind:
+        wf = st.session_state.wind_from
+        wk = st.session_state.wind_kt
+    else:
+        wf = dest.get("wind_from", st.session_state.wind_from)
+        wk = dest.get("wind_kt",   st.session_state.wind_kt)
+    _, th_alt, gs_alt = wind_triangle(tc_alt, CRUISE_TAS, wf, wk)
+    mh_alt = apply_var(th_alt, st.session_state.mag_var, st.session_state.mag_is_e)
     dist_alt = gc_dist_nm(dest["lat"], dest["lon"], alt_choice["lat"], alt_choice["lon"])
     ete_alt_sec = int(round((dist_alt / max(gs_alt,1e-9)) * 3600))
     burn_alt = FUEL_FLOW * (ete_alt_sec/3600.0)
@@ -1247,7 +1451,7 @@ if use_alt and alt_choice and st.session_state.wps:
         "burn":burn_alt
     }
 
-# ======== PDF helpers ========
+# ========= PDF helpers =========
 def _pdf_mmss(sec:int):
     m,s = divmod(int(round(sec)),60)
     return f"{m:02d}:{s:02d}"
@@ -1277,12 +1481,14 @@ def _sum_burn(legs, profile):
     return round(sum(L["burn"] for L in legs if L["profile"]==profile),1)
 
 def _compose_clock_after(total_sec, extra_sec):
-    # mesma lógica de base_time = off-block +15min
     base = None
     if st.session_state.start_clock.strip():
         try:
             h,m = map(int, st.session_state.start_clock.split(":"))
-            base = dt.datetime.combine(dt.date.today(), dt.time(h,m)) + dt.timedelta(minutes=15)
+            base = dt.datetime.combine(
+                dt.date.today(),
+                dt.time(h,m)
+            ) + dt.timedelta(minutes=15)
         except:
             base = None
     t = total_sec + extra_sec
@@ -1356,14 +1562,15 @@ def _build_payloads_main(
         acc_t += L["time_sec"]
         _fill_leg_line(d, i, L, use_point="A", acc_d=acc_d, acc_t=acc_t)
 
-    # linha extra de chegada (se couber antes da 23)
+    # chegada extra se couber
     if len(legs) <= 22 and (N + 1) <= 22:
         j = N + 1
         B = legs_main[-1]["B"]
         d[f"Leg{j:02d}_Waypoint"] = str(B["name"])
         d[f"Leg{j:02d}_Altitude_FL"] = str(int(round(B["alt"])))
-        for k in ("True_Course","True_Heading","Magnetic_Heading","True_Airspeed","Ground_Speed",
-                  "Leg_Distance","Cumulative_Distance","Leg_ETE","Cumulative_ETE","Planned_Burnoff"):
+        for k in ("True_Course","True_Heading","Magnetic_Heading","True_Airspeed",
+                  "Ground_Speed","Leg_Distance","Cumulative_Distance",
+                  "Leg_ETE","Cumulative_ETE","Planned_Burnoff"):
             d[f"Leg{j:02d}_{k}"] = ""
         d[f"Leg{j:02d}_ETO"] = legs_main[-1]["clock_end"]
         d[f"Leg{j:02d}_Estimated_FOB"] = f"{legs_main[-1]['efob_end']:.1f}"
@@ -1418,8 +1625,9 @@ def _build_payload_cont(
         B = legs_chunk[-1]["B"]
         d[f"Leg{next_idx:02d}_Waypoint"] = str(B["name"])
         d[f"Leg{next_idx:02d}_Altitude_FL"] = str(int(round(B["alt"])))
-        for k in ("True_Course","True_Heading","Magnetic_Heading","True_Airspeed","Ground_Speed",
-                  "Leg_Distance","Cumulative_Distance","Leg_ETE","Cumulative_ETE","Planned_Burnoff"):
+        for k in ("True_Course","True_Heading","Magnetic_Heading","True_Airspeed",
+                  "Ground_Speed","Leg_Distance","Cumulative_Distance",
+                  "Leg_ETE","Cumulative_ETE","Planned_Burnoff"):
             d[f"Leg{next_idx:02d}_{k}"] = ""
         d[f"Leg{next_idx:02d}_ETO"] = legs_chunk[-1]["clock_end"]
         d[f"Leg{next_idx:02d}_Estimated_FOB"] = f"{legs_chunk[-1]['efob_end']:.1f}"
@@ -1430,7 +1638,9 @@ def _build_payload_cont(
     d["Leg23_Estimated_FOB"]   = f"{legs_chunk[-1]['efob_end']:.1f}"
 
     if alt_info and alt_choice:
-        total_sec_before_chunk = sum(L["time_sec"] for L in all_legs[:start_idx+len(legs_chunk)])
+        total_sec_before_chunk = sum(
+            L["time_sec"] for L in all_legs[:start_idx+len(legs_chunk)]
+        )
         d.update({
             "Alternate_Airfield":alt_choice["name"],
             "Alternate_Elevation":str(int(alt_choice["elev"])),
@@ -1449,10 +1659,14 @@ def _build_payload_cont(
         })
     return d
 
-# ======== EXPORT PDF BUTTONS ========
+# ========= BOTÕES PDF =========
 cX, cY = st.columns([1,1])
 with cX:
-    make_pdfs = st.button("Gerar PDF(s) NAVLOG", type="primary", use_container_width=True)
+    make_pdfs = st.button(
+        "Gerar PDF(s) NAVLOG",
+        type="primary",
+        use_container_width=True
+    )
 with cY:
     st.caption("Principal até 22 legs; continuação só se exceder.")
 
@@ -1499,3 +1713,4 @@ if make_pdfs:
                     file_name="NAVLOG_FILLED_1.pdf",
                     use_container_width=True
                 )
+
