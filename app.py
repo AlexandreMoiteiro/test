@@ -1,18 +1,23 @@
-# app_rev33.py — NAVLOG — rev33
+# app_rev34.py — NAVLOG — rev34
 # ---------------------------------------------------------------
-# - openAIP overlay corrigido (URL sem {s}) e sem expor key no UI
-# - Toggles finos para camadas openAIP (E/F/G, gliding, MOA, navaids, reporting
-#   points, obstacles, hang gliding, "active only" placeholder)
-# - Key lida via variável de ambiente OPENAIP_KEY (fallback default)
-# - Removida a parte de "criar área ad-hoc" na UI
-#   (essas áreas agora só via código, não via textarea)
-# - Secção espaço aéreo simplificada (multiselect catálogo)
-# - Dog houses redesenhadas (cartão branco alto contraste, barra de cor grossa)
-# - Labels das áreas (LPT1, etc.) agora também cartão branco com borda preta,
-#   sombra forte e barra colorida
-# - LayerControl no mapa para ligares/desligares camadas openAIP
-# - Pequenos fixes (gc_dist_nm duplicada removida)
-# - Resto da lógica NAVLOG/FPL igual à rev32
+# - openAIP overlay corrigido:
+#     usa https://{s}.api.tiles.openaip.net/api/data/openaip/{z}/{x}/{y}.png?apiKey=...
+#     com subdomains="abc", overlay=True e LayerControl
+# - Waypoint labels (fixes) estilo screenshot:
+#     NOME a preto com halo branco + linha azul "EFOB • T+.."
+#     sem caixa branca gorda
+# - Doghouses:
+#     cartão branco rotado alinhado com a leg
+#     MH|TC e GS grandes, ALT/DIST/ETE/BURN arrumados
+#     linha preta da perna até ao cartão
+# - Espaços aéreos (LPT1, LPT61 etc):
+#     polígono/corredor com fill semi-transparente
+#     etiqueta branca com borda preta e sombra forte
+#     linhas empilhadas (nome em bold + níveis/NOTES)
+# - UI mais simples:
+#     toggles: risc as CP / doghouses / áreas preset / openAIP
+#     sem textarea de áreas ad-hoc (isso continua possível via código)
+# - resto NAVLOG / PDF igual base rev33
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -34,14 +39,24 @@ PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386"}
 CP_TICK_HALF = 0.38
 NBSP_THIN = "&#8239;"  # U+202F
 
-# ========= ÁREAS PRÉ-DEFINIDAS (tipo gist local) =========
-# coords = [(lat, lon), ...] (decimal deg). width_nm define corredor linear.
+# ========= ÁREAS PRÉ-DEFINIDAS =========
+# Nota: podes editar isto à vontade fora da UI.
+# Para cada área:
+#   - para polígonos normais, usa floor/ceiling/notes/coords
+#   - para corredores (width_nm >0), coords[0] -> coords[1] define eixo
+#   - "bands" é opcional: se meteres uma lista de dicts {"top": "...","label":"..."}
+#     a label no mapa vai listar linha a linha esses níveis (tipo do pdf COMAO/TRAINING/etc)
 PRESET_AIRSPACES = {
     "LPT1": {
         "floor": "GND", "ceiling": "FL280",
-        "notes": "TRAINING/COMAO",
+        "notes": "TRAINING / COMAO",
         "color": "#ffff00", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL280", "label": "COMAO"},
+            {"top": "FL140", "label": "TRAINING"},
+            {"top": "GND",   "label": ""}
+        ],
         "coords": [
             (41.38, -6.3925),
             (39.899167, -6.899722),
@@ -53,9 +68,13 @@ PRESET_AIRSPACES = {
     },
     "LPT2": {
         "floor": "GND", "ceiling": "FL245",
-        "notes": "TRAINING/COMAO",
+        "notes": "TRAINING / COMAO",
         "color": "#ffff00", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL245", "label": "COMAO"},
+            {"top": "GND",   "label": "TRAINING"}
+        ],
         "coords": [
             (39.9, -7.75),
             (39.893611, -6.899722),
@@ -66,9 +85,13 @@ PRESET_AIRSPACES = {
     },
     "LPT3": {
         "floor": "GND", "ceiling": "FL190",
-        "notes": "TRAINING/COMAO",
+        "notes": "TRAINING / COMAO",
         "color": "#ffff00", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL190", "label": "TRAINING / COMAO"},
+            {"top": "GND",   "label": ""}
+        ],
         "coords": [
             (39.666667, -8.0),
             (39.666667, -7.533333),
@@ -80,9 +103,13 @@ PRESET_AIRSPACES = {
     },
     "LPTRA57": {
         "floor": "GND", "ceiling": "FL245",
-        "notes": "TRAINING/COMAO",
+        "notes": "TRAINING / COMAO",
         "color": "#ffdd00", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL245", "label": "COMAO"},
+            {"top": "GND",   "label": "TRAINING"}
+        ],
         "coords": [
             (39.099167, -7.115556),
             (38.5525, -7.285278),
@@ -93,9 +120,13 @@ PRESET_AIRSPACES = {
     },
     "LPR51BN": {
         "floor": "GND", "ceiling": "FL240",
-        "notes": "TRAINING/COMAO",
+        "notes": "TRAINING / COMAO",
         "color": "#d4ff00", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL240", "label": "COMAO"},
+            {"top": "GND",   "label": "TRAINING"}
+        ],
         "coords": [
             (38.548611, -8.048889),
             (38.5525, -7.285278),
@@ -110,6 +141,10 @@ PRESET_AIRSPACES = {
         "notes": "TRAINING",
         "color": "#c8ff00", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL140", "label": "TRAINING"},
+            {"top": "GND",   "label": ""}
+        ],
         "coords": [
             (38.115278, -8.171111),
             (38.125, -6.960278),
@@ -123,6 +158,10 @@ PRESET_AIRSPACES = {
         "notes": "TRAINING",
         "color": "#baff00", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL060", "label": "TRAINING"},
+            {"top": "GND",   "label": ""}
+        ],
         "coords": [
             (37.597222, -7.95),
             (37.597222, -7.499167),
@@ -136,6 +175,10 @@ PRESET_AIRSPACES = {
         "notes": "TRAINING",
         "color": "#fff000", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL140", "label": "TRAINING"},
+            {"top": "GND",   "label": ""}
+        ],
         "coords": [
             (39.666667, -8.333333),
             (39.666667, -8.0),
@@ -154,6 +197,10 @@ PRESET_AIRSPACES = {
         "notes": "TRAINING",
         "color": "#fff000", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL140", "label": "TRAINING"},
+            {"top": "GND",   "label": ""}
+        ],
         "coords": [
             (39.9, -8.083333),
             (39.9, -7.75),
@@ -167,6 +214,10 @@ PRESET_AIRSPACES = {
         "notes": "TRAINING",
         "color": "#fff000", "opacity": 0.25,
         "width_nm": None,
+        "bands": [
+            {"top": "FL140", "label": "TRAINING"},
+            {"top": "GND",   "label": ""}
+        ],
         "coords": [
             (39.9, -7.75),
             (40.583333, -7.75),
@@ -175,22 +226,24 @@ PRESET_AIRSPACES = {
             (39.9, -7.75),
         ],
     },
-    # Corredores (width_nm = 5 NM ~ 9.3km).
+    # Corredores (width_nm = 5 NM ~ 9.3km)
     "LPT61": {
-        "floor": "GND", "ceiling": "2000FT AMSL",
+        "floor": "GND", "ceiling": "2000 FT AMSL",
         "notes": "Transit Corridor",
         "color": "#adff00", "opacity": 0.25,
         "width_nm": 5.0,
+        "bands": None,
         "coords": [
             (38.758333, -7.971667),
             (39.325, -8.270833),
         ],
     },
     "LPT63": {
-        "floor": "GND", "ceiling": "2000FT AMSL",
+        "floor": "GND", "ceiling": "2000 FT AMSL",
         "notes": "Transit Corridor",
         "color": "#adff00", "opacity": 0.25,
         "width_nm": 5.0,
+        "bands": None,
         "coords": [
             (38.366667, -8.233333),
             (38.583333, -8.583333),
@@ -296,7 +349,7 @@ def corridor_polygon(p1, p2, width_nm):
     right2 = dest_point(lat2, lon2, tc+90, half)
     return [left1, left2, right2, right1, left1]
 
-# parser AIP "38 22 00N 008 14 00W ..."
+# ========= PARSER COORDS AIP (se quiseres colar do AIP para novas áreas via código) =========
 coord_pattern = re.compile(
     r"(\d{2})\s+(\d{2})\s+(\d{2})([NS])\s+(\d{3})\s+(\d{2})\s+(\d{2})([EW])",
     re.IGNORECASE
@@ -340,23 +393,10 @@ ens("text_scale", 1.0)
 
 ens("show_ticks", True)
 ens("show_doghouses", True)
-
-# nossas áreas custom/preset
 ens("show_airspaces", True)
+ens("show_openaip", True)
 
-# toggles finos openAIP (UI só escolhe o que se quer ver)
-ens("show_active_only", False)   # "Show Only Active Airspace" placeholder
-ens("show_class_e", True)
-ens("show_class_f", False)
-ens("show_class_g", False)
-ens("show_gliding", True)
-ens("show_moa", True)
-ens("show_navaids", False)
-ens("show_reporting", False)
-ens("show_obstacles", False)
-ens("show_hg", False)
-
-# token via env; não mostramos a key no UI
+# token via ambiente (não mostramos campo para editar a key)
 ens("openaip_token", os.getenv("OPENAIP_KEY", "e849257999aa8ed820c3a6f7eb40f84e"))
 
 ens("map_center", (39.7, -8.1))
@@ -368,7 +408,7 @@ ens("alt_qadd", 3000.0)
 ens("search_rows", [])
 ens("last_q", "")
 
-ens("airspaces", [])        # áreas extra que metas manualmente via código
+ens("airspaces", [])        # áreas adicionais custom hardcoded
 ens("preset_selected", [])  # nomes das áreas do catálogo
 
 # ========= FORM GLOBAL =========
@@ -414,7 +454,7 @@ with st.form("globals"):
             "CP por defeito (min)", 1, 10, int(st.session_state.ck_default)
         )
 
-    # ----- Linha 2: base mapa / texto / doghouses / ticks / áreas nossas -----
+    # ----- Linha 2: mapa / texto / toggles visuais -----
     b1,b2,b3 = st.columns([2,1,1])
     with b1:
         bases = [
@@ -440,58 +480,18 @@ with st.form("globals"):
         )
         st.session_state.show_doghouses = st.toggle(
             "Dog houses", value=st.session_state.show_doghouses,
-            help="Cartões de perna (MH|TC, GS, ALT, ETE, etc)."
+            help="Cartões rotados com MH|TC, GS, ALT, etc."
         )
     with b3:
         st.session_state.show_airspaces = st.toggle(
             "Áreas catálogo/custom",
             value=st.session_state.show_airspaces,
-            help="Mostra LPT1/LPR51/etc + as tuas áreas hardcoded."
+            help="Mostra LPT1/LPR51/etc + áreas custom hardcoded."
         )
-
-    # ----- Linha 3: toggles finos do openAIP -----
-    st.markdown("#### Camadas openAIP (overlay)")
-    cA,cB,cC,cD = st.columns(4)
-
-    with cA:
-        st.session_state.show_active_only = st.toggle(
-            "Só ativo (beta)",
-            value=st.session_state.show_active_only,
-            help="Placeholder: ideia é filtrar só espaço aéreo 'ativo'."
-        )
-        st.session_state.show_class_e = st.toggle(
-            "Classe E", value=st.session_state.show_class_e
-        )
-        st.session_state.show_class_f = st.toggle(
-            "Classe F", value=st.session_state.show_class_f
-        )
-        st.session_state.show_class_g = st.toggle(
-            "Classe G", value=st.session_state.show_class_g
-        )
-
-    with cB:
-        st.session_state.show_gliding = st.toggle(
-            "Gliding sectors", value=st.session_state.show_gliding
-        )
-        st.session_state.show_hg = st.toggle(
-            "Hang gliding", value=st.session_state.show_hg
-        )
-
-    with cC:
-        st.session_state.show_moa = st.toggle(
-            "MOA / TRA", value=st.session_state.show_moa,
-            help="Military / training áreas (openAIP)."
-        )
-        st.session_state.show_navaids = st.toggle(
-            "Navaids", value=st.session_state.show_navaids
-        )
-
-    with cD:
-        st.session_state.show_reporting = st.toggle(
-            "Reporting Pts", value=st.session_state.show_reporting
-        )
-        st.session_state.show_obstacles = st.toggle(
-            "Obstacles", value=st.session_state.show_obstacles
+        st.session_state.show_openaip = st.toggle(
+            "Overlay openAIP",
+            value=st.session_state.show_openaip,
+            help="Layer VFR do openAIP por cima da base."
         )
 
     st.form_submit_button("Aplicar")
@@ -749,14 +749,13 @@ with st.expander("🛡 Espaço aéreo / restrições"):
     )
 
     st.caption(
-        "Nota: áreas ad-hoc novas NÃO se inserem mais aqui. "
-        "Se precisares, mete-as directamente no código (PRESET_AIRSPACES "
-        "ou st.session_state.airspaces)."
+        "Nota: áreas novas ad-hoc agora só via código "
+        "(PRESET_AIRSPACES ou st.session_state.airspaces)."
     )
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ========= EDITOR WPs (inclui vento por-WP se global OFF) =========
+# ========= EDITOR WPs =========
 del_idx = None
 if st.session_state.wps:
     st.subheader("Rota (Waypoints)")
@@ -842,7 +841,7 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
         nodes.append(A)
         tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
         dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
-        # ground speed para climb/descent aproximada
+        # GS aprox subida/descida
         _, _, gs_cl = wind_triangle(tc, CLIMB_TAS,   A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
         _, _, gs_de = wind_triangle(tc, DESCENT_TAS, A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
         if B["alt"] > A["alt"]:
@@ -1010,19 +1009,75 @@ def html_marker(m, lat, lon, html):
         icon=folium.DivIcon(html=html, icon_size=(0,0))
     ).add_to(m)
 
+# --- Waypoint label (fixes) estilo screenshot:
+#     NOME em bold preto com halo branco +
+#     linha azul "EFOB L • T+00:00"
+def wp_label_html(g, scale: float):
+    fs_name = int(14 * scale)
+    fs_line = int(12 * scale)
+
+    # construir as linhas "EFOB • ETO"
+    line_bits = []
+    for (efob, eto) in g["pairs"]:
+        has_efob = (efob is not None)
+        has_eto  = bool(eto)
+
+        efob_txt = f"{float(efob):.1f} L" if has_efob else ""
+        eto_txt  = eto if has_eto else ""
+
+        if has_efob and has_eto:
+            detail = f"{efob_txt} • {eto_txt}"
+        elif has_efob:
+            detail = efob_txt
+        else:
+            detail = eto_txt
+
+        line_bits.append(
+            f"<div style='font-size:{fs_line}px;"
+            f"font-weight:600;"
+            f"color:#0055FF;"
+            f"text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,"
+            f"-1px 1px 0 #fff,1px 1px 0 #fff;'>"
+            f"{detail}</div>"
+        )
+
+    detail_html = "".join(line_bits)
+
+    return f"""
+    <div style="
+        transform:translate(-50%,-100%);
+        line-height:1.25;
+        text-align:center;
+        white-space:nowrap;
+        font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;">
+
+        <div style="
+            font-size:{fs_name}px;
+            font-weight:700;
+            color:#000;
+            text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,
+                         -1px 1px 0 #fff,1px 1px 0 #fff;">
+            {g['name']}
+        </div>
+
+        {detail_html}
+    </div>
+    """
+
+# --- Doghouse rotada alinhada com a leg -----------------
 def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
     """
-    Versão mais legível:
-    - Caixa branca opaca
-    - Borda preta 3px
-    - Sombra forte
-    - Fontes ligeiramente maiores
-    - Barra de fase grossa
+    Cartão rotado alinhado com a perna:
+    - Cabeçalho grande: MH|TC   GS
+    - Depois ALT / DIST / ETE / BURN
+    - Borda preta grossa, fundo branco, sombra forte
+    - Barra de cor no topo (CLIMB / LEVEL / DESCENT)
     """
-    rot = angle_tc - 90.0
-    fs_head = int(14*scale)
-    fs_cell = int(12*scale)
-    bar_color = PROFILE_COLORS.get(phase, "#111")
+    rot = angle_tc - 90.0  # alinhar corpo com o track
+    fs_big   = int(15 * scale)
+    fs_small = int(12 * scale)
+    bar_color = PROFILE_COLORS.get(phase, "#000")
+
     return f"""
     <div style="
         transform:translate(-50%,-50%) rotate({rot}deg);
@@ -1033,64 +1088,98 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
         background:#fff;
         border:3px solid #000;
         border-radius:10px;
-        box-shadow:0 4px 8px rgba(0,0,0,.5);
+        box-shadow:0 4px 8px rgba(0,0,0,.55);
         padding:8px 10px;
-        line-height:1.2;
+        line-height:1.25;
         text-align:left;
         white-space:nowrap;">
+
         <div style="
             background:{bar_color};
             height:5px;
             border-radius:5px;
-            margin:-6px -6px 6px -6px;"></div>
+            margin:-8px -8px 6px -8px;"></div>
+
         <div style="
+            display:flex;
+            justify-content:space-between;
+            font-size:{fs_big}px;
+            font-weight:700;
+            margin-bottom:4px;">
+            <div>{info['mh_tc']}</div>
+            <div>{info['gs']}</div>
+        </div>
+
+        <div style="
+            font-size:{fs_small}px;
             display:grid;
             grid-template-columns:auto auto;
-            grid-row-gap:3px;
             grid-column-gap:12px;
-            font-size:{fs_cell}px;">
-            <div style="font-size:{fs_head}px;font-weight:700;">{info['mh_tc']}</div>
-            <div style="font-size:{fs_head}px;font-weight:700;">{info['gs']}</div>
-
-            <div>{info['alt']}</div>
-            <div>{info['ete']}</div>
-
-            <div>{info['dist']}</div>
-            <div>{info['burn']}</div>
+            grid-row-gap:2px;">
+            <div>ALT {info['alt']}</div><div>ETE {info['ete']}</div>
+            <div>DIST {info['dist']}</div><div>BURN {info['burn']}</div>
         </div>
     </div>"""
 
-def wp_label_html(g, scale):
-    fs_name = int(13*scale)
-    fs_line = int(11*scale)
-    parts=[]
-    for (efob, eto) in g["pairs"]:
-        efob_txt = fmt_L(efob if efob is not None else 0)
-        eto_txt  = eto or "-"
-        parts.append(
-            f"<div style='font-size:{fs_line}px;line-height:1.2;margin-top:2px;'>"
-            f"{efob_txt}<br/>{eto_txt}</div>"
-        )
-    body = "".join(parts)
+# --- Airspace label estilo "briefing sheet" -------------
+def airspace_label_html(asp, scale):
+    fs_name = int(14*scale)
+    fs_line = int(12*scale)
+
+    # construir linhas internas
+    lines_html = []
+    if asp.get("bands"):
+        # lista tipo:
+        # FL280 (COMAO)
+        # FL140 (TRAINING)
+        # GND
+        for band in asp["bands"]:
+            top_txt = band.get("top","").strip()
+            lbl_txt = band.get("label","").strip()
+            if lbl_txt:
+                lines_html.append(
+                    f"<div style='font-size:{fs_line}px;font-weight:400;'>{top_txt} ({lbl_txt})</div>"
+                )
+            else:
+                lines_html.append(
+                    f"<div style='font-size:{fs_line}px;font-weight:400;'>{top_txt}</div>"
+                )
+    else:
+        # fallback corredor / genérico
+        rng = f"{asp.get('floor','')} - {asp.get('ceiling','')}".strip()
+        if rng != " - ":
+            lines_html.append(
+                f"<div style='font-size:{fs_line}px;font-weight:400;'>{rng}</div>"
+            )
+        note_txt = asp.get("notes","").strip()
+        if note_txt:
+            lines_html.append(
+                f"<div style='font-size:{fs_line}px;font-weight:400;'>{note_txt}</div>"
+            )
+
+    body_html = "".join(lines_html)
+
     return f"""
     <div style="
         transform:translate(-50%,-100%);
-        background:rgba(255,255,255,.95);
+        background:#fff;
         color:#000;
         border:2px solid #000;
         border-radius:8px;
-        box-shadow:0 2px 4px rgba(0,0,0,.3);
-        padding:4px 6px;
-        line-height:1.2;
+        box-shadow:0 4px 8px rgba(0,0,0,.55);
+        padding:6px 8px;
+        line-height:1.3;
         text-align:center;
         white-space:nowrap;
         font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;">
-        <div style="font-size:{fs_name}px;font-weight:600;margin-bottom:2px;">
-            {g['name']}
+        <div style="font-size:{fs_name}px;font-weight:700;margin-bottom:4px;">
+            {asp['name']}
         </div>
-        {body}
-    </div>"""
+        {body_html}
+    </div>
+    """
 
+# ========= MAPA PRINCIPAL =========
 def render_map(nodes, legs, base_choice):
     if not nodes or not legs:
         st.info("Adiciona pelo menos 2 WPs e carrega em **Gerar/Atualizar rota**.")
@@ -1126,75 +1215,22 @@ def render_map(nodes, legs, base_choice):
             attr="© OpenTopoMap"
         ).add_to(m)
 
-    # --- openAIP OVERLAYS ---
+    # --- openAIP OVERLAY ---
     token = st.session_state.openaip_token.strip()
-    if token:
-        # Airspaces (todas classes)
-        if (
-            st.session_state.show_class_e
-            or st.session_state.show_class_f
-            or st.session_state.show_class_g
-            or st.session_state.show_gliding
-            or st.session_state.show_moa
-            or st.session_state.show_active_only
-        ):
-            folium.TileLayer(
-                tiles=(
-                    "https://api.tiles.openaip.net/api/data/airspaces/"
-                    "{z}/{x}/{y}.png?apiKey=" + token
-                ),
-                attr="© openAIP",
-                overlay=True,
-                name="openAIP Airspaces"
-            ).add_to(m)
-
-        # Navaids
-        if st.session_state.show_navaids:
-            folium.TileLayer(
-                tiles=(
-                    "https://api.tiles.openaip.net/api/data/navaids/"
-                    "{z}/{x}/{y}.png?apiKey=" + token
-                ),
-                attr="© openAIP",
-                overlay=True,
-                name="openAIP Navaids"
-            ).add_to(m)
-
-        # Reporting Points
-        if st.session_state.show_reporting:
-            folium.TileLayer(
-                tiles=(
-                    "https://api.tiles.openaip.net/api/data/reportingpoints/"
-                    "{z}/{x}/{y}.png?apiKey=" + token
-                ),
-                attr="© openAIP",
-                overlay=True,
-                name="openAIP Reporting Pts"
-            ).add_to(m)
-
-        # Obstacles
-        if st.session_state.show_obstacles:
-            folium.TileLayer(
-                tiles=(
-                    "https://api.tiles.openaip.net/api/data/obstacles/"
-                    "{z}/{x}/{y}.png?apiKey=" + token
-                ),
-                attr="© openAIP",
-                overlay=True,
-                name="openAIP Obstacles"
-            ).add_to(m)
-
-        # Gliding / Hang Gliding sites
-        if st.session_state.show_gliding or st.session_state.show_hg:
-            folium.TileLayer(
-                tiles=(
-                    "https://api.tiles.openaip.net/api/data/glidingsites/"
-                    "{z}/{x}/{y}.png?apiKey=" + token
-                ),
-                attr="© openAIP",
-                overlay=True,
-                name="openAIP Gliding/HG"
-            ).add_to(m)
+    if st.session_state.show_openaip and token:
+        folium.TileLayer(
+            tiles=(
+                "https://{s}.api.tiles.openaip.net/api/data/openaip/"
+                "{z}/{x}/{y}.png?apiKey=" + token
+            ),
+            attr="© openAIP",
+            name="openAIP (VFR data)",
+            overlay=True,
+            control=True,
+            subdomains="abc",
+            opacity=0.6,
+            max_zoom=20,
+        ).add_to(m)
 
     Fullscreen(
         position='topleft',
@@ -1234,51 +1270,69 @@ def render_map(nodes, legs, base_choice):
                     opacity=1
                 ).add_to(m)
 
-    # --- DOGHOUSES ---
+    # --- DOGHOUSES (cartões rotados + linha de ligação) ---
     if st.session_state.show_doghouses:
-        def z_clear(lat,lon,zs):
-            if not zs: return 9e9
-            return min(gc_dist_nm(lat,lon,a,b) - r for a,b,r in zs)
+        def z_clear(lat, lon, zs):
+            if not zs:
+                return 9e9
+            return min(gc_dist_nm(lat, lon, a, b) - r for a, b, r in zs)
 
-        zones=[]
+        # zonas ocupadas (para evitar overlap bruto)
+        zones = []
         for L in legs:
-            dist = gc_dist_nm(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"])
-            steps = max(2, int(dist/0.9))
+            dist_leg = gc_dist_nm(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"])
+            steps = max(2, int(dist_leg / 0.9))
             for k in range(1, steps):
                 p = point_along_gc(
-                    L["A"]["lat"],L["A"]["lon"],
-                    L["B"]["lat"],L["B"]["lon"],
-                    dist*k/steps
+                    L["A"]["lat"], L["A"]["lon"],
+                    L["B"]["lat"], L["B"]["lon"],
+                    dist_leg * k / steps
                 )
-                zones.append((p[0],p[1],0.38))
+                zones.append((p[0], p[1], 0.38))
 
         prev_side = None
         for idx, L in enumerate(legs):
             if L["Dist"] < 0.2:
                 continue
 
-            base = min(1.25, max(0.85, L["Dist"]/7.0))
+            # escala da doghouse depende um pouco do comprimento da leg e slider de texto
+            base = min(1.25, max(0.9, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
-            side_off = min(2.1, max(0.9, 1.0*s))
 
-            cur = L["TC"]
-            nxt = legs[idx+1]["TC"] if idx < len(legs)-1 else L["TC"]
-            turn = angdiff(nxt, cur)
-            prefer = +1 if turn>12 else (-1 if turn<-12 else (prev_side or +1))
+            # escolhe lado com base na viragem seguinte
+            cur_tc = L["TC"]
+            nxt_tc = legs[idx+1]["TC"] if idx < len(legs)-1 else L["TC"]
+            turn = angdiff(nxt_tc, cur_tc)
+            prefer = +1 if turn > 12 else (-1 if turn < -12 else (prev_side or +1))
 
-            mid = point_along_gc(
-                L["A"]["lat"],L["A"]["lon"],
-                L["B"]["lat"],L["B"]["lon"],
-                0.50*L["Dist"]
+            # ponto médio da perna
+            mid_lat, mid_lon = point_along_gc(
+                L["A"]["lat"], L["A"]["lon"],
+                L["B"]["lat"], L["B"]["lon"],
+                0.50 * L["Dist"]
             )
-            anchor = dest_point(mid[0], mid[1], L["TC"] + 90*prefer, side_off)
-            if z_clear(anchor[0], anchor[1], zones) < LABEL_MIN_CLEAR:
-                for extra in (0.35,0.7,1.1,1.5,1.9):
-                    cand = dest_point(anchor[0], anchor[1], L["TC"] + 90*prefer, extra)
-                    if z_clear(cand[0], cand[1], zones) >= LABEL_MIN_CLEAR:
-                        anchor = cand
+
+            # âncora deslocada lateralmente ~1.2 NM
+            side_off_nm = 1.2
+            anchor_lat, anchor_lon = dest_point(
+                mid_lat, mid_lon,
+                L["TC"] + 90 * prefer,
+                side_off_nm
+            )
+
+            # se está demasiado perto de outra caixa, afasta mais
+            if z_clear(anchor_lat, anchor_lon, zones) < LABEL_MIN_CLEAR:
+                for extra in (0.6, 1.0, 1.6, 2.2):
+                    cand_lat, cand_lon = dest_point(
+                        anchor_lat, anchor_lon,
+                        L["TC"] + 90 * prefer,
+                        extra
+                    )
+                    if z_clear(cand_lat, cand_lon, zones) >= LABEL_MIN_CLEAR:
+                        anchor_lat, anchor_lon = cand_lat, cand_lon
                         break
-            zones.append((anchor[0], anchor[1], 1.0))
+
+            zones.append((anchor_lat, anchor_lon, 1.0))
             prev_side = prefer
 
             info = {
@@ -1290,15 +1344,25 @@ def render_map(nodes, legs, base_choice):
                 "burn":  fmt_L(L['burn']),
             }
 
+            # linha preta (leader line) perna -> cartão
+            folium.PolyLine(
+                [(mid_lat, mid_lon), (anchor_lat, anchor_lon)],
+                color="#000000",
+                weight=2,
+                opacity=1.0
+            ).add_to(m)
+
+            # cartão rotado
             html_marker(
                 m,
-                anchor[0],
-                anchor[1],
+                anchor_lat,
+                anchor_lon,
                 doghouse_html_capsule(info, L["profile"], L["TC"], scale=s)
             )
 
     # --- MARCADORES DE WPs + labels WP/EFOB/ETO ---
     for N in nodes:
+        # bolinha branca com aro preto no ponto exacto
         html_marker(
             m, N["lat"], N["lon"],
             "<div style='transform:translate(-50%,-50%);width:18px;height:18px;"
@@ -1345,38 +1409,11 @@ def render_map(nodes, legs, base_choice):
         for nm in st.session_state.preset_selected:
             A = PRESET_AIRSPACES.get(nm)
             if A:
-                tmp = dict(A)
+                tmp = dict(A)  # cópia
                 tmp["name"] = nm
                 combined_asp.append(tmp)
         # ad-hoc injectadas via código
         combined_asp += st.session_state.airspaces
-
-        def airspace_label_html(asp, scale):
-            fs_main = int(12*scale)
-            fs_name = int(13*scale)
-            bar_color = asp["color"]
-            return f"""
-            <div style="
-                transform:translate(-50%,-100%);
-                background:#fff;
-                color:#000;
-                border:2px solid #000;
-                border-radius:8px;
-                box-shadow:0 4px 8px rgba(0,0,0,.45);
-                padding:6px 8px;
-                line-height:1.2;
-                font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
-                text-align:center;
-                white-space:nowrap;
-                font-size:{fs_main}px;">
-                <div style='background:{bar_color};height:4px;border-radius:4px;
-                    margin:-6px -6px 6px -6px;'></div>
-                <div style="font-size:{fs_name}px;font-weight:600;margin-bottom:2px;">
-                    {asp['name']}
-                </div>
-                <div>{asp['floor']}–{asp['ceiling']}</div>
-                <div style="font-weight:400;">{asp.get('notes','')}</div>
-            </div>"""
 
         for asp in combined_asp:
             # corredor vs polígono
@@ -1399,12 +1436,11 @@ def render_map(nodes, legs, base_choice):
                 fill=True,
                 fill_color=asp["color"],
                 fill_opacity=asp["opacity"],
-                tooltip=f"{asp['name']} {asp['floor']}→{asp['ceiling']} {asp.get('notes','')}"
+                tooltip=f"{asp['name']} {asp.get('floor','')}→{asp.get('ceiling','')} {asp.get('notes','')}"
             ).add_to(m)
 
             clat, clon = polygon_centroid(polycoords)
             s_label = float(st.session_state.text_scale)
-
             html_marker(
                 m,
                 clat,
@@ -1412,12 +1448,12 @@ def render_map(nodes, legs, base_choice):
                 airspace_label_html(asp, s_label)
             )
 
-    # Layer selector (para ligar/desligar as camadas openAIP)
+    # Layer selector para poderes ligar/desligar openAIP
     folium.LayerControl(collapsed=False).add_to(m)
 
     st_folium(m, width=None, height=760, key="mainmap", returned_objects=[])
 
-# render do mapa (fora da função, para ser chamado automaticamente)
+# render do mapa
 if st.session_state.wps and st.session_state.route_nodes and st.session_state.legs:
     render_map(st.session_state.route_nodes, st.session_state.legs, base_choice=st.session_state.map_base)
 elif st.session_state.wps:
@@ -1807,4 +1843,5 @@ if make_pdfs:
                     file_name="NAVLOG_FILLED_1.pdf",
                     use_container_width=True
                 )
+
 
