@@ -1,19 +1,27 @@
-# app_rev35.py — NAVLOG — rev35
+# app_rev36.py — NAVLOG — rev36
 # ---------------------------------------------------------------
 # - Overlay openAIP corrigido + slider de transparência.
 # - Labels dos WPs e doghouses agora rodadas pela TC da leg
-#   (lês sempre no sentido da perna, sem caixas brancas).
-# - Doghouses sem cartão branco: só texto com halo e barra de fase.
-# - Airspaces subtis tipo openAIP:
+#   (lês sempre no sentido da perna).
+# - Doghouses ultra-simples para voo:
+#     * Linha 1: MH|TC
+#     * Linha 2: ⬈/⮕/⬊ ALTITUDE (sem "ALT")
+#     * Linha 3: ETE (sem "ETE")
+#   Halo agressivo p/ legibilidade, sem caixas.
+# - Airspaces estilo openAIP:
 #   * texto com halo (sem caixa branca),
-#   * polígonos todos com a mesma cor suave (amarelo),
+#   * polígonos todos amarelo suave,
 #   * corredores em verde,
 #   * fill leve e borda discreta.
-# - Cores internas normalizadas: só os corredores mudam de cor.
-# - UI:
-#   * Slider "Transparência openAIP".
-#   * Continuam toggles: riscas CP / doghouses / áreas / openAIP.
-# - Resto NAVLOG / PDF mantém da rev anterior.
+#   * transparência controlável.
+# - Filtro de pernas no mapa:
+#   * podes escolher quais legs visualizar (ex: só ida, só vinda).
+# - PDF:
+#   * tempos >=60 min em formato 01h12 em vez de 72:00
+#   * segunda página do PDF mostra os totais da VIAGEM TODA
+#     e não apenas da página.
+# - Hora navegação = off-block +15 min (primeiro fix).
+# - EFOB inicial = start_efob -5 L.
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -29,24 +37,24 @@ TEMPLATE_MAIN = "NAVLOG_FORM.pdf"
 TEMPLATE_CONT = "NAVLOG_FORM_1.pdf"
 
 CLIMB_TAS, CRUISE_TAS, DESCENT_TAS = 70.0, 90.0, 90.0
-FUEL_FLOW = 20.0
+FUEL_FLOW = 20.0              # L/h
 EARTH_NM  = 3440.065
 PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386"}
 
 CP_TICK_HALF = 0.38
-NBSP_THIN = "&#8239;"  # U+202F
+NBSP_THIN = "&#8239;"  # U+202F fino para kt/ft/nm/L
 
 # Paleta para áreas
-ASPACE_COLOR     = "#FFD54A"  # áreas "normais" (LPTx, LPTRA, etc)
+ASPACE_COLOR     = "#FFD54A"  # áreas tipo LPT1, etc
 CORRIDOR_COLOR   = "#9BE27A"  # corredores tipo LPT61
 FILL_OPACITY     = 0.12       # alpha leve no fill
 EDGE_OPACITY     = 0.9        # borda mais visível
 
-# ========= ÁREAS PRÉ-DEFINIDAS (catálogo interno editável) =========
-# Cada área:
-#   - "coords": lista [(lat,lon),...]
-#   - "width_nm": se None => polígono; se >0 => corredor linear entre coords[0] e coords[1] com essa largura NM
-#   - "bands": lista opcional de linhas FL/note para mostrar na label
+# ========= ÁREAS PRÉ-DEFINIDAS =========
+# coords = [(lat, lon), ...] (decimal deg)
+# width_nm = None => polígono
+# width_nm >0  => corredor linear com largura dada
+# bands => linhas FL/nota a mostrar na label
 PRESET_AIRSPACES = {
     "LPT1": {
         "floor": "GND", "ceiling": "FL280",
@@ -270,12 +278,15 @@ st.markdown("""
 
 # ========= FUNÇÕES NUM / GEO =========
 rt10 = lambda s: max(10, int(round(s/10.0)*10)) if s>0 else 0
+
 def mmss(t):
     t=int(t)
     return f"{t//60:02d}:{t%60:02d}"
+
 def hhmmss(t):
     t=int(t)
     return f"{t//3600:02d}:{(t%3600)//60:02d}:{t%60:02d}"
+
 def rint(x): return int(round(float(x)))
 def r10f(x): return round(float(x), 1)
 def wrap360(x): return (x % 360 + 360) % 360
@@ -350,7 +361,7 @@ def corridor_polygon(p1, p2, width_nm):
     right2 = dest_point(lat2, lon2, tc+90, half)
     return [left1, left2, right2, right1, left1]
 
-# ========= PARSER COORDS AIP (para colar do AIP e gerar polígonos via código) =========
+# Parser coords AIP "41 22 48N 006 23 33W ..."
 coord_pattern = re.compile(
     r"(\d{2})\s+(\d{2})\s+(\d{2})([NS])\s+(\d{3})\s+(\d{2})\s+(\d{2})([EW])",
     re.IGNORECASE
@@ -397,9 +408,8 @@ ens("show_doghouses", True)
 ens("show_airspaces", True)
 ens("show_openaip", True)
 
-# token vinda do ambiente; não mostramos a key
+# token via env, não mostramos na UI
 ens("openaip_token", os.getenv("OPENAIP_KEY", "e849257999aa8ed820c3a6f7eb40f84e"))
-# alpha do overlay openAIP
 ens("openaip_alpha", 0.6)
 
 ens("map_center", (39.7, -8.1))
@@ -411,12 +421,15 @@ ens("alt_qadd", 3000.0)
 ens("search_rows", [])
 ens("last_q", "")
 
-ens("airspaces", [])        # áreas adicionais custom hardcoded (fora do preset)
+ens("airspaces", [])        # áreas extra custom (fora do preset)
 ens("preset_selected", [])  # nomes das áreas do catálogo
+
+# filtro de pernas (ida/vinda/custom)
+ens("use_leg_filter", False)
+ens("leg_filter_ids", [])   # lista de índices (0-based) das pernas selecionadas
 
 # ========= FORM GLOBAL =========
 with st.form("globals"):
-    # ----- Linha 1: vento / magnética / climb-descent / fuel -----
     c1,c2,c3,c4 = st.columns(4)
     with c1:
         st.session_state.wind_from = st.number_input(
@@ -457,7 +470,6 @@ with st.form("globals"):
             "CP por defeito (min)", 1, 10, int(st.session_state.ck_default)
         )
 
-    # ----- Linha 2: base / texto / toggles -----
     b1,b2,b3 = st.columns([2,1,1])
     with b1:
         bases = [
@@ -483,7 +495,7 @@ with st.form("globals"):
         )
         st.session_state.show_doghouses = st.toggle(
             "Dog houses", value=st.session_state.show_doghouses,
-            help="Cartões rotados com MH|TC, GS, ALT, etc."
+            help="Cartões rotados com heading/ALT/ETE."
         )
     with b3:
         st.session_state.show_airspaces = st.toggle(
@@ -505,7 +517,7 @@ with st.form("globals"):
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ========= CSVs / DB pontos =========
+# ========= CSVs =========
 AD_CSV  = "AD-HEL-ULM.csv"
 LOC_CSV = "Localidades-Nova-versao-230223.csv"
 
@@ -744,7 +756,7 @@ with tab_map:
             )
             st.success("Adicionado.")
 
-# ========= ESPAÇO AÉREO (catálogo) =========
+# ========= ESPAÇO AÉREO =========
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 with st.expander("🛡 Espaço aéreo / restrições"):
     preset_names_sorted = sorted(PRESET_AIRSPACES.keys())
@@ -754,7 +766,6 @@ with st.expander("🛡 Espaço aéreo / restrições"):
         default=st.session_state.preset_selected,
         help="Seleciona p/ mostrar no mapa (ex.: LPT1, LPT61...)."
     )
-
     st.caption(
         "Nota: áreas novas ad-hoc agora só via código "
         "(PRESET_AIRSPACES ou st.session_state.airspaces)."
@@ -839,7 +850,7 @@ st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ========= ROTA (TOC/TOD) =========
 def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
-    # calcula TOC / TOD intermédios
+    # calcula TOC/TOD intermédios
     nodes = []
     if len(user_wps) < 2:
         return nodes
@@ -848,9 +859,10 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
         nodes.append(A)
         tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
         dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
-        # GS aproximada climb/descida
+        # GS aprox para climb/descida
         _, _, gs_cl = wind_triangle(tc, CLIMB_TAS,   A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
         _, _, gs_de = wind_triangle(tc, DESCENT_TAS, A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
+        # TOC
         if B["alt"] > A["alt"]:
             dh = B["alt"] - A["alt"]
             t_need = dh / max(roc_fpm, 1.0)
@@ -864,6 +876,7 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
                     "wind_from": A.get("wind_from", wind_from),
                     "wind_kt":   A.get("wind_kt", wind_kt),
                 })
+        # TOD
         elif B["alt"] < A["alt"]:
             dh = A["alt"] - B["alt"]
             t_need = dh / max(rod_fpm, 1.0)
@@ -936,6 +949,7 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
             if base_time else f"T+{mmss(t_cursor+time_sec)}"
         )
 
+        # CP ticks
         cps=[]
         if ck_every_min>0 and gs>0:
             k=1
@@ -990,7 +1004,7 @@ with cgen:
             st.session_state.ck_default
         )
 
-# ========= RESUMO ROTA =========
+# ========= RESUMO GLOBAL DA ROTA =========
 if st.session_state.legs:
     total_sec  = sum(L["time_sec"] for L in st.session_state.legs)
     total_burn = r10f(sum(L["burn"] for L in st.session_state.legs))
@@ -1007,6 +1021,55 @@ if st.session_state.legs:
     )
     st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
+# ========= FILTRO DE PERNAS (IDA / VINDA / PARCIAL) =========
+if st.session_state.legs:
+    with st.expander("🎯 Filtro de pernas no mapa (ex: só ida / só volta)", expanded=False):
+        # toggle principal
+        st.session_state.use_leg_filter = st.toggle(
+            "Ativar filtro de pernas no mapa",
+            value=st.session_state.use_leg_filter,
+            help="Se ligado, o mapa só mostra as pernas escolhidas abaixo."
+        )
+
+        # opções tipo "01  LPSO→VARGE"
+        opt_labels = []
+        for idx, L in enumerate(st.session_state.legs):
+            leg_label = f"{idx+1:02d}  {L['A']['name']}→{L['B']['name']}"
+            opt_labels.append(leg_label)
+
+        default_labels = [
+            opt_labels[i] for i in st.session_state.leg_filter_ids
+            if i < len(opt_labels)
+        ]
+
+        chosen_labels = st.multiselect(
+            "Quais pernas queres ver?",
+            opt_labels,
+            default=default_labels,
+            help="Escolhe só ida, só regresso, ou secções específicas."
+        )
+
+        new_ids = []
+        for lbl in chosen_labels:
+            try:
+                n_str = lbl.split()[0]  # "01"
+                leg_idx = int(n_str) - 1
+                if 0 <= leg_idx < len(st.session_state.legs):
+                    new_ids.append(leg_idx)
+            except:
+                pass
+        st.session_state.leg_filter_ids = new_ids
+
+        if st.session_state.use_leg_filter and st.session_state.leg_filter_ids:
+            pretty = ", ".join(
+                f"L{idx+1:02d}" for idx in st.session_state.leg_filter_ids
+            )
+            st.caption(f"A mostrar apenas: {pretty}")
+        elif st.session_state.use_leg_filter:
+            st.caption("Filtro ativo mas nenhuma perna escolhida → nada será desenhado.")
+        else:
+            st.caption("Filtro desligado → mapa mostra TODAS as pernas.")
+
 # ========= MARKUP HELPERS =========
 LABEL_MIN_CLEAR = 0.7
 
@@ -1016,11 +1079,16 @@ def html_marker(m, lat, lon, html):
         icon=folium.DivIcon(html=html, icon_size=(0,0))
     ).add_to(m)
 
-# --- Waypoint label rodado (sem caixa branca) ---
+# Waypoint label rodado, com halo
 def wp_label_html_rot(g, scale: float, angle_tc: float):
     rot = angle_tc - 90.0
     fs_name = int(14 * scale)
     fs_line = int(12 * scale)
+
+    txtshadow = (
+        "-1px -1px 0 #fff,1px -1px 0 #fff,"
+        "-1px  1px 0 #fff,1px  1px 0 #fff"
+    )
 
     lines = []
     for (efob, eto) in g["pairs"]:
@@ -1029,8 +1097,7 @@ def wp_label_html_rot(g, scale: float, angle_tc: float):
         detail = f"{ef} • {et}" if ef and et else (ef or et)
         lines.append(
             f"<div style='font-size:{fs_line}px;font-weight:700;color:#0055FF;"
-            f"text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,"
-            f"-1px 1px 0 #fff,1px 1px 0 #fff;'>{detail}</div>"
+            f"text-shadow:{txtshadow};'>{detail}</div>"
         )
 
     return f"""
@@ -1040,17 +1107,15 @@ def wp_label_html_rot(g, scale: float, angle_tc: float):
         line-height:1.2;text-align:center;white-space:nowrap;
         font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;">
         <div style="font-size:{fs_name}px;font-weight:900;color:#000;
-            text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,
-                         -1px 1px 0 #fff,1px 1px 0 #fff;">
+            text-shadow:{txtshadow};">
             {g['name']}
         </div>
         {''.join(lines)}
     </div>
     """
 
-# --- Doghouse rotada, sem caixa branca ---
+# Doghouse minimalista rotada
 def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
-    # setas da fase
     phase_arrow_map = {
         "CLIMB": "⬈",
         "LEVEL": "⮕",
@@ -1060,12 +1125,10 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
 
     rot = angle_tc - 90.0
 
-    # tamanhos (escalam com o slider de texto e também com o comprimento da perna)
     fs_head = int(18 * scale)  # MH|TC
     fs_alt  = int(16 * scale)  # seta + altitude
-    fs_ete  = int(16 * scale)  # tempo ETE
+    fs_ete  = int(16 * scale)  # tempo
 
-    # halo agressivo p/ ler em cima de qualquer merda de fundo
     txtshadow = (
         "-2px -2px 0 #fff,  2px -2px 0 #fff,"
         "-2px  2px 0 #fff,  2px  2px 0 #fff,"
@@ -1086,42 +1149,35 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
         white-space:nowrap;
         text-align:left;
     ">
-
-        <!-- Heading (MH|TC) -->
         <div style="
             font-size:{fs_head}px;
             font-weight:800;
             text-shadow:{txtshadow};
-        ">
-            {info['mh_tc']}
-        </div>
+        ">{info['mh_tc']}</div>
 
-        <!-- Fase + altitude (seta primeiro) -->
         <div style="
             font-size:{fs_alt}px;
             font-weight:700;
             text-shadow:{txtshadow};
-        ">
-            {arrow} {info['alt']}
-        </div>
+        ">{arrow} {info['alt']}</div>
 
-        <!-- Tempo da perna -->
         <div style="
             font-size:{fs_ete}px;
             font-weight:700;
             text-shadow:{txtshadow};
-        ">
-            {info['ete']}
-        </div>
-
+        ">{info['ete']}</div>
     </div>
     """
 
-
-# --- Label das áreas estilo openAIP (halo, sem caixa) ---
+# Label de áreas tipo openAIP
 def airspace_label_html(asp, scale):
     fs_name = int(12*scale)
     fs_line = int(11*scale)
+
+    txtshadow = (
+        "-1px -1px 0 #fff,1px -1px 0 #fff,"
+        "-1px  1px 0 #fff,1px  1px 0 #fff"
+    )
 
     lines = []
     if asp.get("bands"):
@@ -1140,7 +1196,7 @@ def airspace_label_html(asp, scale):
             lines.append(str(asp["notes"]))
 
     body = "".join(
-        f"<div style='font-size:{fs_line}px;font-weight:600'>{x}</div>" for x in lines
+        f"<div style='font-size:{fs_line}px;font-weight:600;text-shadow:{txtshadow};'>{x}</div>" for x in lines
     )
 
     return f"""
@@ -1148,11 +1204,41 @@ def airspace_label_html(asp, scale):
         transform:translate(-50%,-100%);
         color:#000; white-space:nowrap; text-align:center;
         font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
-        text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;">
+        text-shadow:{txtshadow};">
         <div style="font-size:{fs_name}px;font-weight:900">{asp['name']}</div>
         {body}
     </div>
     """
+
+# ========= PERNAS FILTRADAS PARA O MAPA =========
+def get_filtered_nodes_legs():
+    """
+    Devolve (nodes_to_show, legs_to_show) já filtrados se o filtro estiver ativo.
+    Se o filtro estiver off, devolve tudo.
+    """
+    all_nodes = st.session_state.route_nodes
+    all_legs  = st.session_state.legs
+
+    if (not st.session_state.use_leg_filter) or (not st.session_state.leg_filter_ids):
+        return all_nodes, all_legs
+
+    sel_idxs = [
+        i for i in st.session_state.leg_filter_ids
+        if 0 <= i < len(all_legs)
+    ]
+    sel_legs = [all_legs[i] for i in sel_idxs]
+
+    # construir nós únicos (A e B de cada leg escolhida)
+    sel_nodes_seq = []
+    seen = set()
+    for L in sel_legs:
+        for P in [L["A"], L["B"]]:
+            key = (round(P["lat"],6), round(P["lon"],6), P["name"])
+            if key not in seen:
+                seen.add(key)
+                sel_nodes_seq.append(P)
+
+    return sel_nodes_seq, sel_legs
 
 # ========= MAPA PRINCIPAL =========
 def render_map(nodes, legs, base_choice):
@@ -1168,7 +1254,7 @@ def render_map(nodes, legs, base_choice):
         prefer_canvas=True
     )
 
-    # --- BASE LAYER ---
+    # base layer
     if base_choice == "OpenTopoMap (VFR-ish)":
         folium.TileLayer(
             "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
@@ -1190,7 +1276,7 @@ def render_map(nodes, legs, base_choice):
             attr="© OpenTopoMap"
         ).add_to(m)
 
-    # --- openAIP OVERLAY ---
+    # openAIP overlay
     token = st.session_state.openaip_token.strip()
     if st.session_state.show_openaip and token:
         folium.TileLayer(
@@ -1213,7 +1299,7 @@ def render_map(nodes, legs, base_choice):
         force_separate_button=True
     ).add_to(m)
 
-    # --- PERNAS DA ROTA ---
+    # PERNAS
     for L in legs:
         latlngs = [(L["A"]["lat"],L["A"]["lon"]), (L["B"]["lat"],L["B"]["lon"])]
         color = PROFILE_COLORS.get(L["profile"], "#C000FF")
@@ -1224,7 +1310,7 @@ def render_map(nodes, legs, base_choice):
             latlngs, color=color, weight=4, opacity=1.0
         ).add_to(m)
 
-    # --- TICKS CP ---
+    # TICKS CP
     if st.session_state.show_ticks:
         for L in legs:
             if L["GS"]<=0 or not L["cps"]:
@@ -1245,14 +1331,13 @@ def render_map(nodes, legs, base_choice):
                     opacity=1
                 ).add_to(m)
 
-    # --- DOGHOUSES (rotadas, sem caixa branca) ---
+    # DOGHOUSES
     if st.session_state.show_doghouses:
         def z_clear(lat, lon, zs):
             if not zs:
                 return 9e9
             return min(gc_dist_nm(lat, lon, a, b) - r for a, b, r in zs)
 
-        # zonas ocupadas
         zones = []
         for L in legs:
             dist_leg = gc_dist_nm(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"])
@@ -1274,7 +1359,7 @@ def render_map(nodes, legs, base_choice):
             base = min(1.25, max(0.9, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
 
-            # lado preferido (direita/esquerda) baseado na próxima viragem
+            # lado preferido (direita/esquerda) baseado na viragem seguinte
             cur_tc = L["TC"]
             nxt_tc = legs[idx+1]["TC"] if idx < len(legs)-1 else L["TC"]
             turn = angdiff(nxt_tc, cur_tc)
@@ -1295,7 +1380,7 @@ def render_map(nodes, legs, base_choice):
                 side_off_nm
             )
 
-            # afasta mais se overlap
+            # afasta se colado com outra coisa
             if z_clear(anchor_lat, anchor_lon, zones) < LABEL_MIN_CLEAR:
                 for extra in (0.6, 1.0, 1.6, 2.2):
                     cand_lat, cand_lon = dest_point(
@@ -1312,11 +1397,8 @@ def render_map(nodes, legs, base_choice):
 
             info = {
                 "mh_tc": f"{deg3(L['MH'])}|{deg3(L['TC'])}",
-                "gs":    fmt_kt(L['GS']),
                 "alt":   fmt_ft(L['A']['alt']),
                 "ete":   mmss(L['time_sec']),
-                "dist":  fmt_nm(L['Dist']),
-                "burn":  fmt_L(L['burn']),
             }
 
             # leader line preta
@@ -1327,7 +1409,6 @@ def render_map(nodes, legs, base_choice):
                 opacity=1.0
             ).add_to(m)
 
-            # cartão rotado (halo only)
             html_marker(
                 m,
                 anchor_lat,
@@ -1335,7 +1416,7 @@ def render_map(nodes, legs, base_choice):
                 doghouse_html_capsule(info, L["profile"], L["TC"], scale=s)
             )
 
-    # --- MARCADORES DE WPs (bolinha branca com aro preto) ---
+    # NÓS (bolinha branca com aro preto)
     for N in nodes:
         html_marker(
             m, N["lat"], N["lon"],
@@ -1344,19 +1425,18 @@ def render_map(nodes, legs, base_choice):
             "box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
         )
 
-    # --- INFO ETO / EFOB por nó ---
+    # INFO ETO / EFOB por nó
     info_nodes = [{"eto": None, "efob": None} for _ in nodes]
     if legs:
         info_nodes[0]["eto"]  = legs[0]["clock_start"]
         info_nodes[0]["efob"] = legs[0]["efob_start"]
         for i in range(1, len(nodes)):
-            Lprev = legs[i-1]
-            info_nodes[i]["eto"]  = Lprev["clock_end"]
-            info_nodes[i]["efob"] = Lprev["efob_end"]
+            if i-1 < len(legs):
+                Lprev = legs[i-1]
+                info_nodes[i]["eto"]  = Lprev["clock_end"]
+                info_nodes[i]["efob"] = Lprev["efob_end"]
 
-    # orientação (TC) por nó:
-    #  - nó i usa TC da perna que SAI desse nó
-    #  - último nó usa TC da perna anterior
+    # ângulo associado a cada nó (TC da perna que sai / senão última)
     node_tc = []
     if legs:
         for i in range(len(nodes)):
@@ -1364,8 +1444,10 @@ def render_map(nodes, legs, base_choice):
                 node_tc.append(legs[i]["TC"])
             else:
                 node_tc.append(legs[-1]["TC"])
+    else:
+        node_tc = [0.0]*len(nodes)
 
-    # agrupa nós iguais (mesmo sítio/nome base) e guarda ângulo
+    # agrupar nós iguais
     grouped=[]
     seen=set()
     for idx,N in enumerate(nodes):
@@ -1386,22 +1468,22 @@ def render_map(nodes, legs, base_choice):
                     g["pairs"].append((info_nodes[idx]["efob"], info_nodes[idx]["eto"]))
                     break
 
-    # desenhar as labels WP rodadas
+    # labels WP rodadas
     for g in grouped:
         s = float(st.session_state.text_scale)
         html_marker(m, g["lat"], g["lon"], wp_label_html_rot(g, s, g["angle"]))
 
-    # --- ÁREAS CATÁLOGO/PERSONALIZADAS ---
+    # ÁREAS
     if st.session_state.show_airspaces:
         combined_asp = []
-        # presets escolhidos
+        # presets selecionados
         for nm in st.session_state.preset_selected:
             A = PRESET_AIRSPACES.get(nm)
             if A:
                 tmp = dict(A)
                 tmp["name"] = nm
                 combined_asp.append(tmp)
-        # ad-hoc extra hardcoded
+        # ad-hoc extra
         combined_asp += st.session_state.airspaces
 
         for asp in combined_asp:
@@ -1418,7 +1500,6 @@ def render_map(nodes, legs, base_choice):
             if not polycoords:
                 continue
 
-            # cor unificada: áreas = amarelo, corredores = verde
             edge_color = CORRIDOR_COLOR if asp.get("width_nm") else ASPACE_COLOR
 
             folium.Polygon(
@@ -1441,14 +1522,22 @@ def render_map(nodes, legs, base_choice):
                 airspace_label_html(asp, s_label)
             )
 
-    # Layer selector para poderes ligar/desligar openAIP
     folium.LayerControl(collapsed=False).add_to(m)
 
     st_folium(m, width=None, height=760, key="mainmap", returned_objects=[])
 
-# render do mapa
+# ========= RENDER DO MAPA (com filtro de pernas) =========
 if st.session_state.wps and st.session_state.route_nodes and st.session_state.legs:
-    render_map(st.session_state.route_nodes, st.session_state.legs, base_choice=st.session_state.map_base)
+    nodes_to_show, legs_to_show = get_filtered_nodes_legs()
+
+    if legs_to_show and nodes_to_show:
+        render_map(
+            nodes_to_show,
+            legs_to_show,
+            base_choice=st.session_state.map_base
+        )
+    else:
+        st.warning("Filtro ativo mas sem pernas selecionadas para mostrar.")
 elif st.session_state.wps:
     st.info("Carrega em **Gerar/Atualizar rota**.")
 else:
@@ -1555,7 +1644,6 @@ alt_leg_info = None
 if use_alt and alt_choice and st.session_state.wps:
     dest = st.session_state.wps[-1]
     tc_alt = gc_course_tc(dest["lat"], dest["lon"], alt_choice["lat"], alt_choice["lon"])
-    # vento da última perna (ou global)
     if st.session_state.use_global_wind:
         wf = st.session_state.wind_from
         wk = st.session_state.wind_kt
@@ -1578,15 +1666,14 @@ if use_alt and alt_choice and st.session_state.wps:
 def _pdf_mmss(sec:int):
     # arredonda para o segundo mais próximo
     total_sec = int(round(sec))
-
     minutes, seconds = divmod(total_sec, 60)
 
-    # se já passou dos 60 minutos => usar HHhMM
+    # >=60 min -> HHhMM
     if minutes >= 60:
         hours, mins = divmod(minutes, 60)
         return f"{hours:02d}h{mins:02d}"
 
-    # caso normal (<60 min) => MM:SS
+    # <60 min -> MM:SS
     return f"{minutes:02d}:{seconds:02d}"
 
 def _set_need_appearances(pdf):
@@ -1740,14 +1827,14 @@ def _build_payload_cont(
     alt_info=None,
     alt_choice=None
 ):
-    # pega do leg 23 em diante (start_idx normalmente = 22)
+    # pega do leg 23 em diante (start_idx tipicamente =22)
     legs_chunk = all_legs[start_idx:start_idx+11]
     if not legs_chunk:
         return None
 
     d = {"OBSERVATIONS":"SEVENAIR OPS: 131.675"}
 
-    # acumulação só para preencher as linhas individuais desta página
+    # acumulação interna (para as colunas cumulativas desta folha)
     acc_d = 0.0
     acc_t = 0
     for offset, L in enumerate(legs_chunk, start=12):
@@ -1755,7 +1842,7 @@ def _build_payload_cont(
         acc_t += L["time_sec"]
         _fill_leg_line(d, offset, L, use_point="A", acc_d=acc_d, acc_t=acc_t)
 
-    # se esta página inclui o destino final, ainda desenhamos a linha de chegada
+    # chegada final se couber
     is_last_chunk = (start_idx + len(legs_chunk) == len(all_legs))
     next_idx = 12 + len(legs_chunk)
     if is_last_chunk and next_idx <= 22:
@@ -1769,9 +1856,7 @@ def _build_payload_cont(
         d[f"Leg{next_idx:02d}_ETO"] = legs_chunk[-1]["clock_end"]
         d[f"Leg{next_idx:02d}_Estimated_FOB"] = f"{legs_chunk[-1]['efob_end']:.1f}"
 
-    # =========================
-    # >>> TOTAIS GLOBAIS <<<
-    # =========================
+    # ------------- TOTAIS GLOBAIS DO VOO INTEIRO -------------
     total_dist_all_nm   = sum(L["Dist"] for L in all_legs)
     total_time_all_sec  = sum(L["time_sec"] for L in all_legs)
     total_burn_all_L    = sum(L["burn"] for L in all_legs)
@@ -1782,7 +1867,6 @@ def _build_payload_cont(
     d["Leg23_Planned_Burnoff"] = f"{r10f(total_burn_all_L):.1f}"
     d["Leg23_Estimated_FOB"]   = f"{final_efob_all_L:.1f}"
 
-    # alternante (mantemos a mesma lógica que já tinhas)
     if alt_info and alt_choice:
         total_sec_before_chunk = sum(
             L["time_sec"] for L in all_legs[:start_idx+len(legs_chunk)]
@@ -1803,9 +1887,7 @@ def _build_payload_cont(
             "Alternate_Planned_Burnoff":f"{r10f(alt_info['burn']):.1f}",
             "Alternate_Estimated_FOB":f"{r10f(all_legs[start_idx+len(legs_chunk)-1]['efob_end'] - alt_info['burn']):.1f}",
         })
-
     return d
-
 
 # ========= BOTÕES PDF =========
 cX, cY = st.columns([1,1])
@@ -1816,7 +1898,7 @@ with cX:
         use_container_width=True
     )
 with cY:
-    st.caption("Principal até 22 legs; continuação só se exceder.")
+    st.caption("Principal até 22 legs; continuação se exceder.")
 
 if make_pdfs:
     if not st.session_state.legs:
