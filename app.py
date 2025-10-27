@@ -1576,8 +1576,18 @@ if use_alt and alt_choice and st.session_state.wps:
 
 # ========= PDF helpers =========
 def _pdf_mmss(sec:int):
-    m,s = divmod(int(round(sec)),60)
-    return f"{m:02d}:{s:02d}"
+    # arredonda para o segundo mais próximo
+    total_sec = int(round(sec))
+
+    minutes, seconds = divmod(total_sec, 60)
+
+    # se já passou dos 60 minutos => usar HHhMM
+    if minutes >= 60:
+        hours, mins = divmod(minutes, 60)
+        return f"{hours:02d}h{mins:02d}"
+
+    # caso normal (<60 min) => MM:SS
+    return f"{minutes:02d}:{seconds:02d}"
 
 def _set_need_appearances(pdf):
     if pdf.Root.AcroForm:
