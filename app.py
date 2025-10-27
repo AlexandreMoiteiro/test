@@ -1050,22 +1050,26 @@ def wp_label_html_rot(g, scale: float, angle_tc: float):
 
 # --- Doghouse rotada, sem caixa branca ---
 def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
-    # phase arrow para ler rápido em voo
+    # setas da fase
     phase_arrow_map = {
-        "CLIMB": "↗",
-        "LEVEL": "→",
+        "CLIMB": "⬈",
+        "LEVEL": "⮕",
         "DESCENT": "⬊",
     }
-    arrow = phase_arrow_map.get(phase, "→")
+    arrow = phase_arrow_map.get(phase, "⮕")
 
     rot = angle_tc - 90.0
-    fs_big   = int(16 * scale)   # heading grande
-    fs_small = int(14 * scale)   # linha ALT / ETE
 
-    # halo branco -> legível em qualquer fundo
+    # tamanhos (escalam com o slider de texto e também com o comprimento da perna)
+    fs_head = int(18 * scale)  # MH|TC
+    fs_alt  = int(16 * scale)  # seta + altitude
+    fs_ete  = int(16 * scale)  # tempo ETE
+
+    # halo agressivo p/ ler em cima de qualquer merda de fundo
     txtshadow = (
-        "-1px -1px 0 #fff, 1px -1px 0 #fff, "
-        "-1px  1px 0 #fff, 1px  1px 0 #fff"
+        "-2px -2px 0 #fff,  2px -2px 0 #fff,"
+        "-2px  2px 0 #fff,  2px  2px 0 #fff,"
+        "0px   0px 4px #fff, 2px 2px 3px rgba(0,0,0,.7)"
     )
 
     return f"""
@@ -1078,35 +1082,41 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
         background:transparent;
         border:none;
         padding:0;
-        line-height:1.2;
+        line-height:1.25;
         white-space:nowrap;
         text-align:left;
     ">
 
-        <!-- Linha grande: MH|TC -->
+        <!-- Heading (MH|TC) -->
         <div style="
-            font-size:{fs_big}px;
+            font-size:{fs_head}px;
             font-weight:800;
             text-shadow:{txtshadow};
         ">
             {info['mh_tc']}
         </div>
 
-        <!-- Linha pequena: ALT + fase, ETE -->
+        <!-- Fase + altitude (seta primeiro) -->
         <div style="
-            display:flex;
-            flex-direction:row;
-            justify-content:space-between;
-            gap:12px;
-            font-size:{fs_small}px;
-            font-weight:600;
+            font-size:{fs_alt}px;
+            font-weight:700;
             text-shadow:{txtshadow};
         ">
-            <div>ALT {info['alt']} {arrow}</div>
-            <div>ETE {info['ete']}</div>
+            {arrow} {info['alt']}
         </div>
+
+        <!-- Tempo da perna -->
+        <div style="
+            font-size:{fs_ete}px;
+            font-weight:700;
+            text-shadow:{txtshadow};
+        ">
+            {info['ete']}
+        </div>
+
     </div>
     """
+
 
 # --- Label das áreas estilo openAIP (halo, sem caixa) ---
 def airspace_label_html(asp, scale):
