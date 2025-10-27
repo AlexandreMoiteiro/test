@@ -1,23 +1,19 @@
-# app_rev34.py — NAVLOG — rev34
+# app_rev35.py — NAVLOG — rev35
 # ---------------------------------------------------------------
-# - openAIP overlay corrigido:
-#     usa https://{s}.api.tiles.openaip.net/api/data/openaip/{z}/{x}/{y}.png?apiKey=...
-#     com subdomains="abc", overlay=True e LayerControl
-# - Waypoint labels (fixes) estilo screenshot:
-#     NOME a preto com halo branco + linha azul "EFOB • T+.."
-#     sem caixa branca gorda
-# - Doghouses:
-#     cartão branco rotado alinhado com a leg
-#     MH|TC e GS grandes, ALT/DIST/ETE/BURN arrumados
-#     linha preta da perna até ao cartão
-# - Espaços aéreos (LPT1, LPT61 etc):
-#     polígono/corredor com fill semi-transparente
-#     etiqueta branca com borda preta e sombra forte
-#     linhas empilhadas (nome em bold + níveis/NOTES)
-# - UI mais simples:
-#     toggles: risc as CP / doghouses / áreas preset / openAIP
-#     sem textarea de áreas ad-hoc (isso continua possível via código)
-# - resto NAVLOG / PDF igual base rev33
+# - Overlay openAIP corrigido + slider de transparência.
+# - Labels dos WPs e doghouses agora rodadas pela TC da leg
+#   (lês sempre no sentido da perna, sem caixas brancas).
+# - Doghouses sem cartão branco: só texto com halo e barra de fase.
+# - Airspaces subtis tipo openAIP:
+#   * texto com halo (sem caixa branca),
+#   * polígonos todos com a mesma cor suave (amarelo),
+#   * corredores em verde,
+#   * fill leve e borda discreta.
+# - Cores internas normalizadas: só os corredores mudam de cor.
+# - UI:
+#   * Slider "Transparência openAIP".
+#   * Continuam toggles: riscas CP / doghouses / áreas / openAIP.
+# - Resto NAVLOG / PDF mantém da rev anterior.
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -36,16 +32,21 @@ CLIMB_TAS, CRUISE_TAS, DESCENT_TAS = 70.0, 90.0, 90.0
 FUEL_FLOW = 20.0
 EARTH_NM  = 3440.065
 PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386"}
+
 CP_TICK_HALF = 0.38
 NBSP_THIN = "&#8239;"  # U+202F
 
-# ========= ÁREAS PRÉ-DEFINIDAS =========
-# Nota: podes editar isto à vontade fora da UI.
-# Para cada área:
-#   - para polígonos normais, usa floor/ceiling/notes/coords
-#   - para corredores (width_nm >0), coords[0] -> coords[1] define eixo
-#   - "bands" é opcional: se meteres uma lista de dicts {"top": "...","label":"..."}
-#     a label no mapa vai listar linha a linha esses níveis (tipo do pdf COMAO/TRAINING/etc)
+# Paleta para áreas
+ASPACE_COLOR     = "#FFD54A"  # áreas "normais" (LPTx, LPTRA, etc)
+CORRIDOR_COLOR   = "#9BE27A"  # corredores tipo LPT61
+FILL_OPACITY     = 0.12       # alpha leve no fill
+EDGE_OPACITY     = 0.9        # borda mais visível
+
+# ========= ÁREAS PRÉ-DEFINIDAS (catálogo interno editável) =========
+# Cada área:
+#   - "coords": lista [(lat,lon),...]
+#   - "width_nm": se None => polígono; se >0 => corredor linear entre coords[0] e coords[1] com essa largura NM
+#   - "bands": lista opcional de linhas FL/note para mostrar na label
 PRESET_AIRSPACES = {
     "LPT1": {
         "floor": "GND", "ceiling": "FL280",
@@ -226,7 +227,7 @@ PRESET_AIRSPACES = {
             (39.9, -7.75),
         ],
     },
-    # Corredores (width_nm = 5 NM ~ 9.3km)
+    # Corredores
     "LPT61": {
         "floor": "GND", "ceiling": "2000 FT AMSL",
         "notes": "Transit Corridor",
@@ -349,7 +350,7 @@ def corridor_polygon(p1, p2, width_nm):
     right2 = dest_point(lat2, lon2, tc+90, half)
     return [left1, left2, right2, right1, left1]
 
-# ========= PARSER COORDS AIP (se quiseres colar do AIP para novas áreas via código) =========
+# ========= PARSER COORDS AIP (para colar do AIP e gerar polígonos via código) =========
 coord_pattern = re.compile(
     r"(\d{2})\s+(\d{2})\s+(\d{2})([NS])\s+(\d{3})\s+(\d{2})\s+(\d{2})([EW])",
     re.IGNORECASE
@@ -396,8 +397,10 @@ ens("show_doghouses", True)
 ens("show_airspaces", True)
 ens("show_openaip", True)
 
-# token via ambiente (não mostramos campo para editar a key)
+# token vinda do ambiente; não mostramos a key
 ens("openaip_token", os.getenv("OPENAIP_KEY", "e849257999aa8ed820c3a6f7eb40f84e"))
+# alpha do overlay openAIP
+ens("openaip_alpha", 0.6)
 
 ens("map_center", (39.7, -8.1))
 ens("map_zoom", 8)
@@ -408,12 +411,12 @@ ens("alt_qadd", 3000.0)
 ens("search_rows", [])
 ens("last_q", "")
 
-ens("airspaces", [])        # áreas adicionais custom hardcoded
+ens("airspaces", [])        # áreas adicionais custom hardcoded (fora do preset)
 ens("preset_selected", [])  # nomes das áreas do catálogo
 
 # ========= FORM GLOBAL =========
 with st.form("globals"):
-    # ----- Linha 1: vento / magnética / perf climb-descent / combustível -----
+    # ----- Linha 1: vento / magnética / climb-descent / fuel -----
     c1,c2,c3,c4 = st.columns(4)
     with c1:
         st.session_state.wind_from = st.number_input(
@@ -454,7 +457,7 @@ with st.form("globals"):
             "CP por defeito (min)", 1, 10, int(st.session_state.ck_default)
         )
 
-    # ----- Linha 2: mapa / texto / toggles visuais -----
+    # ----- Linha 2: base / texto / toggles -----
     b1,b2,b3 = st.columns([2,1,1])
     with b1:
         bases = [
@@ -492,6 +495,10 @@ with st.form("globals"):
             "Overlay openAIP",
             value=st.session_state.show_openaip,
             help="Layer VFR do openAIP por cima da base."
+        )
+        st.session_state.openaip_alpha = st.slider(
+            "Transparência openAIP", 0.0, 1.0,
+            float(st.session_state.openaip_alpha), 0.05
         )
 
     st.form_submit_button("Aplicar")
@@ -832,7 +839,7 @@ st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ========= ROTA (TOC/TOD) =========
 def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
-    # TOC / TOD
+    # calcula TOC / TOD intermédios
     nodes = []
     if len(user_wps) < 2:
         return nodes
@@ -841,7 +848,7 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
         nodes.append(A)
         tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
         dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
-        # GS aprox subida/descida
+        # GS aproximada climb/descida
         _, _, gs_cl = wind_triangle(tc, CLIMB_TAS,   A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
         _, _, gs_de = wind_triangle(tc, DESCENT_TAS, A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
         if B["alt"] > A["alt"]:
@@ -912,7 +919,7 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
         tas = CLIMB_TAS if profile=="CLIMB" else (DESCENT_TAS if profile=="DESCENT" else CRUISE_TAS)
         _, th, gs = wind_triangle(tc, tas, wind_from_used, wind_kt_used)
 
-        mh = apply_var(th, mag_var, mag_is_e)
+        mh = apply_var(th, st.session_state.mag_var, st.session_state.mag_is_e)
 
         time_sec = rt10((dist / max(gs,1e-9)) * 3600.0) if gs>0 else 0
         burn = FUEL_FLOW * (time_sec/3600.0)
@@ -1009,74 +1016,44 @@ def html_marker(m, lat, lon, html):
         icon=folium.DivIcon(html=html, icon_size=(0,0))
     ).add_to(m)
 
-# --- Waypoint label (fixes) estilo screenshot:
-#     NOME em bold preto com halo branco +
-#     linha azul "EFOB L • T+00:00"
-def wp_label_html(g, scale: float):
+# --- Waypoint label rodado (sem caixa branca) ---
+def wp_label_html_rot(g, scale: float, angle_tc: float):
+    rot = angle_tc - 90.0
     fs_name = int(14 * scale)
     fs_line = int(12 * scale)
 
-    # construir as linhas "EFOB • ETO"
-    line_bits = []
+    lines = []
     for (efob, eto) in g["pairs"]:
-        has_efob = (efob is not None)
-        has_eto  = bool(eto)
-
-        efob_txt = f"{float(efob):.1f} L" if has_efob else ""
-        eto_txt  = eto if has_eto else ""
-
-        if has_efob and has_eto:
-            detail = f"{efob_txt} • {eto_txt}"
-        elif has_efob:
-            detail = efob_txt
-        else:
-            detail = eto_txt
-
-        line_bits.append(
-            f"<div style='font-size:{fs_line}px;"
-            f"font-weight:600;"
-            f"color:#0055FF;"
+        ef = f"{float(efob):.1f} L" if efob is not None else ""
+        et = eto or ""
+        detail = f"{ef} • {et}" if ef and et else (ef or et)
+        lines.append(
+            f"<div style='font-size:{fs_line}px;font-weight:700;color:#0055FF;"
             f"text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,"
-            f"-1px 1px 0 #fff,1px 1px 0 #fff;'>"
-            f"{detail}</div>"
+            f"-1px 1px 0 #fff,1px 1px 0 #fff;'>{detail}</div>"
         )
-
-    detail_html = "".join(line_bits)
 
     return f"""
     <div style="
-        transform:translate(-50%,-100%);
-        line-height:1.25;
-        text-align:center;
-        white-space:nowrap;
+        transform:translate(-50%,-100%) rotate({rot}deg);
+        transform-origin:center center;
+        line-height:1.2;text-align:center;white-space:nowrap;
         font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;">
-
-        <div style="
-            font-size:{fs_name}px;
-            font-weight:700;
-            color:#000;
+        <div style="font-size:{fs_name}px;font-weight:900;color:#000;
             text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,
                          -1px 1px 0 #fff,1px 1px 0 #fff;">
             {g['name']}
         </div>
-
-        {detail_html}
+        {''.join(lines)}
     </div>
     """
 
-# --- Doghouse rotada alinhada com a leg -----------------
+# --- Doghouse rotada, sem caixa branca ---
 def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
-    """
-    Cartão rotado alinhado com a perna:
-    - Cabeçalho grande: MH|TC   GS
-    - Depois ALT / DIST / ETE / BURN
-    - Borda preta grossa, fundo branco, sombra forte
-    - Barra de cor no topo (CLIMB / LEVEL / DESCENT)
-    """
-    rot = angle_tc - 90.0  # alinhar corpo com o track
+    rot = angle_tc - 90.0
     fs_big   = int(15 * scale)
     fs_small = int(12 * scale)
-    bar_color = PROFILE_COLORS.get(phase, "#000")
+    bar = PROFILE_COLORS.get(phase, "#000")
 
     return f"""
     <div style="
@@ -1084,98 +1061,59 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
         transform-origin:center center;
         font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-variant-numeric:tabular-nums;
-        color:#000;
-        background:#fff;
-        border:3px solid #000;
-        border-radius:10px;
-        box-shadow:0 4px 8px rgba(0,0,0,.55);
-        padding:8px 10px;
-        line-height:1.25;
-        text-align:left;
-        white-space:nowrap;">
+        color:#000; background:transparent; border:none; padding:0;
+        line-height:1.25; white-space:nowrap;">
 
-        <div style="
-            background:{bar_color};
-            height:5px;
-            border-radius:5px;
-            margin:-8px -8px 6px -8px;"></div>
+        <div style="height:4px;background:{bar};border-radius:4px;margin:0 0 4px 0;"></div>
 
-        <div style="
-            display:flex;
-            justify-content:space-between;
-            font-size:{fs_big}px;
-            font-weight:700;
-            margin-bottom:4px;">
-            <div>{info['mh_tc']}</div>
-            <div>{info['gs']}</div>
+        <div style="display:flex;justify-content:space-between;
+            font-size:{fs_big}px;font-weight:800;
+            text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;">
+            <div>{info['mh_tc']}</div><div>{info['gs']}</div>
         </div>
 
-        <div style="
-            font-size:{fs_small}px;
-            display:grid;
-            grid-template-columns:auto auto;
-            grid-column-gap:12px;
-            grid-row-gap:2px;">
+        <div style="font-size:{fs_small}px;display:grid;
+            grid-template-columns:auto auto;grid-column-gap:12px;grid-row-gap:2px;
+            text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;">
             <div>ALT {info['alt']}</div><div>ETE {info['ete']}</div>
             <div>DIST {info['dist']}</div><div>BURN {info['burn']}</div>
         </div>
-    </div>"""
+    </div>
+    """
 
-# --- Airspace label estilo "briefing sheet" -------------
+# --- Label das áreas estilo openAIP (halo, sem caixa) ---
 def airspace_label_html(asp, scale):
-    fs_name = int(14*scale)
-    fs_line = int(12*scale)
+    fs_name = int(12*scale)
+    fs_line = int(11*scale)
 
-    # construir linhas internas
-    lines_html = []
+    lines = []
     if asp.get("bands"):
-        # lista tipo:
-        # FL280 (COMAO)
-        # FL140 (TRAINING)
-        # GND
         for band in asp["bands"]:
             top_txt = band.get("top","").strip()
             lbl_txt = band.get("label","").strip()
             if lbl_txt:
-                lines_html.append(
-                    f"<div style='font-size:{fs_line}px;font-weight:400;'>{top_txt} ({lbl_txt})</div>"
-                )
+                lines.append(f"{top_txt} ({lbl_txt})")
             else:
-                lines_html.append(
-                    f"<div style='font-size:{fs_line}px;font-weight:400;'>{top_txt}</div>"
-                )
+                lines.append(top_txt)
     else:
-        # fallback corredor / genérico
-        rng = f"{asp.get('floor','')} - {asp.get('ceiling','')}".strip()
-        if rng != " - ":
-            lines_html.append(
-                f"<div style='font-size:{fs_line}px;font-weight:400;'>{rng}</div>"
-            )
-        note_txt = asp.get("notes","").strip()
-        if note_txt:
-            lines_html.append(
-                f"<div style='font-size:{fs_line}px;font-weight:400;'>{note_txt}</div>"
-            )
+        rng = f"{asp.get('floor','')} - {asp.get('ceiling','')}".strip(" -")
+        if rng:
+            lines.append(rng)
+        if asp.get("notes"):
+            lines.append(str(asp["notes"]))
 
-    body_html = "".join(lines_html)
+    body = "".join(
+        f"<div style='font-size:{fs_line}px;font-weight:600'>{x}</div>" for x in lines
+    )
 
     return f"""
     <div style="
         transform:translate(-50%,-100%);
-        background:#fff;
-        color:#000;
-        border:2px solid #000;
-        border-radius:8px;
-        box-shadow:0 4px 8px rgba(0,0,0,.55);
-        padding:6px 8px;
-        line-height:1.3;
-        text-align:center;
-        white-space:nowrap;
-        font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;">
-        <div style="font-size:{fs_name}px;font-weight:700;margin-bottom:4px;">
-            {asp['name']}
-        </div>
-        {body_html}
+        color:#000; white-space:nowrap; text-align:center;
+        font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
+        text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;">
+        <div style="font-size:{fs_name}px;font-weight:900">{asp['name']}</div>
+        {body}
     </div>
     """
 
@@ -1228,7 +1166,7 @@ def render_map(nodes, legs, base_choice):
             overlay=True,
             control=True,
             subdomains="abc",
-            opacity=0.6,
+            opacity=float(st.session_state.openaip_alpha),
             max_zoom=20,
         ).add_to(m)
 
@@ -1270,14 +1208,14 @@ def render_map(nodes, legs, base_choice):
                     opacity=1
                 ).add_to(m)
 
-    # --- DOGHOUSES (cartões rotados + linha de ligação) ---
+    # --- DOGHOUSES (rotadas, sem caixa branca) ---
     if st.session_state.show_doghouses:
         def z_clear(lat, lon, zs):
             if not zs:
                 return 9e9
             return min(gc_dist_nm(lat, lon, a, b) - r for a, b, r in zs)
 
-        # zonas ocupadas (para evitar overlap bruto)
+        # zonas ocupadas
         zones = []
         for L in legs:
             dist_leg = gc_dist_nm(L["A"]["lat"], L["A"]["lon"], L["B"]["lat"], L["B"]["lon"])
@@ -1295,11 +1233,11 @@ def render_map(nodes, legs, base_choice):
             if L["Dist"] < 0.2:
                 continue
 
-            # escala da doghouse depende um pouco do comprimento da leg e slider de texto
+            # escala ~ comprimento da leg + slider
             base = min(1.25, max(0.9, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
 
-            # escolhe lado com base na viragem seguinte
+            # lado preferido (direita/esquerda) baseado na próxima viragem
             cur_tc = L["TC"]
             nxt_tc = legs[idx+1]["TC"] if idx < len(legs)-1 else L["TC"]
             turn = angdiff(nxt_tc, cur_tc)
@@ -1320,7 +1258,7 @@ def render_map(nodes, legs, base_choice):
                 side_off_nm
             )
 
-            # se está demasiado perto de outra caixa, afasta mais
+            # afasta mais se overlap
             if z_clear(anchor_lat, anchor_lon, zones) < LABEL_MIN_CLEAR:
                 for extra in (0.6, 1.0, 1.6, 2.2):
                     cand_lat, cand_lon = dest_point(
@@ -1344,7 +1282,7 @@ def render_map(nodes, legs, base_choice):
                 "burn":  fmt_L(L['burn']),
             }
 
-            # linha preta (leader line) perna -> cartão
+            # leader line preta
             folium.PolyLine(
                 [(mid_lat, mid_lon), (anchor_lat, anchor_lon)],
                 color="#000000",
@@ -1352,7 +1290,7 @@ def render_map(nodes, legs, base_choice):
                 opacity=1.0
             ).add_to(m)
 
-            # cartão rotado
+            # cartão rotado (halo only)
             html_marker(
                 m,
                 anchor_lat,
@@ -1360,9 +1298,8 @@ def render_map(nodes, legs, base_choice):
                 doghouse_html_capsule(info, L["profile"], L["TC"], scale=s)
             )
 
-    # --- MARCADORES DE WPs + labels WP/EFOB/ETO ---
+    # --- MARCADORES DE WPs (bolinha branca com aro preto) ---
     for N in nodes:
-        # bolinha branca com aro preto no ponto exacto
         html_marker(
             m, N["lat"], N["lon"],
             "<div style='transform:translate(-50%,-50%);width:18px;height:18px;"
@@ -1370,6 +1307,7 @@ def render_map(nodes, legs, base_choice):
             "box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
         )
 
+    # --- INFO ETO / EFOB por nó ---
     info_nodes = [{"eto": None, "efob": None} for _ in nodes]
     if legs:
         info_nodes[0]["eto"]  = legs[0]["clock_start"]
@@ -1379,6 +1317,18 @@ def render_map(nodes, legs, base_choice):
             info_nodes[i]["eto"]  = Lprev["clock_end"]
             info_nodes[i]["efob"] = Lprev["efob_end"]
 
+    # orientação (TC) por nó:
+    #  - nó i usa TC da perna que SAI desse nó
+    #  - último nó usa TC da perna anterior
+    node_tc = []
+    if legs:
+        for i in range(len(nodes)):
+            if i < len(legs):
+                node_tc.append(legs[i]["TC"])
+            else:
+                node_tc.append(legs[-1]["TC"])
+
+    # agrupa nós iguais (mesmo sítio/nome base) e guarda ângulo
     grouped=[]
     seen=set()
     for idx,N in enumerate(nodes):
@@ -1390,7 +1340,8 @@ def render_map(nodes, legs, base_choice):
                 "name": base_name,
                 "lat": N["lat"],
                 "lon": N["lon"],
-                "pairs":[(info_nodes[idx]["efob"], info_nodes[idx]["eto"])]
+                "pairs":[(info_nodes[idx]["efob"], info_nodes[idx]["eto"])],
+                "angle": node_tc[idx],
             })
         else:
             for g in grouped:
@@ -1398,9 +1349,10 @@ def render_map(nodes, legs, base_choice):
                     g["pairs"].append((info_nodes[idx]["efob"], info_nodes[idx]["eto"]))
                     break
 
+    # desenhar as labels WP rodadas
     for g in grouped:
         s = float(st.session_state.text_scale)
-        html_marker(m, g["lat"], g["lon"], wp_label_html(g, s))
+        html_marker(m, g["lat"], g["lon"], wp_label_html_rot(g, s, g["angle"]))
 
     # --- ÁREAS CATÁLOGO/PERSONALIZADAS ---
     if st.session_state.show_airspaces:
@@ -1409,10 +1361,10 @@ def render_map(nodes, legs, base_choice):
         for nm in st.session_state.preset_selected:
             A = PRESET_AIRSPACES.get(nm)
             if A:
-                tmp = dict(A)  # cópia
+                tmp = dict(A)
                 tmp["name"] = nm
                 combined_asp.append(tmp)
-        # ad-hoc injectadas via código
+        # ad-hoc extra hardcoded
         combined_asp += st.session_state.airspaces
 
         for asp in combined_asp:
@@ -1429,13 +1381,17 @@ def render_map(nodes, legs, base_choice):
             if not polycoords:
                 continue
 
+            # cor unificada: áreas = amarelo, corredores = verde
+            edge_color = CORRIDOR_COLOR if asp.get("width_nm") else ASPACE_COLOR
+
             folium.Polygon(
                 locations=[(lat,lon) for (lat,lon) in polycoords],
-                color=asp["color"],
+                color=edge_color,
                 weight=2,
+                opacity=EDGE_OPACITY,
                 fill=True,
-                fill_color=asp["color"],
-                fill_opacity=asp["opacity"],
+                fill_color=edge_color,
+                fill_opacity=FILL_OPACITY,
                 tooltip=f"{asp['name']} {asp.get('floor','')}→{asp.get('ceiling','')} {asp.get('notes','')}"
             ).add_to(m)
 
