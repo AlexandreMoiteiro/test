@@ -1080,7 +1080,6 @@ def doghouse_html_capsule(info, phase, angle_tc, scale=1.0):
         </div>
     </div>
     """
-
 # --- Label das áreas estilo openAIP (halo, sem caixa) ---
 def airspace_label_html(asp, scale):
     fs_name = int(12*scale)
