@@ -1740,10 +1740,14 @@ def _build_payload_cont(
     alt_info=None,
     alt_choice=None
 ):
+    # pega do leg 23 em diante (start_idx normalmente = 22)
     legs_chunk = all_legs[start_idx:start_idx+11]
     if not legs_chunk:
         return None
+
     d = {"OBSERVATIONS":"SEVENAIR OPS: 131.675"}
+
+    # acumulação só para preencher as linhas individuais desta página
     acc_d = 0.0
     acc_t = 0
     for offset, L in enumerate(legs_chunk, start=12):
@@ -1751,7 +1755,7 @@ def _build_payload_cont(
         acc_t += L["time_sec"]
         _fill_leg_line(d, offset, L, use_point="A", acc_d=acc_d, acc_t=acc_t)
 
-    # chegada nesta folha se for a última e couber
+    # se esta página inclui o destino final, ainda desenhamos a linha de chegada
     is_last_chunk = (start_idx + len(legs_chunk) == len(all_legs))
     next_idx = 12 + len(legs_chunk)
     if is_last_chunk and next_idx <= 22:
@@ -1765,11 +1769,20 @@ def _build_payload_cont(
         d[f"Leg{next_idx:02d}_ETO"] = legs_chunk[-1]["clock_end"]
         d[f"Leg{next_idx:02d}_Estimated_FOB"] = f"{legs_chunk[-1]['efob_end']:.1f}"
 
-    d["Leg23_Leg_Distance"] = f"{acc_d:.1f}"
-    d["Leg23_Leg_ETE"]      = _pdf_mmss(acc_t)
-    d["Leg23_Planned_Burnoff"] = f"{r10f(sum(L['burn'] for L in legs_chunk)):.1f}"
-    d["Leg23_Estimated_FOB"]   = f"{legs_chunk[-1]['efob_end']:.1f}"
+    # =========================
+    # >>> TOTAIS GLOBAIS <<<
+    # =========================
+    total_dist_all_nm   = sum(L["Dist"] for L in all_legs)
+    total_time_all_sec  = sum(L["time_sec"] for L in all_legs)
+    total_burn_all_L    = sum(L["burn"] for L in all_legs)
+    final_efob_all_L    = all_legs[-1]["efob_end"]
 
+    d["Leg23_Leg_Distance"] = f"{total_dist_all_nm:.1f}"
+    d["Leg23_Leg_ETE"]      = _pdf_mmss(total_time_all_sec)
+    d["Leg23_Planned_Burnoff"] = f"{r10f(total_burn_all_L):.1f}"
+    d["Leg23_Estimated_FOB"]   = f"{final_efob_all_L:.1f}"
+
+    # alternante (mantemos a mesma lógica que já tinhas)
     if alt_info and alt_choice:
         total_sec_before_chunk = sum(
             L["time_sec"] for L in all_legs[:start_idx+len(legs_chunk)]
@@ -1790,7 +1803,9 @@ def _build_payload_cont(
             "Alternate_Planned_Burnoff":f"{r10f(alt_info['burn']):.1f}",
             "Alternate_Estimated_FOB":f"{r10f(all_legs[start_idx+len(legs_chunk)-1]['efob_end'] - alt_info['burn']):.1f}",
         })
+
     return d
+
 
 # ========= BOTÕES PDF =========
 cX, cY = st.columns([1,1])
