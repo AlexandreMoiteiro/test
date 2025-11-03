@@ -1772,7 +1772,7 @@ def _fill_pdf(template_path: str, out_path: str, data: dict):
                     # se for um dos campos de navaid, encolhe a letra
                     if key.startswith(SMALL_FIELDS_PREFIXES):
                         # /Helv 6 Tf 0 g  -> fonte Helvetica 6pt, cor preta
-                        a.update(PdfDict(DA="/Helv 4 Tf 0 g"))
+                        a.update(PdfDict(DA="/Helv 5 Tf 0 g"))
 
     PdfWriter(out_path, trailer=pdf).write()
     return out_path
