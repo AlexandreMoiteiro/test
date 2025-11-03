@@ -685,10 +685,10 @@ def nearest_vor(lat: float, lon: float):
 def fmt_ident_with_freq(v):
     # "114.30 CAS"
     return f"{v['freq_mhz']:.2f} {v['ident']}"
-
+    
 def fmt_radial_distance(v):
-    # "R123/D15.4"
-    return f"R{v['radial_deg']:03d}/D{v['dist_nm']:.1f}"
+    dist_int = int(round(v["dist_nm"]))
+    return f"R{v['radial_deg']:03d}/D{dist_int}"
 
 def make_unique_name(name: str) -> str:
     names = [str(w["name"]) for w in st.session_state.wps]
