@@ -1776,37 +1776,42 @@ def _compose_clock_after(total_sec, extra_sec):
         return (base + dt.timedelta(seconds=t)).strftime("%H:%M")
     return f"T+{mmss(t)}"
 
-def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:int, prefix="Leg"):
-    P = L["A"] if use_point=="A" else L["B"]
-    d[f"{prefix}{idx:02d}_Waypoint"]            = str(P["name"])
-    d[f"{prefix}{idx:02d}_Altitude_FL"]         = str(int(round(P["alt"])))
-    d[f"{prefix}{idx:02d}_True_Course"]         = f"{int(round(L['TC'])):03d}"
-    d[f"{prefix}{idx:02d}_True_Heading"]        = f"{int(round(L['TH'])):03d}"
-    d[f"{prefix}{idx:02d}_Magnetic_Heading"]    = f"{int(round(L['MH'])):03d}"
-    d[f"{prefix}{idx:02d}_True_Airspeed"]       = str(int(round(L["TAS"])))
-    d[f"{prefix}{idx:02d}_Ground_Speed"]        = str(int(round(L["GS"])))
-    d[f"{prefix}{idx:02d}_Leg_Distance"]        = f"{L['Dist']:.1f}"
-    d[f"{prefix}{idx:02d}_Cumulative_Distance"] = f"{acc_d:.1f}"
-    d[f"{prefix}{idx:02d}_Leg_ETE"]             = _pdf_mmss(L["time_sec"])
-    d[f"{prefix}{idx:02d}_Cumulative_ETE"]      = _pdf_mmss(acc_t)
-    d[f"{prefix}{idx:02d}_ETO"]                 = L["clock_end"]
-    d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
-    d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
+def _fill_pdf(template_path: str, out_path: str, data: dict):
+    pdf = PdfReader(template_path)
 
-    # --- NOVO: VOR mais próximo -> campos do teu PDF ---
-    try:
-        vor = nearest_vor(float(P["lat"]), float(P["lon"]))
-        if vor:
-            # ex: "114.30 CAS"
-            d[f"{prefix}{idx:02d}_Navaid_Identifier"] = fmt_ident_with_freq(vor)
-            # ex: "R123/D15.4"
-            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = fmt_radial_distance(vor)
-        else:
-            d[f"{prefix}{idx:02d}_Navaid_Identifier"] = ""
-            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = ""
-    except Exception:
-        d[f"{prefix}{idx:02d}_Navaid_Identifier"] = ""
-        d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = ""
+    # isto garante que o Acrobat/preview volta a desenhar os campos
+    if pdf.Root.AcroForm:
+        pdf.Root.AcroForm.update(PdfDict(NeedAppearances=True))
+
+    # campos que queremos com letra pequena
+    SMALL_FIELDS_PREFIXES = (
+        "Leg01_Navaid_", "Leg02_Navaid_", "Leg03_Navaid_",
+        "Leg04_Navaid_", "Leg05_Navaid_", "Leg06_Navaid_",
+        "Leg07_Navaid_", "Leg08_Navaid_", "Leg09_Navaid_",
+        "Leg10_Navaid_", "Leg11_Navaid_", "Leg12_Navaid_",
+        "Leg13_Navaid_", "Leg14_Navaid_", "Leg15_Navaid_",
+        "Leg16_Navaid_", "Leg17_Navaid_", "Leg18_Navaid_",
+        "Leg19_Navaid_", "Leg20_Navaid_", "Leg21_Navaid_",
+        "Leg22_Navaid_", "Leg23_Navaid_",
+    )
+
+    for page in pdf.pages:
+        if not getattr(page, "Annots", None):
+            continue
+        for a in page.Annots:
+            if a.Subtype == PdfName('Widget') and a.T:
+                key = str(a.T)[1:-1]  # tira parênteses do nome
+                if key in data:
+                    # escreve o valor
+                    a.update(PdfDict(V=str(data[key])))
+
+                    # se for um dos campos de navaid, encolhe a letra
+                    if key.startswith(SMALL_FIELDS_PREFIXES):
+                        # /Helv 6 Tf 0 g  -> fonte Helvetica 6pt, cor preta
+                        a.update(PdfDict(DA="/Helv 6 Tf 0 g"))
+
+    PdfWriter(out_path, trailer=pdf).write()
+    return out_path
 
 def _build_payloads_main(
     legs, *,
