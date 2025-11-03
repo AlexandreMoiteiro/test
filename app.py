@@ -1,4 +1,5 @@
-# app_rev36.py — NAVLOG — rev36
+
+# app_rev36.py — NAVLOG — rev36 + VOR nearest
 # ---------------------------------------------------------------
 # - Overlay openAIP corrigido + slider de transparência.
 # - Labels dos WPs e doghouses agora rodadas pela TC da leg
@@ -22,6 +23,9 @@
 #     e não apenas da página.
 # - Hora navegação = off-block +15 min (primeiro fix).
 # - EFOB inicial = start_efob -5 L.
+# - NOVO: VOR mais próximo por fix → campos Ident/Freq no PDF:
+#     * Ident: "114.30 CAS"
+#     * Freq:  "R123/D15.4"
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -520,6 +524,7 @@ st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 # ========= CSVs =========
 AD_CSV  = "AD-HEL-ULM.csv"
 LOC_CSV = "Localidades-Nova-versao-230223.csv"
+VOR_CSV = "NAVAIDS_VOR.csv"   # NOVO
 
 def dms_to_dd(token: str, is_lon=False):
     token = str(token).strip()
@@ -591,6 +596,48 @@ def parse_loc_df(df: pd.DataFrame) -> pd.DataFrame:
             })
     return pd.DataFrame(rows).dropna(subset=["lat","lon"])
 
+# --- NOVO: carregar VORs (Portugal continental) ---
+def _load_vor_db(path: str) -> pd.DataFrame:
+    # tenta ler do CSV; se não houver, devolve fallback interno
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            # normalizar nomes
+            cols = {c.lower(): c for c in df.columns}
+            def col(name): return cols.get(name, name)
+            if not {"ident","freq_mhz","lat","lon"}.issubset({c.lower() for c in df.columns}):
+                df = df.rename(columns={
+                    col("ident"): "ident",
+                    col("name"): "name" if "name" in cols else None,
+                    col("freq_mhz"): "freq_mhz",
+                    col("lat"): "lat",
+                    col("lon"): "lon",
+                })
+            df = df[["ident","name","freq_mhz","lat","lon"]].copy()
+            df["ident"] = df["ident"].astype(str).str.upper().str.strip()
+            df["freq_mhz"] = pd.to_numeric(df["freq_mhz"], errors="coerce")
+            df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+            df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+            df = df.dropna(subset=["ident","freq_mhz","lat","lon"]).reset_index(drop=True)
+            return df
+        except Exception:
+            pass
+
+    # fallback interno com os principais VOR/DME de Portugal continental
+    fallback = [
+        # ident, name, freq_mhz, lat, lon
+        ("CAS", "Cascais DVOR/DME", 114.30, 38.7483, -9.3619),
+        ("ESP", "Espichel DVOR/DME", 112.50, 38.4242, -9.1856),
+        ("VFA", "Faro DVOR/DME",     112.80, 37.0136, -7.9750),
+        ("FTM", "Fátima DVOR/DME",   113.50, 39.6656, -8.4928),
+        ("LIS", "Lisboa DVOR/DME",   114.80, 38.8878, -9.1628),
+        ("NSA", "Nisa DVOR/DME",     115.50, 39.5647, -7.9147),
+        ("PRT", "Porto DVOR/DME",    114.10, 41.2731, -8.6878),
+        ("SGR", "Sagres VOR/DME",    113.90, 37.0839, -8.94639),
+        ("SRA", "Sintra VORTAC",     112.10, 38.829201, -9.34),
+    ]
+    return pd.DataFrame(fallback, columns=["ident","name","freq_mhz","lat","lon"])
+
 try:
     ad_raw  = pd.read_csv(AD_CSV)
     ad_df   = parse_ad_df(ad_raw)
@@ -604,6 +651,44 @@ except Exception:
 if st.session_state.db_points is None:
     st.session_state.db_points = pd.concat([ad_df, loc_df]).dropna(subset=["lat","lon"]).reset_index(drop=True)
 db = st.session_state.db_points
+
+# carregar VORs para a sessão
+if "vor_db" not in st.session_state:
+    st.session_state.vor_db = _load_vor_db(VOR_CSV)
+
+# --- helpers VOR ---
+def nearest_vor(lat: float, lon: float):
+    """Devolve dict {ident,freq_mhz,lat,lon,dist_nm,radial_deg} do VOR mais próximo a (lat,lon)."""
+    df = st.session_state.vor_db
+    if df is None or df.empty:
+        return None
+    best = None
+    best_d = 1e9
+    for _, r in df.iterrows():
+        d = gc_dist_nm(lat, lon, float(r["lat"]), float(r["lon"]))
+        if d < best_d:
+            best_d = d
+            best = r
+    if best is None:
+        return None
+    radial = gc_course_tc(float(best["lat"]), float(best["lon"]), lat, lon)
+    return {
+        "ident": str(best["ident"]),
+        "name":  str(best.get("name") or ""),
+        "freq_mhz": float(best["freq_mhz"]),
+        "lat": float(best["lat"]),
+        "lon": float(best["lon"]),
+        "dist_nm": best_d,
+        "radial_deg": int(round(radial)) % 360,
+    }
+
+def fmt_ident_with_freq(v):
+    # "114.30 CAS"
+    return f"{v['freq_mhz']:.2f} {v['ident']}"
+
+def fmt_radial_distance(v):
+    # "R123/D15.4"
+    return f"R{v['radial_deg']:03d}/D{v['dist_nm']:.1f}"
 
 def make_unique_name(name: str) -> str:
     names = [str(w["name"]) for w in st.session_state.wps]
@@ -756,7 +841,7 @@ with tab_map:
             )
             st.success("Adicionado.")
 
-# ========= ESPAÇO AÉREO =========
+# ========= ESPAÇO AÉRERO =========
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 with st.expander("🛡 Espaço aéreo / restrições"):
     preset_names_sorted = sorted(PRESET_AIRSPACES.keys())
@@ -1024,14 +1109,12 @@ if st.session_state.legs:
 # ========= FILTRO DE PERNAS (IDA / VINDA / PARCIAL) =========
 if st.session_state.legs:
     with st.expander("🎯 Filtro de pernas no mapa (ex: só ida / só volta)", expanded=False):
-        # toggle principal
         st.session_state.use_leg_filter = st.toggle(
             "Ativar filtro de pernas no mapa",
             value=st.session_state.use_leg_filter,
             help="Se ligado, o mapa só mostra as pernas escolhidas abaixo."
         )
 
-        # opções tipo "01  LPSO→VARGE"
         opt_labels = []
         for idx, L in enumerate(st.session_state.legs):
             leg_label = f"{idx+1:02d}  {L['A']['name']}→{L['B']['name']}"
@@ -1212,10 +1295,6 @@ def airspace_label_html(asp, scale):
 
 # ========= PERNAS FILTRADAS PARA O MAPA =========
 def get_filtered_nodes_legs():
-    """
-    Devolve (nodes_to_show, legs_to_show) já filtrados se o filtro estiver ativo.
-    Se o filtro estiver off, devolve tudo.
-    """
     all_nodes = st.session_state.route_nodes
     all_legs  = st.session_state.legs
 
@@ -1228,7 +1307,6 @@ def get_filtered_nodes_legs():
     ]
     sel_legs = [all_legs[i] for i in sel_idxs]
 
-    # construir nós únicos (A e B de cada leg escolhida)
     sel_nodes_seq = []
     seen = set()
     for L in sel_legs:
@@ -1355,24 +1433,20 @@ def render_map(nodes, legs, base_choice):
             if L["Dist"] < 0.2:
                 continue
 
-            # escala ~ comprimento da leg + slider
             base = min(1.25, max(0.9, L["Dist"]/7.0))
             s = base * float(st.session_state.text_scale)
 
-            # lado preferido (direita/esquerda) baseado na viragem seguinte
             cur_tc = L["TC"]
             nxt_tc = legs[idx+1]["TC"] if idx < len(legs)-1 else L["TC"]
             turn = angdiff(nxt_tc, cur_tc)
             prefer = +1 if turn > 12 else (-1 if turn < -12 else (prev_side or +1))
 
-            # ponto médio da perna
             mid_lat, mid_lon = point_along_gc(
                 L["A"]["lat"], L["A"]["lon"],
                 L["B"]["lat"], L["B"]["lon"],
                 0.50 * L["Dist"]
             )
 
-            # âncora deslocada lateralmente ~1.2 NM
             side_off_nm = 1.2
             anchor_lat, anchor_lon = dest_point(
                 mid_lat, mid_lon,
@@ -1380,7 +1454,6 @@ def render_map(nodes, legs, base_choice):
                 side_off_nm
             )
 
-            # afasta se colado com outra coisa
             if z_clear(anchor_lat, anchor_lon, zones) < LABEL_MIN_CLEAR:
                 for extra in (0.6, 1.0, 1.6, 2.2):
                     cand_lat, cand_lon = dest_point(
@@ -1401,7 +1474,6 @@ def render_map(nodes, legs, base_choice):
                 "ete":   mmss(L['time_sec']),
             }
 
-            # leader line preta
             folium.PolyLine(
                 [(mid_lat, mid_lon), (anchor_lat, anchor_lon)],
                 color="#000000",
@@ -1416,7 +1488,7 @@ def render_map(nodes, legs, base_choice):
                 doghouse_html_capsule(info, L["profile"], L["TC"], scale=s)
             )
 
-    # NÓS (bolinha branca com aro preto)
+    # NÓS
     for N in nodes:
         html_marker(
             m, N["lat"], N["lon"],
@@ -1436,7 +1508,6 @@ def render_map(nodes, legs, base_choice):
                 info_nodes[i]["eto"]  = Lprev["clock_end"]
                 info_nodes[i]["efob"] = Lprev["efob_end"]
 
-    # ângulo associado a cada nó (TC da perna que sai / senão última)
     node_tc = []
     if legs:
         for i in range(len(nodes)):
@@ -1447,7 +1518,6 @@ def render_map(nodes, legs, base_choice):
     else:
         node_tc = [0.0]*len(nodes)
 
-    # agrupar nós iguais
     grouped=[]
     seen=set()
     for idx,N in enumerate(nodes):
@@ -1468,26 +1538,21 @@ def render_map(nodes, legs, base_choice):
                     g["pairs"].append((info_nodes[idx]["efob"], info_nodes[idx]["eto"]))
                     break
 
-    # labels WP rodadas
     for g in grouped:
         s = float(st.session_state.text_scale)
         html_marker(m, g["lat"], g["lon"], wp_label_html_rot(g, s, g["angle"]))
 
-    # ÁREAS
     if st.session_state.show_airspaces:
         combined_asp = []
-        # presets selecionados
         for nm in st.session_state.preset_selected:
             A = PRESET_AIRSPACES.get(nm)
             if A:
                 tmp = dict(A)
                 tmp["name"] = nm
                 combined_asp.append(tmp)
-        # ad-hoc extra
         combined_asp += st.session_state.airspaces
 
         for asp in combined_asp:
-            # corredor vs polígono
             if asp.get("width_nm"):
                 coords = asp.get("coords", [])
                 if len(coords) >= 2:
@@ -1664,16 +1729,11 @@ if use_alt and alt_choice and st.session_state.wps:
 
 # ========= PDF helpers =========
 def _pdf_mmss(sec:int):
-    # arredonda para o segundo mais próximo
     total_sec = int(round(sec))
     minutes, seconds = divmod(total_sec, 60)
-
-    # >=60 min -> HHhMM
     if minutes >= 60:
         hours, mins = divmod(minutes, 60)
         return f"{hours:02d}h{mins:02d}"
-
-    # <60 min -> MM:SS
     return f"{minutes:02d}:{seconds:02d}"
 
 def _set_need_appearances(pdf):
@@ -1732,6 +1792,19 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
     d[f"{prefix}{idx:02d}_ETO"]                 = L["clock_end"]
     d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
     d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
+
+    # --- NOVO: Ident e Frequency com VOR mais próximo do ponto ---
+    try:
+        vor = nearest_vor(float(P["lat"]), float(P["lon"]))
+        if vor:
+            d[f"{prefix}{idx:02d}_Ident"]     = fmt_ident_with_freq(vor)     # ex: "114.30 CAS"
+            d[f"{prefix}{idx:02d}_Frequency"] = fmt_radial_distance(vor)     # ex: "R123/D15.4"
+        else:
+            d[f"{prefix}{idx:02d}_Ident"]     = ""
+            d[f"{prefix}{idx:02d}_Frequency"] = ""
+    except Exception:
+        d[f"{prefix}{idx:02d}_Ident"]     = ""
+        d[f"{prefix}{idx:02d}_Frequency"] = ""
 
 def _build_payloads_main(
     legs, *,
@@ -1795,7 +1868,6 @@ def _build_payloads_main(
         d[f"Leg{j:02d}_ETO"] = legs_main[-1]["clock_end"]
         d[f"Leg{j:02d}_Estimated_FOB"] = f"{legs_main[-1]['efob_end']:.1f}"
 
-    # totais (linha 23)
     d["Leg23_Leg_Distance"] = f"{total_dist:.1f}"
     d["Leg23_Leg_ETE"]      = _pdf_mmss(total_sec)
     d["Leg23_Planned_Burnoff"] = f"{total_burn:.1f}"
@@ -1827,14 +1899,12 @@ def _build_payload_cont(
     alt_info=None,
     alt_choice=None
 ):
-    # pega do leg 23 em diante (start_idx tipicamente =22)
     legs_chunk = all_legs[start_idx:start_idx+11]
     if not legs_chunk:
         return None
 
     d = {"OBSERVATIONS":"SEVENAIR OPS: 131.675"}
 
-    # acumulação interna (para as colunas cumulativas desta folha)
     acc_d = 0.0
     acc_t = 0
     for offset, L in enumerate(legs_chunk, start=12):
@@ -1842,7 +1912,6 @@ def _build_payload_cont(
         acc_t += L["time_sec"]
         _fill_leg_line(d, offset, L, use_point="A", acc_d=acc_d, acc_t=acc_t)
 
-    # chegada final se couber
     is_last_chunk = (start_idx + len(legs_chunk) == len(all_legs))
     next_idx = 12 + len(legs_chunk)
     if is_last_chunk and next_idx <= 22:
@@ -1856,7 +1925,6 @@ def _build_payload_cont(
         d[f"Leg{next_idx:02d}_ETO"] = legs_chunk[-1]["clock_end"]
         d[f"Leg{next_idx:02d}_Estimated_FOB"] = f"{legs_chunk[-1]['efob_end']:.1f}"
 
-    # ------------- TOTAIS GLOBAIS DO VOO INTEIRO -------------
     total_dist_all_nm   = sum(L["Dist"] for L in all_legs)
     total_time_all_sec  = sum(L["time_sec"] for L in all_legs)
     total_burn_all_L    = sum(L["burn"] for L in all_legs)
