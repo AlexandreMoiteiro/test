@@ -1793,18 +1793,20 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
     d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
     d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
 
-    # --- NOVO: Ident e Frequency com VOR mais próximo do ponto ---
+    # --- NOVO: VOR mais próximo -> campos do teu PDF ---
     try:
         vor = nearest_vor(float(P["lat"]), float(P["lon"]))
         if vor:
-            d[f"{prefix}{idx:02d}_Ident"]     = fmt_ident_with_freq(vor)     # ex: "114.30 CAS"
-            d[f"{prefix}{idx:02d}_Frequency"] = fmt_radial_distance(vor)     # ex: "R123/D15.4"
+            # ex: "114.30 CAS"
+            d[f"{prefix}{idx:02d}_Navaid_Identifier"] = fmt_ident_with_freq(vor)
+            # ex: "R123/D15.4"
+            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = fmt_radial_distance(vor)
         else:
-            d[f"{prefix}{idx:02d}_Ident"]     = ""
-            d[f"{prefix}{idx:02d}_Frequency"] = ""
+            d[f"{prefix}{idx:02d}_Navaid_Identifier"] = ""
+            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = ""
     except Exception:
-        d[f"{prefix}{idx:02d}_Ident"]     = ""
-        d[f"{prefix}{idx:02d}_Frequency"] = ""
+        d[f"{prefix}{idx:02d}_Navaid_Identifier"] = ""
+        d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = ""
 
 def _build_payloads_main(
     legs, *,
