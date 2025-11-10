@@ -566,6 +566,7 @@ def _load_vor_db(path: str) -> pd.DataFrame:
         ("PRT", "Porto DVOR/DME",    114.10, 41.2731, -8.6878),
         ("SGR", "Sagres VOR/DME",    113.90, 37.0839, -8.94639),
         ("SRA", "Sintra VORTAC",     112.10, 38.829201, -9.34),
+        ("VBZ", "Badajoz VOR/DME",   116.8,  38.889900, -6.815750)
     ]
     return pd.DataFrame(fallback, columns=["ident","name","freq_mhz","lat","lon"])
 
