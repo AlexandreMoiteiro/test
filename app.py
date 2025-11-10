@@ -10,6 +10,7 @@
 # - PDF passa a preencher pelas CHEGADAS (ponto B da perna)
 # - Perna de STOP / touch-and-go: no WP metes "stop (min)" e entra no NAVLOG
 # - Mantido overlay openAIP, doghouses, filtro de pernas, PDF com 2.ª página
+# - CORREÇÃO: se o ponto B estiver em AUTO mas o ponto A estiver FIXED, o PDF passa a usar o FIXED do A
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -1740,11 +1741,23 @@ def _choose_vor_for_point(P):
     # senão AUTO
     return nearest_vor(float(P["lat"]), float(P["lon"]))
 
+# ========= CORREÇÃO AQUI =========
 def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:int, prefix="Leg"):
-    # use_point = "B" (chegada)
-    P = L["B"] if use_point=="B" else L["A"]
-    d[f"{prefix}{idx:02d}_Waypoint"]            = str(P["name"])
-    d[f"{prefix}{idx:02d}_Altitude_FL"]         = str(int(round(P["alt"])))
+    """
+    Preenche uma linha do PDF.
+    Continua a usar o ponto de chegada (use_point='B'), MAS:
+    - se o ponto de chegada estiver em AUTO
+    - e o ponto de partida estiver em FIXED
+    então usamos o FIXED do ponto de partida.
+    Assim, pôr FIXED no WP 'de saída' também tem efeito.
+    """
+    # ponto principal (como já tinhas: pelas chegadas)
+    P_main = L["B"] if use_point=="B" else L["A"]
+    P_other = L["A"] if use_point=="B" else L["B"]
+
+    d[f"{prefix}{idx:02d}_Waypoint"]            = str(P_main["name"])
+    d[f"{prefix}{idx:02d}_Altitude_FL"]         = str(int(round(P_main["alt"])))
+
     if L["profile"] != "STOP":
         d[f"{prefix}{idx:02d}_True_Course"]         = f"{int(round(L['TC'])):03d}"
         d[f"{prefix}{idx:02d}_True_Heading"]        = f"{int(round(L['TH'])):03d}"
@@ -1759,6 +1772,7 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
         d[f"{prefix}{idx:02d}_True_Airspeed"]       = ""
         d[f"{prefix}{idx:02d}_Ground_Speed"]        = ""
         d[f"{prefix}{idx:02d}_Leg_Distance"]        = "0.0"
+
     d[f"{prefix}{idx:02d}_Cumulative_Distance"] = f"{acc_d:.1f}"
     d[f"{prefix}{idx:02d}_Leg_ETE"]             = _pdf_mmss(L["time_sec"])
     d[f"{prefix}{idx:02d}_Cumulative_ETE"]      = _pdf_mmss(acc_t)
@@ -1766,12 +1780,23 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
     d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
     d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
 
-    # VOR campo
+    # --- escolha de VOR com fallback ---
     try:
-        vor = _choose_vor_for_point(P)
+        # primeiro tenta o ponto principal
+        use_point_for_vor = P_main
+        # se o principal NÃO está FIXED, mas o outro está, usar o outro
+        if not (P_main.get("vor_pref") == "FIXED" and P_main.get("vor_ident")):
+            if P_other.get("vor_pref") == "FIXED" and P_other.get("vor_ident"):
+                use_point_for_vor = P_other
+
+        vor = _choose_vor_for_point(use_point_for_vor)
         if vor:
             d[f"{prefix}{idx:02d}_Navaid_Identifier"] = fmt_ident_with_freq(vor)
-            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = fmt_radial_distance_from(vor, P["lat"], P["lon"])
+            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = fmt_radial_distance_from(
+                vor,
+                use_point_for_vor["lat"],
+                use_point_for_vor["lon"]
+            )
         else:
             d[f"{prefix}{idx:02d}_Navaid_Identifier"] = ""
             d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = ""
@@ -1945,5 +1970,6 @@ if make_pdfs:
                     file_name="NAVLOG_FILLED_1.pdf",
                     use_container_width=True
                 )
+
 
 
