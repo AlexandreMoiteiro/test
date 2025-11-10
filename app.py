@@ -1,4 +1,4 @@
-# app_navlog_rev38.py
+# app_navlog_rev38_fix_vor.py
 # ---------------------------------------------------------------
 # - Remoção de WPs estável (não apaga vários de uma vez)
 # - Fuels arredondados a 0.5 L
@@ -10,7 +10,8 @@
 # - PDF passa a preencher pelas CHEGADAS (ponto B da perna)
 # - Perna de STOP / touch-and-go: no WP metes "stop (min)" e entra no NAVLOG
 # - Mantido overlay openAIP, doghouses, filtro de pernas, PDF com 2.ª página
-# - CORREÇÃO: se o ponto B estiver em AUTO mas o ponto A estiver FIXED, o PDF passa a usar o FIXED do A
+# - [FIX] TOC/TOD passam a herdar o VOR do WP de chegada → FIXED passa mesmo para o PDF
+# - [FIX] Ao gerar PDF volta a gerar a rota com o estado atual dos WPs
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -921,6 +922,10 @@ st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ========= ROTA (TOC/TOD) =========
 def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
+    """
+    IMPORTANTE: TOC/TOD passam a herdar o VOR do ponto de CHEGADA (B),
+    para o PDF (que usa o ponto B) respeitar o FIXED que escolheste.
+    """
     nodes = []
     if len(user_wps) < 2:
         return nodes
@@ -946,6 +951,7 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
             d_need = gs_cl * (t_need/60.0)
             if d_need < dist - 0.05:
                 lat_toc, lon_toc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need)
+                # herda VOR do B (destino)
                 nodes.append({
                     "name": f"TOC L{i+1}",
                     "lat": lat_toc, "lon": lon_toc,
@@ -953,8 +959,8 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
                     "wind_from": A.get("wind_from", wind_from),
                     "wind_kt":   A.get("wind_kt", wind_kt),
                     "stop_min":  0.0,
-                    "vor_pref":  "AUTO",
-                    "vor_ident": "",
+                    "vor_pref":  B.get("vor_pref", A.get("vor_pref","AUTO")),
+                    "vor_ident": B.get("vor_ident", A.get("vor_ident","")),
                 })
         # TOD
         elif B["alt"] < A["alt"]:
@@ -971,8 +977,9 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
                     "wind_from": A.get("wind_from", wind_from),
                     "wind_kt":   A.get("wind_kt", wind_kt),
                     "stop_min":  0.0,
-                    "vor_pref":  "AUTO",
-                    "vor_ident": "",
+                    # também herda do B (ponto que vais efetivamente chegar)
+                    "vor_pref":  B.get("vor_pref", A.get("vor_pref","AUTO")),
+                    "vor_ident": B.get("vor_ident", A.get("vor_ident","")),
                 })
     # último WP
     last = user_wps[-1]
@@ -1106,6 +1113,7 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
                 (base_time + dt.timedelta(seconds=t_cursor+stop_sec)).strftime('%H:%M')
                 if base_time else f"T+{mmss(t_cursor+stop_sec)}"
             )
+            # STOP também herda o VOR do próprio ponto B
             legs.append({
                 "i":len(legs)+1,
                 "A":B,
@@ -1734,6 +1742,7 @@ def _compose_clock_after(total_sec, extra_sec):
     return f"T+{mmss(t)}"
 
 def _choose_vor_for_point(P):
+    # se o ponto disser FIXED e tiver ident → usa
     if P.get("vor_pref") == "FIXED" and P.get("vor_ident"):
         v = get_vor_by_ident(P["vor_ident"])
         if v:
@@ -1741,23 +1750,11 @@ def _choose_vor_for_point(P):
     # senão AUTO
     return nearest_vor(float(P["lat"]), float(P["lon"]))
 
-# ========= CORREÇÃO AQUI =========
 def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:int, prefix="Leg"):
-    """
-    Preenche uma linha do PDF.
-    Continua a usar o ponto de chegada (use_point='B'), MAS:
-    - se o ponto de chegada estiver em AUTO
-    - e o ponto de partida estiver em FIXED
-    então usamos o FIXED do ponto de partida.
-    Assim, pôr FIXED no WP 'de saída' também tem efeito.
-    """
-    # ponto principal (como já tinhas: pelas chegadas)
-    P_main = L["B"] if use_point=="B" else L["A"]
-    P_other = L["A"] if use_point=="B" else L["B"]
-
-    d[f"{prefix}{idx:02d}_Waypoint"]            = str(P_main["name"])
-    d[f"{prefix}{idx:02d}_Altitude_FL"]         = str(int(round(P_main["alt"])))
-
+    # use_point = "B" (chegada)
+    P = L["B"] if use_point=="B" else L["A"]
+    d[f"{prefix}{idx:02d}_Waypoint"]            = str(P["name"])
+    d[f"{prefix}{idx:02d}_Altitude_FL"]         = str(int(round(P["alt"])))
     if L["profile"] != "STOP":
         d[f"{prefix}{idx:02d}_True_Course"]         = f"{int(round(L['TC'])):03d}"
         d[f"{prefix}{idx:02d}_True_Heading"]        = f"{int(round(L['TH'])):03d}"
@@ -1772,7 +1769,6 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
         d[f"{prefix}{idx:02d}_True_Airspeed"]       = ""
         d[f"{prefix}{idx:02d}_Ground_Speed"]        = ""
         d[f"{prefix}{idx:02d}_Leg_Distance"]        = "0.0"
-
     d[f"{prefix}{idx:02d}_Cumulative_Distance"] = f"{acc_d:.1f}"
     d[f"{prefix}{idx:02d}_Leg_ETE"]             = _pdf_mmss(L["time_sec"])
     d[f"{prefix}{idx:02d}_Cumulative_ETE"]      = _pdf_mmss(acc_t)
@@ -1780,23 +1776,12 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
     d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
     d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
 
-    # --- escolha de VOR com fallback ---
+    # VOR campo
     try:
-        # primeiro tenta o ponto principal
-        use_point_for_vor = P_main
-        # se o principal NÃO está FIXED, mas o outro está, usar o outro
-        if not (P_main.get("vor_pref") == "FIXED" and P_main.get("vor_ident")):
-            if P_other.get("vor_pref") == "FIXED" and P_other.get("vor_ident"):
-                use_point_for_vor = P_other
-
-        vor = _choose_vor_for_point(use_point_for_vor)
+        vor = _choose_vor_for_point(P)
         if vor:
             d[f"{prefix}{idx:02d}_Navaid_Identifier"] = fmt_ident_with_freq(vor)
-            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = fmt_radial_distance_from(
-                vor,
-                use_point_for_vor["lat"],
-                use_point_for_vor["lon"]
-            )
+            d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = fmt_radial_distance_from(vor, P["lat"], P["lon"])
         else:
             d[f"{prefix}{idx:02d}_Navaid_Identifier"] = ""
             d[f"{prefix}{idx:02d}_Navaid_Frequency"]  = ""
@@ -1928,6 +1913,21 @@ with cY:
     st.caption("Principal até 22 legs; continuação se exceder.")
 
 if make_pdfs:
+    # <<< NOVO: garantir que a rota está atualizada com o estado dos WPs (incluindo VOR FIXED) >>>
+    st.session_state.route_nodes = build_route_nodes(
+        st.session_state.wps,
+        st.session_state.wind_from,
+        st.session_state.wind_kt,
+        st.session_state.roc_fpm,
+        st.session_state.rod_fpm
+    )
+    st.session_state.legs = build_legs_from_nodes(
+        st.session_state.route_nodes,
+        st.session_state.mag_var,
+        st.session_state.mag_is_e,
+        st.session_state.ck_default
+    )
+
     if not st.session_state.legs:
         st.error("Gera primeiro a rota.")
     else:
@@ -1970,6 +1970,3 @@ if make_pdfs:
                     file_name="NAVLOG_FILLED_1.pdf",
                     use_container_width=True
                 )
-
-
-
