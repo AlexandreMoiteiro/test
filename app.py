@@ -10,8 +10,8 @@
 # - PDF passa a preencher pelas CHEGADAS (ponto B da perna)
 # - Perna de STOP / touch-and-go: no WP metes "stop (min)" e entra no NAVLOG
 # - Mantido overlay openAIP, doghouses, filtro de pernas, PDF com 2.ª página
-# - [FIX] TOC/TOD passam a herdar o VOR do WP de chegada → FIXED passa mesmo para o PDF
-# - [FIX] Ao gerar PDF volta a gerar a rota com o estado atual dos WPs
+# - CORREÇÃO: quando escolhes FIXED num WP e selecionas o VOR, o valor já não é
+#   apagado pelo text_input na volta seguinte (era isto que estava a forçar AUTO).
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -878,7 +878,7 @@ if st.session_state.wps:
                 wind_from_i = w.get("wind_from", st.session_state.wind_from)
                 wind_kt_i   = w.get("wind_kt",   st.session_state.wind_kt)
 
-            # escolha de VOR
+            # escolha de VOR (CORRIGIDO)
             st.markdown("**Navaid preferido para este ponto**")
             vor_pref = st.selectbox(
                 f"Modo VOR — WP{i+1}",
@@ -886,16 +886,36 @@ if st.session_state.wps:
                 index=0 if w.get("vor_pref","AUTO")=="AUTO" else 1,
                 key=f"wpvorpref_{w['id']}"
             )
-            vor_ident_val = w.get("vor_ident","")
+
+            # chave única para o text_input deste WP
+            vor_ident_key = f"wpvortxt_{w['id']}"
+
             if vor_pref == "FIXED":
-                near_list = nearby_vors(float(lat), float(lon))
+                # ponto atual
+                cur_lat = float(lat)
+                cur_lon = float(lon)
+                near_list = nearby_vors(cur_lat, cur_lon)
                 labels = ["(escolher)"] + [f"{v['ident']} — {v['name']} ({v['freq_mhz']:.2f})" for v in near_list]
+
+                # qual é o valor atual conhecido (pode vir do WP ou do session_state)
+                current_ident = st.session_state.get(vor_ident_key, w.get("vor_ident",""))
+
                 sel = st.selectbox(f"VOR próximo — WP{i+1}", labels, key=f"wpvornsel_{w['id']}")
                 if sel != "(escolher)":
                     chosen = near_list[labels.index(sel)-1]
-                    vor_ident_val = chosen["ident"]
-                vor_ident_val = st.text_input(f"Ident VOR manual — WP{i+1}", vor_ident_val, key=f"wpvortxt_{w['id']}")
+                    current_ident = chosen["ident"]
+                    # força o text_input a ter o mesmo valor escolhido
+                    st.session_state[vor_ident_key] = current_ident
+
+                vor_ident_val = st.text_input(
+                    f"Ident VOR manual — WP{i+1}",
+                    value=current_ident,
+                    key=vor_ident_key
+                )
             else:
+                # se voltar para AUTO, limpamos o valor deste campo
+                if vor_ident_key in st.session_state:
+                    del st.session_state[vor_ident_key]
                 vor_ident_val = ""
 
             # guardar
@@ -922,10 +942,6 @@ st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
 # ========= ROTA (TOC/TOD) =========
 def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
-    """
-    IMPORTANTE: TOC/TOD passam a herdar o VOR do ponto de CHEGADA (B),
-    para o PDF (que usa o ponto B) respeitar o FIXED que escolheste.
-    """
     nodes = []
     if len(user_wps) < 2:
         return nodes
@@ -951,7 +967,6 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
             d_need = gs_cl * (t_need/60.0)
             if d_need < dist - 0.05:
                 lat_toc, lon_toc = point_along_gc(A["lat"], A["lon"], B["lat"], B["lon"], d_need)
-                # herda VOR do B (destino)
                 nodes.append({
                     "name": f"TOC L{i+1}",
                     "lat": lat_toc, "lon": lon_toc,
@@ -959,8 +974,8 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
                     "wind_from": A.get("wind_from", wind_from),
                     "wind_kt":   A.get("wind_kt", wind_kt),
                     "stop_min":  0.0,
-                    "vor_pref":  B.get("vor_pref", A.get("vor_pref","AUTO")),
-                    "vor_ident": B.get("vor_ident", A.get("vor_ident","")),
+                    "vor_pref":  "AUTO",   # nós gerados ficam AUTO
+                    "vor_ident": "",
                 })
         # TOD
         elif B["alt"] < A["alt"]:
@@ -977,9 +992,8 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
                     "wind_from": A.get("wind_from", wind_from),
                     "wind_kt":   A.get("wind_kt", wind_kt),
                     "stop_min":  0.0,
-                    # também herda do B (ponto que vais efetivamente chegar)
-                    "vor_pref":  B.get("vor_pref", A.get("vor_pref","AUTO")),
-                    "vor_ident": B.get("vor_ident", A.get("vor_ident","")),
+                    "vor_pref":  "AUTO",   # nós gerados ficam AUTO
+                    "vor_ident": "",
                 })
     # último WP
     last = user_wps[-1]
@@ -1113,7 +1127,6 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
                 (base_time + dt.timedelta(seconds=t_cursor+stop_sec)).strftime('%H:%M')
                 if base_time else f"T+{mmss(t_cursor+stop_sec)}"
             )
-            # STOP também herda o VOR do próprio ponto B
             legs.append({
                 "i":len(legs)+1,
                 "A":B,
@@ -1467,7 +1480,6 @@ def render_map(nodes, legs, base_choice):
         info_nodes[0]["eto"]  = legs[0]["clock_start"]
         info_nodes[0]["efob"] = legs[0]["efob_start"]
         for i in range(1, len(nodes)):
-            # encontrar leg cuja B é este node
             eta = None
             efob = None
             for L in legs:
@@ -1480,7 +1492,6 @@ def render_map(nodes, legs, base_choice):
     node_tc = []
     if legs:
         for i in range(len(nodes)):
-            # usa TC do leg que sai deste nó, senão último
             found = None
             for L in legs:
                 if abs(L["A"]["lat"] - nodes[i]["lat"])<1e-6 and abs(L["A"]["lon"] - nodes[i]["lon"])<1e-6 and L["profile"]!="STOP":
@@ -1742,9 +1753,14 @@ def _compose_clock_after(total_sec, extra_sec):
     return f"T+{mmss(t)}"
 
 def _choose_vor_for_point(P):
-    # se o ponto disser FIXED e tiver ident → usa
-    if P.get("vor_pref") == "FIXED" and P.get("vor_ident"):
-        v = get_vor_by_ident(P["vor_ident"])
+    """
+    Corrigido: se o ponto disser FIXED mas não tiver vor_ident,
+    ainda tentamos usar o próprio nome do ponto como ident (ex.: CAS).
+    Se nada der, volta ao mais próximo (AUTO).
+    """
+    if P.get("vor_pref") == "FIXED":
+        cand = (P.get("vor_ident") or P.get("name") or "").strip()
+        v = get_vor_by_ident(cand)
         if v:
             return v
     # senão AUTO
@@ -1913,21 +1929,6 @@ with cY:
     st.caption("Principal até 22 legs; continuação se exceder.")
 
 if make_pdfs:
-    # <<< NOVO: garantir que a rota está atualizada com o estado dos WPs (incluindo VOR FIXED) >>>
-    st.session_state.route_nodes = build_route_nodes(
-        st.session_state.wps,
-        st.session_state.wind_from,
-        st.session_state.wind_kt,
-        st.session_state.roc_fpm,
-        st.session_state.rod_fpm
-    )
-    st.session_state.legs = build_legs_from_nodes(
-        st.session_state.route_nodes,
-        st.session_state.mag_var,
-        st.session_state.mag_is_e,
-        st.session_state.ck_default
-    )
-
     if not st.session_state.legs:
         st.error("Gera primeiro a rota.")
     else:
@@ -1970,3 +1971,4 @@ if make_pdfs:
                     file_name="NAVLOG_FILLED_1.pdf",
                     use_container_width=True
                 )
+
