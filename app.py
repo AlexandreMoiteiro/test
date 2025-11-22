@@ -1,21 +1,15 @@
-# app_navlog_rev38_fix_vor.py
+# app_navlog_rev39_simplificado_vor.py
 # ---------------------------------------------------------------
-# - Remoção de WPs estável (não apaga vários de uma vez)
-# - Fuels arredondados à unidade (1 L)
-# - Tempos arredondados à unidade (1 min)
-# - Distâncias arredondadas a 0.5 NM
-# - Aceita VOR como fixes (aparecem na pesquisa)
-# - Se adicionas um VOR, ele já fica como VOR FIXO nesse WP
-# - Em cada WP podes escolher o VOR (AUTO = mais próximo, FIXED = o que quiseres)
-# - PDF passa a preencher pelas CHEGADAS (ponto B da perna)
-# - Perna de STOP / touch-and-go: no WP metes "stop (min)" e entra no NAVLOG
-# - Mantido overlay openAIP, doghouses, filtro de pernas, PDF com 2.ª página
-# - CORREÇÃO: quando escolhes FIXED num WP e selecionas o VOR, o valor já não é
-#   apagado pelo text_input na volta seguinte (era isto que estava a forçar AUTO).
-# - NOVO: não preencher ETO no PDF (campos em branco)
-# - NOVO: waypoint RASQUETE BRIDGE adicionado à base de dados
-# - NOVO: botões ↑ / ↓ para reordenar WPs
-# - NOVO: escolha de VOR em massa para vários WPs
+# - Remoção de VOR manual por WP (fica só VOR em massa no fim da lista)
+# - VOR em massa: escolhes 1 VOR e aplicas a vários WPs de uma vez
+# - Se não aplicares nada, fica AUTO (VOR mais próximo) por defeito
+# - ETO deixa de ser preenchido no PDF (campo em branco)
+# - Labels do mapa deixam de mostrar ETO (mostram só EFOB)
+# - Tempos arredondados à unidade (1 s)
+# - Combustível arredondado à unidade (1 L)
+# - Rasquete Bridge adicionado à base de dados de pesquisa
+# - Permite mudar a ordem dos WPs com botões ↑ / ↓
+# - Mantido: TOC/TOD, STOP, doghouses, overlay openAIP, filtro de pernas, 2.ª página PDF
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -35,24 +29,21 @@ FUEL_FLOW = 20.0              # L/h
 EARTH_NM  = 3440.065
 PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386","STOP":"#FF0000"}
 
-# arredondamentos PEDIDOS PELO UTILIZADOR
-# tempo à unidade (1 min) -> 60 s
-ROUND_TIME_SEC = 60
-# distância mantém 0.5 NM
-ROUND_DIST_NM  = 0.5
-# combustível à unidade (1 L)
-ROUND_FUEL_L   = 1.0
+# arredondamentos (agora à unidade)
+ROUND_TIME_SEC = 1       # antes 30
+ROUND_DIST_NM  = 0.5     # mantém 0.5 NM
+ROUND_FUEL_L   = 1.0     # antes 0.5 L
 
 CP_TICK_HALF = 0.38
 NBSP_THIN = "&#8239;"  # U+202F fino para kt/ft/nm/L
 
 # Paleta para áreas
-ASPACE_COLOR     = "#FFD54A"  # áreas tipo LPT1, etc
-CORRIDOR_COLOR   = "#9BE27A"  # corredores tipo LPT61
-FILL_OPACITY     = 0.12       # alpha leve no fill
-EDGE_OPACITY     = 0.9        # borda mais visível
+ASPACE_COLOR     = "#FFD54A"
+CORRIDOR_COLOR   = "#9BE27A"
+FILL_OPACITY     = 0.12
+EDGE_OPACITY     = 0.9
 
-# ========= ÁREAS PRÉ-DEFINIDAS (igual ao original) =========
+# ========= ÁREAS PRÉ-DEFINIDAS =========
 PRESET_AIRSPACES = {
     "LPT1": {
         "floor": "GND", "ceiling": "FL280",
@@ -279,14 +270,14 @@ def round_to_step(x: float, step: float) -> float:
     return round(x / step) * step
 
 def rt30(sec: float) -> int:
-    # já está com ROUND_TIME_SEC = 60 → arredonda a 1 min
+    # agora arredonda a 1 s (ROUND_TIME_SEC = 1)
     return int(round_to_step(sec, ROUND_TIME_SEC))
 
 def rdist05(nm: float) -> float:
     return round_to_step(nm, ROUND_DIST_NM)
 
 def rfuel05(L: float) -> float:
-    # já está com ROUND_FUEL_L = 1.0 → arredonda a 1 L
+    # agora arredonda a 1 L (ROUND_FUEL_L = 1.0)
     return round_to_step(L, ROUND_FUEL_L)
 
 def mmss(t):
@@ -364,7 +355,6 @@ def corridor_polygon(p1, p2, width_nm):
     right2 = dest_point(lat2, lon2, tc+90, half)
     return [left1, left2, right2, right1, left1]
 
-# Parser coords AIP "41 22 48N 006 23 33W ..."
 coord_pattern = re.compile(
     r"(\d{2})\s+(\d{2})\s+(\d{2})([NS])\s+(\d{3})\s+(\d{2})\s+(\d{2})([EW])",
     re.IGNORECASE
@@ -429,10 +419,6 @@ ens("preset_selected", [])
 
 ens("use_leg_filter", False)
 ens("leg_filter_ids", [])
-
-ens("bulk_vor_wps", [])
-ens("bulk_vor_mode", "AUTO (mais próximo)")
-ens("bulk_vor_ident_sel", "")
 
 # ========= FORM GLOBAL =========
 with st.form("globals"):
@@ -603,28 +589,29 @@ for _, r in st.session_state.vor_db.iterrows():
     })
 vor_df = pd.DataFrame(vor_pts)
 
-# juntar tudo
+# juntar tudo + WAYPOINT EXTRA: RASQUETE BRIDGE (coords aproximadas)
 if st.session_state.db_points is None:
-    st.session_state.db_points = pd.concat(
+    base_db = pd.concat(
         [ad_df, loc_df, vor_df],
         ignore_index=True
     ).dropna(subset=["lat","lon"]).reset_index(drop=True)
-db = st.session_state.db_points
 
-# ========= ADICIONAR RASQUETE BRIDGE À BD =========
-# Coordenadas aproximadas na barragem de Montargil
-rasquete = {
-    "src": "USR",
-    "code": "RASQ",
-    "name": "RASQUETE BRIDGE",
-    "city": "Montargil",
-    "sector": "",
-    "lat": 39.0541,
-    "lon": -8.1765,
-    "alt": 300.0,
-}
-db = pd.concat([db, pd.DataFrame([rasquete])], ignore_index=True)
-st.session_state.db_points = db
+    extra_rows = [{
+        "src": "LOC",
+        "code": "RASQ",
+        "name": "RASQUETE BRIDGE",
+        "sector": "Montargil / Barragem de Montargil",
+        # Nota: coordenadas aproximadas, perto da barragem de Montargil.
+        # Se tiveres valores exatos, troca aqui.
+        "lat": 39.0538,
+        "lon": -8.1762,
+        "alt": 0.0,
+    }]
+    base_db = pd.concat([base_db, pd.DataFrame(extra_rows)], ignore_index=True)
+
+    st.session_state.db_points = base_db.dropna(subset=["lat","lon"]).reset_index(drop=True)
+
+db = st.session_state.db_points
 
 # ========= helpers VOR =========
 def nearest_vor(lat: float, lon: float):
@@ -878,75 +865,13 @@ st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 # ========= EDITOR WPs =========
 ensure_wp_ids()
 remove_id = None
+move_up_id = None
+move_down_id = None
 
 if st.session_state.wps:
     st.subheader("Rota (Waypoints)")
-
-    # ---------- VOR EM MASSA ----------
-    with st.expander("🎯 VOR em massa para WPs", expanded=False):
-        labels = [f"{i+1:02d} — {w['name']} (id {w['id']})" for i, w in enumerate(st.session_state.wps)]
-        chosen_labels = st.multiselect(
-            "Seleciona os WPs a atualizar",
-            labels,
-            key="bulk_vor_wps"
-        )
-
-        bulk_mode = st.radio(
-            "Modo de VOR",
-            ["AUTO (mais próximo)", "FIXED (manual)"],
-            key="bulk_vor_mode",
-            horizontal=True
-        )
-
-        chosen_ident = ""
-        if bulk_mode.startswith("FIXED"):
-            vor_options = []
-            for _, r in st.session_state.vor_db.iterrows():
-                vor_options.append(f"{r['ident']} — {r.get('name','')} ({float(r['freq_mhz']):.2f})")
-            if vor_options:
-                sel_v = st.selectbox("VOR a aplicar", vor_options, key="bulk_vor_ident_sel")
-                chosen_ident = sel_v.split("—",1)[0].strip()
-            else:
-                st.warning("Sem VORs na base de dados.")
-
-        if st.button("Aplicar VOR aos WPs selecionados"):
-            # traduzir labels em ids
-            selected_ids = []
-            for lbl in chosen_labels:
-                m = re.match(r"(\d+)\s+—.*id\s+(\d+)", lbl)
-                if m:
-                    wp_id = int(m.group(2))
-                    selected_ids.append(wp_id)
-            if not selected_ids:
-                st.warning("Nenhum WP selecionado.")
-            else:
-                for idx, w in enumerate(st.session_state.wps):
-                    if w["id"] in selected_ids:
-                        if bulk_mode.startswith("AUTO"):
-                            w["vor_pref"] = "AUTO"
-                            w["vor_ident"] = ""
-                        else:
-                            if chosen_ident:
-                                w["vor_pref"] = "FIXED"
-                                w["vor_ident"] = chosen_ident
-                st.success("VOR atualizado nos WPs selecionados.")
-
-    # ---------- LISTA DE WPS COM MOVER / EDITAR ----------
     for i, w in enumerate(st.session_state.wps):
         with st.expander(f"WP {i+1} — {w['name']} ({w['id']})", expanded=False):
-            # botões de ordenar
-            col_move_up, col_move_down, _ = st.columns([0.15,0.15,0.7])
-            with col_move_up:
-                if st.button("↑", key=f"moveup_{w['id']}"):
-                    if i > 0:
-                        st.session_state.wps[i-1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i-1]
-                        st.experimental_rerun()
-            with col_move_down:
-                if st.button("↓", key=f"movedown_{w['id']}"):
-                    if i < len(st.session_state.wps)-1:
-                        st.session_state.wps[i+1], st.session_state.wps[i] = st.session_state.wps[i], st.session_state.wps[i+1]
-                        st.experimental_rerun()
-
             c1,c2,c3,c4 = st.columns([2,2,2,1])
             with c1:
                 name = st.text_input(f"Nome — WP{i+1}", w["name"], key=f"wpn_{w['id']}")
@@ -957,10 +882,10 @@ if st.session_state.wps:
             with c4:
                 alt  = st.number_input(f"Alt (ft) — WP{i+1}", 0.0, 18000.0, float(w["alt"]), step=50.0, key=f"wpalt_{w['id']}")
 
-            # stop/touch and go
+            # STOP / touch-and-go
             stop_min = st.number_input(f"STOP neste WP (min)", 0.0, 60.0, float(w.get("stop_min", 0.0)), step=0.5, key=f"wpstop_{w['id']}")
 
-            # vento
+            # vento por WP (se não usar global)
             if not st.session_state.use_global_wind:
                 c5,c6 = st.columns(2)
                 with c5:
@@ -971,45 +896,7 @@ if st.session_state.wps:
                 wind_from_i = w.get("wind_from", st.session_state.wind_from)
                 wind_kt_i   = w.get("wind_kt",   st.session_state.wind_kt)
 
-            # escolha de VOR (CORRIGIDO + integra com bulk)
-            st.markdown("**Navaid preferido para este ponto**")
-            vor_pref = st.selectbox(
-                f"Modo VOR — WP{i+1}",
-                ["AUTO","FIXED"],
-                index=0 if w.get("vor_pref","AUTO")=="AUTO" else 1,
-                key=f"wpvorpref_{w['id']}"
-            )
-
-            # chave única para o text_input deste WP
-            vor_ident_key = f"wpvortxt_{w['id']}"
-
-            if vor_pref == "FIXED":
-                # ponto atual
-                cur_lat = float(lat)
-                cur_lon = float(lon)
-                near_list = nearby_vors(cur_lat, cur_lon)
-                labels = ["(escolher)"] + [f"{v['ident']} — {v['name']} ({v['freq_mhz']:.2f})" for v in near_list]
-
-                # valor atual conhecido (do WP ou do session_state)
-                current_ident = st.session_state.get(vor_ident_key, w.get("vor_ident",""))
-
-                sel = st.selectbox(f"VOR próximo — WP{i+1}", labels, key=f"wpvornsel_{w['id']}")
-                if sel != "(escolher)":
-                    chosen = near_list[labels.index(sel)-1]
-                    current_ident = chosen["ident"]
-                    st.session_state[vor_ident_key] = current_ident
-
-                vor_ident_val = st.text_input(
-                    f"Ident VOR manual — WP{i+1}",
-                    value=current_ident,
-                    key=vor_ident_key
-                )
-            else:
-                if vor_ident_key in st.session_state:
-                    del st.session_state[vor_ident_key]
-                vor_ident_val = ""
-
-            # guardar
+            # guardar (sem UI de VOR — fica tudo por VOR em massa)
             st.session_state.wps[i] = {
                 "id": w["id"],
                 "name":name,
@@ -1019,15 +906,89 @@ if st.session_state.wps:
                 "wind_from": int(wind_from_i),
                 "wind_kt":   int(wind_kt_i),
                 "stop_min":  float(stop_min),
-                "vor_pref":  vor_pref,
-                "vor_ident": vor_ident_val,
+                "vor_pref":  w.get("vor_pref","AUTO"),
+                "vor_ident": w.get("vor_ident",""),
             }
 
-            if st.button("Remover", key=f"delwp_{w['id']}"):
-                remove_id = w["id"]
+            btn_c1, btn_c2, btn_c3 = st.columns(3)
+            with btn_c1:
+                if st.button("↑ Mover para cima", key=f"up_{w['id']}"):
+                    move_up_id = w["id"]
+            with btn_c2:
+                if st.button("↓ Mover para baixo", key=f"down_{w['id']}"):
+                    move_down_id = w["id"]
+            with btn_c3:
+                if st.button("Remover", key=f"delwp_{w['id']}"):
+                    remove_id = w["id"]
 
+# aplicar movimentos de ordem
+if move_up_id is not None:
+    idx = next((i for i,w in enumerate(st.session_state.wps) if w["id"] == move_up_id), None)
+    if idx is not None and idx > 0:
+        st.session_state.wps[idx-1], st.session_state.wps[idx] = st.session_state.wps[idx], st.session_state.wps[idx-1]
+
+if move_down_id is not None:
+    idx = next((i for i,w in enumerate(st.session_state.wps) if w["id"] == move_down_id), None)
+    if idx is not None and idx < len(st.session_state.wps)-1:
+        st.session_state.wps[idx], st.session_state.wps[idx+1] = st.session_state.wps[idx+1], st.session_state.wps[idx]
+
+# aplicar remoção
 if remove_id is not None:
     st.session_state.wps = [w for w in st.session_state.wps if w["id"] != remove_id]
+
+# ========= VOR EM MASSA (única forma de fixar VOR manualmente) =========
+if st.session_state.wps:
+    with st.expander("📡 VOR em massa para vários WPs", expanded=False):
+        st.caption("Escolhe um VOR e aplica a uma série de pontos. Se escolheres AUTO, esses pontos passam a usar o VOR mais próximo.")
+        # lista de WPs
+        wp_labels = [f"{i+1:02d} — {w['name']}" for i, w in enumerate(st.session_state.wps)]
+        selected_wps = st.multiselect(
+            "WPs a afetar",
+            wp_labels,
+            default=wp_labels
+        )
+        target_idx = [wp_labels.index(lbl) for lbl in selected_wps]
+
+        # lista de VORs
+        vor_df_ui = st.session_state.vor_db
+        vor_labels = [f"{row['ident']} — {row['name']} ({row['freq_mhz']:.2f})" for _, row in vor_df_ui.iterrows()]
+        vor_idents = [str(row['ident']) for _, row in vor_df_ui.iterrows()]
+        vor_choice = st.selectbox(
+            "VOR a aplicar",
+            ["AUTO (usar VOR mais próximo)"] + vor_labels
+        )
+
+        if st.button("Aplicar VOR aos WPs selecionados"):
+            if not target_idx:
+                st.warning("Seleciona pelo menos um WP.")
+            else:
+                if vor_choice.startswith("AUTO"):
+                    # volta tudo a AUTO
+                    for i in target_idx:
+                        st.session_state.wps[i]["vor_pref"] = "AUTO"
+                        st.session_state.wps[i]["vor_ident"] = ""
+                    applied_txt = "AUTO (VOR mais próximo)"
+                else:
+                    j = vor_labels.index(vor_choice)
+                    ident = vor_idents[j]
+                    for i in target_idx:
+                        st.session_state.wps[i]["vor_pref"] = "FIXED"
+                        st.session_state.wps[i]["vor_ident"] = ident
+                    applied_txt = ident
+
+                # também atualiza route_nodes se já existirem (TOC/TOD mantêm AUTO)
+                if st.session_state.route_nodes:
+                    for node in st.session_state.route_nodes:
+                        for i, w in enumerate(st.session_state.wps):
+                            if (
+                                abs(node["lat"]-w["lat"])<1e-6 and
+                                abs(node["lon"]-w["lon"])<1e-6 and
+                                node["name"] == w["name"]
+                            ):
+                                node["vor_pref"]  = w["vor_pref"]
+                                node["vor_ident"] = w["vor_ident"]
+                                break
+                st.success(f"VOR aplicado: {applied_txt}. Se já tinhas rota gerada, volta a carregar em «Gerar/Atualizar rota» para atualizar tudo.")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
@@ -1038,7 +999,6 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
         return nodes
     for i in range(len(user_wps)-1):
         A, B = user_wps[i], user_wps[i+1]
-        # A entra sempre
         nodes.append({
             "name": A["name"], "lat": A["lat"], "lon": A["lon"], "alt": A["alt"],
             "wind_from": A.get("wind_from", wind_from),
@@ -1086,7 +1046,6 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
                     "vor_pref":  "AUTO",
                     "vor_ident": "",
                 })
-    # último WP
     last = user_wps[-1]
     nodes.append({
         "name": last["name"], "lat": last["lat"], "lon": last["lon"], "alt": last["alt"],
@@ -1103,7 +1062,6 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
     if len(nodes) < 2:
         return legs
 
-    # hora base = off-block +15 min
     base_time = None
     if st.session_state.start_clock.strip():
         try:
@@ -1115,17 +1073,15 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
         except:
             base_time = None
 
-    # combustível inicial efetivo = start_efob -5 L
     carry_efob = max(0.0, float(st.session_state.start_efob) - 5.0)
-
     t_cursor = 0
+
     for i in range(len(nodes)-1):
         A, B = nodes[i], nodes[i+1]
         tc   = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
         dist_raw = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
         dist = rdist05(dist_raw)
 
-        # vento para esta perna
         if st.session_state.use_global_wind:
             wind_from_used = st.session_state.wind_from
             wind_kt_used   = st.session_state.wind_kt
@@ -1133,7 +1089,6 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
             wind_from_used = A.get("wind_from", st.session_state.wind_from)
             wind_kt_used   = A.get("wind_kt",   st.session_state.wind_kt)
 
-        # perfil
         if abs(B["alt"]-A["alt"])<1e-6:
             profile = "LEVEL"
             tas = CRUISE_TAS
@@ -1203,7 +1158,6 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
         t_cursor += time_sec
         carry_efob = efob_end
 
-        # STOP neste ponto de chegada?
         stop_min = B.get("stop_min", 0.0)
         if stop_min and stop_min > 0.0:
             stop_sec = rt30(stop_min * 60.0)
@@ -1329,15 +1283,17 @@ def html_marker(m, lat, lon, html):
     ).add_to(m)
 
 def wp_label_html_rot(g, scale: float, angle_tc: float):
+    # agora só mostra EFOB, sem ETO
     rot = angle_tc - 90.0
     fs_name = int(14 * scale)
     fs_line = int(12 * scale)
     txtshadow = "-1px -1px 0 #fff,1px -1px 0 #fff,-1px  1px 0 #fff,1px  1px 0 #fff"
     lines = []
     for (efob, eto) in g["pairs"]:
-        ef = f"{float(efob):.1f} L" if efob is not None else ""
-        et = eto or ""
-        detail = f"{ef} • {et}" if ef and et else (ef or et)
+        if efob is None:
+            continue
+        ef = f"{float(efob):.1f} L"
+        detail = ef
         lines.append(
             f"<div style='font-size:{fs_line}px;font-weight:700;color:#0055FF;text-shadow:{txtshadow};'>{detail}</div>"
         )
@@ -1565,7 +1521,7 @@ def render_map(nodes, legs, base_choice):
             "box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
         )
 
-    # INFO ETO / EFOB por nó (no mapa mantemos ETO, só removemos no PDF)
+    # INFO EFOB / ETO por nó (ETO já não é mostrado na label, mas fica aqui se quiseres voltar a usar no futuro)
     info_nodes = [{"eto": None, "efob": None} for _ in nodes]
     if legs:
         info_nodes[0]["eto"]  = legs[0]["clock_start"]
@@ -1594,7 +1550,6 @@ def render_map(nodes, legs, base_choice):
     else:
         node_tc = [0.0]*len(nodes)
 
-    # agrupar pontos coincidentes
     grouped=[]
     seen=set()
     for idx,N in enumerate(nodes):
@@ -1845,7 +1800,7 @@ def _compose_clock_after(total_sec, extra_sec):
 
 def _choose_vor_for_point(P):
     """
-    Corrigido: se o ponto disser FIXED mas não tiver vor_ident,
+    Se o ponto disser FIXED mas não tiver vor_ident,
     ainda tentamos usar o próprio nome do ponto como ident (ex.: CAS).
     Se nada der, volta ao mais próximo (AUTO).
     """
@@ -1854,11 +1809,9 @@ def _choose_vor_for_point(P):
         v = get_vor_by_ident(cand)
         if v:
             return v
-    # senão AUTO
     return nearest_vor(float(P["lat"]), float(P["lon"]))
 
 def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:int, prefix="Leg"):
-    # use_point = "B" (chegada)
     P = L["B"] if use_point=="B" else L["A"]
     d[f"{prefix}{idx:02d}_Waypoint"]            = str(P["name"])
     d[f"{prefix}{idx:02d}_Altitude_FL"]         = str(int(round(P["alt"])))
@@ -1879,12 +1832,11 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
     d[f"{prefix}{idx:02d}_Cumulative_Distance"] = f"{acc_d:.1f}"
     d[f"{prefix}{idx:02d}_Leg_ETE"]             = _pdf_mmss(L["time_sec"])
     d[f"{prefix}{idx:02d}_Cumulative_ETE"]      = _pdf_mmss(acc_t)
-    # PEDIDO: NÃO PREENCHER ETO → fica vazio
+    # **IMPORTANTE**: ETO não preenchido (fica em branco)
     d[f"{prefix}{idx:02d}_ETO"]                 = ""
     d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
     d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
 
-    # VOR campo
     try:
         vor = _choose_vor_for_point(P)
         if vor:
@@ -1946,7 +1898,6 @@ def _build_payloads_main(
         acc_t += L["time_sec"]
         _fill_leg_line(d, i, L, use_point="B", acc_d=acc_d, acc_t=acc_t)
 
-    # totais viagem toda
     d["Leg23_Leg_Distance"] = f"{total_dist:.1f}"
     d["Leg23_Leg_ETE"]      = _pdf_mmss(total_sec)
     d["Leg23_Planned_Burnoff"] = f"{total_burn:.1f}"
@@ -1965,7 +1916,7 @@ def _build_payloads_main(
             "Alternate_Cumulative_Distance":f"{alt_info['dist']:.1f}",
             "Alternate_Leg_ETE":_pdf_mmss(alt_info['ete']),
             "Alternate_Cumulative_ETE":_pdf_mmss(alt_info['ete']),
-            # PEDIDO: não preencher ETO → vazio
+            # **IMPORTANTE**: ETO do alternante também em branco
             "Alternate_ETO":"",
             "Alternate_Planned_Burnoff":f"{alt_info['burn']:.1f}",
             "Alternate_Estimated_FOB":f"{rfuel05(legs[-1]['efob_end'] - alt_info['burn']):.1f}",
@@ -2008,7 +1959,7 @@ def _build_payload_cont(all_legs, start_idx, *, alt_info=None, alt_choice=None):
             "Alternate_Cumulative_Distance":f"{alt_info['dist']:.1f}",
             "Alternate_Leg_ETE":_pdf_mmss(alt_info['ete']),
             "Alternate_Cumulative_ETE":_pdf_mmss(alt_info['ete']),
-            # também aqui: ETO vazio
+            # **IMPORTANTE**: aqui também deixamos o ETO em branco
             "Alternate_ETO":"",
             "Alternate_Planned_Burnoff":f"{alt_info['burn']:.1f}",
             "Alternate_Estimated_FOB":f"{rfuel05(all_legs[start_idx+len(legs_chunk)-1]['efob_end'] - alt_info['burn']):.1f}",
@@ -2065,3 +2016,4 @@ if make_pdfs:
                     file_name="NAVLOG_FILLED_1.pdf",
                     use_container_width=True
                 )
+
