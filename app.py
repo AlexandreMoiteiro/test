@@ -1,12 +1,12 @@
-# app_navlog_rev39_simplificado_vor.py
+# app_navlog_rev40_minutos.py
 # ---------------------------------------------------------------
 # - Remoção de VOR manual por WP (fica só VOR em massa no fim da lista)
 # - VOR em massa: escolhes 1 VOR e aplicas a vários WPs de uma vez
 # - Se não aplicares nada, fica AUTO (VOR mais próximo) por defeito
 # - ETO deixa de ser preenchido no PDF (campo em branco)
 # - Labels do mapa deixam de mostrar ETO (mostram só EFOB)
-# - Tempos arredondados à unidade (1 s)
-# - Combustível arredondado à unidade (1 L)
+# - Tempos arredondados AO MINUTO (60 s)
+# - Combustível arredondado à UNIDADE (1 L)
 # - Rasquete Bridge adicionado à base de dados de pesquisa
 # - Permite mudar a ordem dos WPs com botões ↑ / ↓
 # - Mantido: TOC/TOD, STOP, doghouses, overlay openAIP, filtro de pernas, 2.ª página PDF
@@ -29,10 +29,10 @@ FUEL_FLOW = 20.0              # L/h
 EARTH_NM  = 3440.065
 PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386","STOP":"#FF0000"}
 
-# arredondamentos (agora à unidade)
-ROUND_TIME_SEC = 1       # antes 30
-ROUND_DIST_NM  = 0.5     # mantém 0.5 NM
-ROUND_FUEL_L   = 1.0     # antes 0.5 L
+# arredondamentos (minuto e litro)
+ROUND_TIME_SEC = 60       # arredonda ao minuto
+ROUND_DIST_NM  = 0.5      # mantém 0.5 NM
+ROUND_FUEL_L   = 1.0      # arredonda a 1 L
 
 CP_TICK_HALF = 0.38
 NBSP_THIN = "&#8239;"  # U+202F fino para kt/ft/nm/L
@@ -270,14 +270,14 @@ def round_to_step(x: float, step: float) -> float:
     return round(x / step) * step
 
 def rt30(sec: float) -> int:
-    # agora arredonda a 1 s (ROUND_TIME_SEC = 1)
+    # agora arredonda a múltiplos de ROUND_TIME_SEC (60 s)
     return int(round_to_step(sec, ROUND_TIME_SEC))
 
 def rdist05(nm: float) -> float:
     return round_to_step(nm, ROUND_DIST_NM)
 
 def rfuel05(L: float) -> float:
-    # agora arredonda a 1 L (ROUND_FUEL_L = 1.0)
+    # arredonda a 1 L
     return round_to_step(L, ROUND_FUEL_L)
 
 def mmss(t):
@@ -601,8 +601,7 @@ if st.session_state.db_points is None:
         "code": "RASQ",
         "name": "RASQUETE BRIDGE",
         "sector": "Montargil / Barragem de Montargil",
-        # Nota: coordenadas aproximadas, perto da barragem de Montargil.
-        # Se tiveres valores exatos, troca aqui.
+        # Coordenadas aproximadas — ajusta se tiveres as oficiais
         "lat": 39.0538,
         "lon": -8.1762,
         "alt": 0.0,
@@ -936,7 +935,7 @@ if move_down_id is not None:
 if remove_id is not None:
     st.session_state.wps = [w for w in st.session_state.wps if w["id"] != remove_id]
 
-# ========= VOR EM MASSA (única forma de fixar VOR manualmente) =========
+# ========= VOR EM MASSA =========
 if st.session_state.wps:
     with st.expander("📡 VOR em massa para vários WPs", expanded=False):
         st.caption("Escolhe um VOR e aplica a uma série de pontos. Se escolheres AUTO, esses pontos passam a usar o VOR mais próximo.")
@@ -1521,7 +1520,7 @@ def render_map(nodes, legs, base_choice):
             "box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
         )
 
-    # INFO EFOB / ETO por nó (ETO já não é mostrado na label, mas fica aqui se quiseres voltar a usar no futuro)
+    # INFO EFOB / ETO por nó (ETO não mostrado nas labels)
     info_nodes = [{"eto": None, "efob": None} for _ in nodes]
     if legs:
         info_nodes[0]["eto"]  = legs[0]["clock_start"]
@@ -1832,7 +1831,7 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
     d[f"{prefix}{idx:02d}_Cumulative_Distance"] = f"{acc_d:.1f}"
     d[f"{prefix}{idx:02d}_Leg_ETE"]             = _pdf_mmss(L["time_sec"])
     d[f"{prefix}{idx:02d}_Cumulative_ETE"]      = _pdf_mmss(acc_t)
-    # **IMPORTANTE**: ETO não preenchido (fica em branco)
+    # ETO fica em branco
     d[f"{prefix}{idx:02d}_ETO"]                 = ""
     d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
     d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
@@ -1916,8 +1915,7 @@ def _build_payloads_main(
             "Alternate_Cumulative_Distance":f"{alt_info['dist']:.1f}",
             "Alternate_Leg_ETE":_pdf_mmss(alt_info['ete']),
             "Alternate_Cumulative_ETE":_pdf_mmss(alt_info['ete']),
-            # **IMPORTANTE**: ETO do alternante também em branco
-            "Alternate_ETO":"",
+            "Alternate_ETO":"",  # ETO em branco também no alternante
             "Alternate_Planned_Burnoff":f"{alt_info['burn']:.1f}",
             "Alternate_Estimated_FOB":f"{rfuel05(legs[-1]['efob_end'] - alt_info['burn']):.1f}",
         })
@@ -1959,8 +1957,7 @@ def _build_payload_cont(all_legs, start_idx, *, alt_info=None, alt_choice=None):
             "Alternate_Cumulative_Distance":f"{alt_info['dist']:.1f}",
             "Alternate_Leg_ETE":_pdf_mmss(alt_info['ete']),
             "Alternate_Cumulative_ETE":_pdf_mmss(alt_info['ete']),
-            # **IMPORTANTE**: aqui também deixamos o ETO em branco
-            "Alternate_ETO":"",
+            "Alternate_ETO":"",  # em branco também na continuação
             "Alternate_Planned_Burnoff":f"{alt_info['burn']:.1f}",
             "Alternate_Estimated_FOB":f"{rfuel05(all_legs[start_idx+len(legs_chunk)-1]['efob_end'] - alt_info['burn']):.1f}",
         })
