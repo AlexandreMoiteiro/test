@@ -1,6 +1,6 @@
-# app_navlog_rev40_minutos.py
+# app_navlog_rev41_minutos.py
 # ---------------------------------------------------------------
-# - Remoção de VOR manual por WP (fica só VOR em massa no fim da lista)
+# - Remoção de VOR manual por WP (fica só VOR em massa)
 # - VOR em massa: escolhes 1 VOR e aplicas a vários WPs de uma vez
 # - Se não aplicares nada, fica AUTO (VOR mais próximo) por defeito
 # - ETO deixa de ser preenchido no PDF (campo em branco)
@@ -9,6 +9,8 @@
 # - Combustível arredondado à UNIDADE (1 L)
 # - Rasquete Bridge adicionado à base de dados de pesquisa
 # - Permite mudar a ordem dos WPs com botões ↑ / ↓
+# - NÃO acrescenta “#2” quando repetes o nome de um WP
+# - NÃO coloca VOR nos TOC/TOD no PDF
 # - Mantido: TOC/TOD, STOP, doghouses, overlay openAIP, filtro de pernas, 2.ª página PDF
 # ---------------------------------------------------------------
 
@@ -31,8 +33,8 @@ PROFILE_COLORS = {"CLIMB":"#FF7A00","LEVEL":"#C000FF","DESCENT":"#00B386","STOP"
 
 # arredondamentos (minuto e litro)
 ROUND_TIME_SEC = 60       # arredonda ao minuto
-ROUND_DIST_NM  = 0.5      # mantém 0.5 NM
-ROUND_FUEL_L   = 1.0      # arredonda a 1 L
+ROUND_DIST_NM  = 0.5      # 0.5 NM
+ROUND_FUEL_L   = 1.0      # 1 L
 
 CP_TICK_HALF = 0.38
 NBSP_THIN = "&#8239;"  # U+202F fino para kt/ft/nm/L
@@ -281,12 +283,15 @@ def rfuel05(L: float) -> float:
     return round_to_step(L, ROUND_FUEL_L)
 
 def mmss(t):
-    t=int(t)
-    return f"{t//60:02d}:{t%60:02d}"
+    """Devolve sempre MM:00, arredondado ao minuto mais próximo."""
+    total_minutes = int(round(float(t) / 60.0))
+    return f"{total_minutes:02d}:00"
 
 def hhmmss(t):
-    t=int(t)
-    return f"{t//3600:02d}:{(t%3600)//60:02d}:{t%60:02d}"
+    """Devolve sempre HH:MM:00, arredondado ao minuto mais próximo."""
+    total_minutes = int(round(float(t) / 60.0))
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:00"
 
 def wrap360(x): return (x % 360 + 360) % 360
 def angdiff(a, b): return (a - b + 180) % 360 - 180
@@ -694,11 +699,8 @@ def ensure_wp_ids():
 ensure_wp_ids()
 
 def make_unique_name(name: str) -> str:
-    names = [str(w["name"]) for w in st.session_state.wps]
-    if name not in names: return name
-    k=2
-    while f"{name} #{k}" in names: k+=1
-    return f"{name} #{k}"
+    # agora não acrescenta “#2”, “#3”… deixa o nome exatamente como foi escrito
+    return str(name)
 
 def new_wp_dict(name, lat, lon, alt, src=None):
     wp_id = st.session_state.wp_next_id
@@ -715,6 +717,7 @@ def new_wp_dict(name, lat, lon, alt, src=None):
         "vor_pref":  "AUTO",
         "vor_ident": "",
     }
+    # se adicionas um VOR como WP, esse WP fica FIXED a esse VOR
     if src == "VOR":
         base["vor_pref"] = "FIXED"
         base["vor_ident"] = str(name).upper()
@@ -1741,12 +1744,17 @@ if use_alt and alt_choice and st.session_state.wps:
 
 # ========= PDF helpers =========
 def _pdf_mmss(sec:int):
-    total_sec = int(round(sec))
-    minutes, seconds = divmod(total_sec, 60)
-    if minutes >= 60:
-        hours, mins = divmod(minutes, 60)
+    """
+    Formato para o PDF:
+    - Se < 60 min:  MM:00
+    - Se ≥ 60 min:  HHhMM
+    Tudo arredondado ao minuto mais próximo.
+    """
+    total_minutes = int(round(float(sec) / 60.0))
+    if total_minutes >= 60:
+        hours, mins = divmod(total_minutes, 60)
         return f"{hours:02d}h{mins:02d}"
-    return f"{minutes:02d}:{seconds:02d}"
+    return f"{total_minutes:02d}:00"
 
 def _fill_pdf(template_path: str, out_path: str, data: dict):
     pdf = PdfReader(template_path)
@@ -1799,10 +1807,15 @@ def _compose_clock_after(total_sec, extra_sec):
 
 def _choose_vor_for_point(P):
     """
-    Se o ponto disser FIXED mas não tiver vor_ident,
-    ainda tentamos usar o próprio nome do ponto como ident (ex.: CAS).
-    Se nada der, volta ao mais próximo (AUTO).
+    - Se for TOC/TOD → NÃO usa VOR (fica vazio).
+    - Se o ponto disser FIXED, tenta usar vor_ident ou o próprio nome.
+    - Caso contrário AUTO → VOR mais próximo.
     """
+    nm = str(P.get("name","")).upper()
+    if nm.startswith("TOC ") or nm.startswith("TOD "):
+        # não preencher VOR para TOC/TOD
+        return None
+
     if P.get("vor_pref") == "FIXED":
         cand = (P.get("vor_ident") or P.get("name") or "").strip()
         v = get_vor_by_ident(cand)
