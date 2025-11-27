@@ -4,3 +4,4 @@ streamlit-folium>=0.18.0
 pandas>=1.5
 pdfrw>=0.4
 matplotlib
+reportlab
