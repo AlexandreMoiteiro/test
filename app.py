@@ -1,4 +1,4 @@
-# app_navlog_rev41_minutos.py
+# app_navlog_rev41_minutos_routes_briefing.py
 # ---------------------------------------------------------------
 # - Remoção de VOR manual por WP (fica só VOR em massa)
 # - VOR em massa: escolhes 1 VOR e aplicas a vários WPs de uma vez
@@ -12,11 +12,13 @@
 # - NÃO acrescenta “#2” quando repetes o nome de um WP
 # - NÃO coloca VOR nos TOC/TOD no PDF
 # - Mantido: TOC/TOD, STOP, doghouses, overlay openAIP, filtro de pernas, 2.ª página PDF
+# - NOVO: Rotas padrão em Gist (guardar / carregar / apagar)
+# - NOVO: Briefing extra por leg (PDF/CSV) com From/To, MH, TC, radial, tempo, altitudes
 # ---------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
-import folium, math, re, datetime as dt, difflib, os
+import folium, math, re, datetime as dt, difflib, os, json, requests
 from streamlit_folium import st_folium
 from folium.plugins import Fullscreen, MarkerCluster
 from math import degrees
@@ -339,7 +341,7 @@ def dest_point(lat, lon, bearing_deg, dist_nm):
 
 def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     total = gc_dist_nm(lat1, lon1, lat2, lon2)
-    if total <= 0: return lat1, lon1
+    if total <= 0: return (lat1, lon1)
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
@@ -424,6 +426,9 @@ ens("preset_selected", [])
 
 ens("use_leg_filter", False)
 ens("leg_filter_ids", [])
+
+# NOVO: rotas padrão em Gist
+ens("saved_routes", {})
 
 # ========= FORM GLOBAL =========
 with st.form("globals"):
@@ -726,6 +731,101 @@ def new_wp_dict(name, lat, lon, alt, src=None):
 def append_wp(name, lat, lon, alt, src=None):
     st.session_state.wps.append(new_wp_dict(name, lat, lon, alt, src))
 
+# ========= ROTAS PADRÃO (GIST) =========
+
+def _get_gist_credentials():
+    # tenta first st.secrets, depois os.getenv
+    token = (
+        getattr(st, "secrets", {}).get("GITHUB_TOKEN")
+        if hasattr(st, "secrets") else None
+    ) or os.getenv("GITHUB_TOKEN")
+
+    gist_id = (
+        getattr(st, "secrets", {}).get("ROUTES_GIST_ID")
+        if hasattr(st, "secrets") else None
+    ) or os.getenv("ROUTES_GIST_ID")
+
+    return token, gist_id
+
+def _serialize_wp_for_route(wp: dict) -> dict:
+    """Só guardo o que é preciso para reconstruir a rota."""
+    return {
+        "name": wp["name"],
+        "lat":  float(wp["lat"]),
+        "lon":  float(wp["lon"]),
+        "alt":  float(wp["alt"]),
+        "stop_min": float(wp.get("stop_min", 0.0)),
+        "wind_from": int(wp.get("wind_from", st.session_state.wind_from)),
+        "wind_kt":   int(wp.get("wind_kt",   st.session_state.wind_kt)),
+        "vor_pref":  wp.get("vor_pref", "AUTO"),
+        "vor_ident": wp.get("vor_ident", ""),
+    }
+
+def _deserialize_wp_for_route(data: dict) -> dict:
+    """Reconstrói o WP usando new_wp_dict para gerar ID novo."""
+    base = new_wp_dict(
+        data.get("name", "WP"),
+        float(data.get("lat", 0.0)),
+        float(data.get("lon", 0.0)),
+        float(data.get("alt", 0.0)),
+    )
+    base["stop_min"]  = float(data.get("stop_min", 0.0))
+    base["wind_from"] = int(data.get("wind_from", st.session_state.wind_from))
+    base["wind_kt"]   = int(data.get("wind_kt",   st.session_state.wind_kt))
+    base["vor_pref"]  = data.get("vor_pref", "AUTO")
+    base["vor_ident"] = data.get("vor_ident", "")
+    return base
+
+def load_routes_from_gist():
+    token, gist_id = _get_gist_credentials()
+    if not token or not gist_id:
+        st.warning("GITHUB_TOKEN ou ROUTES_GIST_ID não configurados. Rotas padrão desativadas.")
+        return {}
+
+    try:
+        r = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}"}
+        )
+        if r.status_code != 200:
+            st.warning(f"Não foi possível ler o Gist ({r.status_code}).")
+            return {}
+        data = r.json()
+        files = data.get("files", {})
+        if "routes.json" not in files:
+            return {}
+        content = files["routes.json"]["content"]
+        return json.loads(content or "{}")
+    except Exception as e:
+        st.warning(f"Erro ao ler Gist: {e}")
+        return {}
+
+def save_routes_to_gist(routes_dict: dict):
+    token, gist_id = _get_gist_credentials()
+    if not token or not gist_id:
+        st.warning("GITHUB_TOKEN ou ROUTES_GIST_ID não configurados. Não foi possível gravar.")
+        return
+
+    try:
+        payload = {
+            "files": {
+                "routes.json": {
+                    "content": json.dumps(routes_dict, indent=2)
+                }
+            }
+        }
+        r = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}"},
+            json=payload
+        )
+        if r.status_code not in (200, 201):
+            st.error(f"Erro ao gravar no Gist ({r.status_code}): {r.text}")
+        else:
+            st.success("Rotas padrão atualizadas no Gist.")
+    except Exception as e:
+        st.error(f"Erro ao gravar Gist: {e}")
+
 # ========= ABAS =========
 tab_csv, tab_map, tab_fpl = st.tabs(["🔎 Pesquisar CSV", "🗺️ Adicionar no mapa", "✈️ Flight Plan"])
 
@@ -861,6 +961,56 @@ with st.expander("🛡 Espaço aéreo / restrições"):
         help="Seleciona p/ mostrar no mapa (ex.: LPT1, LPT61...)."
     )
     st.caption("Nota: áreas novas ad-hoc agora só via código.")
+
+st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+
+# ========= ROTAS PADRÃO UI =========
+with st.expander("📁 Rotas padrão (Gist)", expanded=False):
+    # carregar do Gist quando abrimos este expander
+    if not st.session_state.saved_routes:
+        st.session_state.saved_routes = load_routes_from_gist()
+
+    routes = st.session_state.saved_routes
+    existing_names = sorted(routes.keys())
+
+    cR1, cR2 = st.columns([2,2])
+    with cR1:
+        new_route_name = st.text_input("Nome para guardar rota atual", "")
+        if st.button("💾 Guardar rota atual", use_container_width=True):
+            if not st.session_state.wps:
+                st.warning("Não há WPs na rota atual.")
+            elif not new_route_name.strip():
+                st.warning("Dá um nome à rota.")
+            else:
+                key = new_route_name.strip()
+                routes[key] = [
+                    _serialize_wp_for_route(w) for w in st.session_state.wps
+                ]
+                st.session_state.saved_routes = routes
+                save_routes_to_gist(routes)
+
+    with cR2:
+        if existing_names:
+            chosen = st.selectbox("Carregar rota guardada", existing_names)
+            load_btn = st.button("📥 Carregar rota selecionada", use_container_width=True)
+            if load_btn and chosen:
+                data = routes.get(chosen, [])
+                st.session_state.wps = [
+                    _deserialize_wp_for_route(d) for d in data
+                ]
+                st.success(f"Rota «{chosen}» carregada ({len(st.session_state.wps)} WPs).")
+        else:
+            st.info("Ainda não tens rotas guardadas no Gist.")
+
+    # opcional: apagar rota
+    if existing_names:
+        st.markdown("---")
+        del_name = st.selectbox("Apagar rota", ["(nenhuma)"] + existing_names)
+        if del_name != "(nenhuma)" and st.button("🗑 Apagar rota", use_container_width=True):
+            routes.pop(del_name, None)
+            st.session_state.saved_routes = routes
+            save_routes_to_gist(routes)
+            st.success(f"Rota «{del_name}» apagada.")
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
@@ -1064,7 +1214,7 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
     if len(nodes) < 2:
         return legs
 
-    base_time = None
+    base_time = None    # início do cronómetro (15 min após off-blocks)
     if st.session_state.start_clock.strip():
         try:
             h,m = map(int, st.session_state.start_clock.split(":"))
@@ -1976,17 +2126,133 @@ def _build_payload_cont(all_legs, start_idx, *, alt_info=None, alt_choice=None):
         })
     return d
 
+# ========= LEGS BRIEFING (TABELA / PDF) =========
+
+def _leg_altitude_profile_str(A, B):
+    a1 = int(round(A["alt"]))
+    a2 = int(round(B["alt"]))
+    if a2 > a1:
+        trend = "SUBIDA"
+    elif a2 < a1:
+        trend = "DESCIDA"
+    else:
+        trend = "MANTER"
+    return f"{a1} -> {a2} ({trend})"
+
+def build_leg_briefing_rows(legs):
+    rows = []
+    for idx, L in enumerate(legs, start=1):
+        A, B = L["A"], L["B"]
+
+        # radial / VOR
+        vor = None
+        radial_str = ""
+        vor_str = ""
+        try:
+            vor = _choose_vor_for_point(B)
+            if vor:
+                vor_str = fmt_ident_with_freq(vor)
+                radial_str = fmt_radial_distance_from(vor, B["lat"], B["lon"])
+        except Exception:
+            pass
+
+        rows.append({
+            "Leg": idx,
+            "From": A["name"],
+            "To": B["name"],
+            "MH": f"{int(round(L['MH'])):03d}",
+            "TC": f"{int(round(L['TC'])):03d}",
+            "VOR": vor_str,
+            "Radial/Dist": radial_str,
+            "Tempo": _pdf_mmss(L["time_sec"]),
+            "Alt": _leg_altitude_profile_str(A, B),
+            "Profile": L["profile"],
+        })
+    return rows
+
+def generate_legs_briefing_pdf(path: str, rows):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+    except ImportError:
+        st.error("reportlab não está instalado. Instala 'reportlab' para gerar o briefing em PDF.")
+        return None
+
+    c = canvas.Canvas(path, pagesize=A4)
+    width, height = A4
+
+    x_margin = 15 * mm
+    y = height - 20 * mm
+
+    title = "Route briefing (legs)"
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x_margin, y, title)
+    y -= 10 * mm
+
+    # Cabeçalho da tabela
+    headers = ["Leg", "From", "To", "MH", "TC", "VOR", "Radial/Dist", "Tempo", "Alt", "Profile"]
+    col_widths = [12*mm, 28*mm, 28*mm, 12*mm, 12*mm, 28*mm, 28*mm, 18*mm, 30*mm, 20*mm]
+
+    c.setFont("Helvetica-Bold", 8)
+    x = x_margin
+    for h, w in zip(headers, col_widths):
+        c.drawString(x, y, h)
+        x += w
+    y -= 6 * mm
+    c.line(x_margin, y+2*mm, x_margin + sum(col_widths), y+2*mm)
+
+    # Linhas
+    c.setFont("Helvetica", 7)
+    for row in rows:
+        if y < 20 * mm:
+            c.showPage()
+            y = height - 20 * mm
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(x_margin, y, title + " (cont.)")
+            y -= 10 * mm
+            c.setFont("Helvetica-Bold", 8)
+            x = x_margin
+            for h, w in zip(headers, col_widths):
+                c.drawString(x, y, h)
+                x += w
+            y -= 6 * mm
+            c.line(x_margin, y+2*mm, x_margin + sum(col_widths), y+2*mm)
+            c.setFont("Helvetica", 7)
+
+        x = x_margin
+        vals = [
+            row["Leg"],
+            row["From"],
+            row["To"],
+            row["MH"],
+            row["TC"],
+            row["VOR"],
+            row["Radial/Dist"],
+            row["Tempo"],
+            row["Alt"],
+            row["Profile"],
+        ]
+        for val, w in zip(vals, col_widths):
+            c.drawString(x, y, str(val))
+            x += w
+        y -= 5 * mm
+
+    c.save()
+    return path
+
 # ========= BOTÕES PDF =========
 cX, cY = st.columns([1,1])
 with cX:
     make_pdfs = st.button("Gerar PDF(s) NAVLOG", type="primary", use_container_width=True)
 with cY:
-    st.caption("Principal até 22 legs; continuação se exceder.")
+    st.caption("Principal até 22 legs; continuação se exceder + briefing por leg.")
 
 if make_pdfs:
     if not st.session_state.legs:
         st.error("Gera primeiro a rota.")
     else:
+        # NAVLOG principal
         d_main = _build_payloads_main(
             st.session_state.legs,
             callsign=callsign,
@@ -2011,6 +2277,7 @@ if make_pdfs:
                 use_container_width=True
             )
 
+        # NAVLOG continuação, se necessário
         if len(st.session_state.legs) > 22:
             d_cont = _build_payload_cont(
                 st.session_state.legs,
@@ -2027,3 +2294,28 @@ if make_pdfs:
                     use_container_width=True
                 )
 
+        # 🔹 NOVO: briefing por leg
+        rows = build_leg_briefing_rows(st.session_state.legs)
+
+        st.markdown("### 📋 Leg briefing")
+        st.dataframe(pd.DataFrame(rows))
+
+        # tenta gerar PDF (se reportlab existir)
+        briefing_pdf_path = generate_legs_briefing_pdf("NAVLOG_LEGS_BRIEFING.pdf", rows)
+        if briefing_pdf_path:
+            with open(briefing_pdf_path, "rb") as f:
+                st.download_button(
+                    "⬇️ Briefing por leg (PDF)",
+                    f.read(),
+                    file_name="NAVLOG_LEGS_BRIEFING.pdf",
+                    use_container_width=True
+                )
+        else:
+            # fallback: CSV
+            csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Briefing por leg (CSV)",
+                csv_bytes,
+                file_name="NAVLOG_LEGS_BRIEFING.csv",
+                use_container_width=True
+            )
