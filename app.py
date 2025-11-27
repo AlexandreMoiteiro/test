@@ -1,19 +1,10 @@
-# app_navlog_rev41_minutos_routes_briefing.py
+# app_navlog_rev42_rotas_skeleton.py
 # ---------------------------------------------------------------
-# - Remoção de VOR manual por WP (fica só VOR em massa)
-# - VOR em massa: escolhes 1 VOR e aplicas a vários WPs de uma vez
-# - Se não aplicares nada, fica AUTO (VOR mais próximo) por defeito
-# - ETO deixa de ser preenchido no PDF (campo em branco)
-# - Labels do mapa deixam de mostrar ETO (mostram só EFOB)
-# - Tempos arredondados AO MINUTO (60 s)
-# - Combustível arredondado à UNIDADE (1 L)
-# - Rasquete Bridge adicionado à base de dados de pesquisa
-# - Permite mudar a ordem dos WPs com botões ↑ / ↓
-# - NÃO acrescenta “#2” quando repetes o nome de um WP
-# - NÃO coloca VOR nos TOC/TOD no PDF
-# - Mantido: TOC/TOD, STOP, doghouses, overlay openAIP, filtro de pernas, 2.ª página PDF
-# - NOVO: Rotas padrão em Gist (guardar / carregar / apagar)
-# - NOVO: Briefing extra por leg (PDF/CSV) com From/To, MH, TC, radial, tempo, altitudes
+# - Rotas padrão: podes guardar/carregar rotas (só esqueleto) num Gist
+# - Esqueleto da rota: guarda só WPs, altitudes, STOPs e VOR fixos
+#   (NÃO guarda vento nem tempos → são sempre calculados no dia)
+# - Exporta também um CSV de esqueleto de pernas (FROM, TO, TC, MH, dist, alt, perfil, radial)
+# - Mantido: tudo o resto (NAVLOG, TOC/TOD, STOP, doghouses, overlay openAIP, etc.)
 # ---------------------------------------------------------------
 
 import streamlit as st
@@ -23,6 +14,8 @@ from streamlit_folium import st_folium
 from folium.plugins import Fullscreen, MarkerCluster
 from math import degrees
 from pdfrw import PdfReader, PdfWriter, PdfDict, PdfName
+
+GITHUB_API = "https://api.github.com"
 
 # ========= CONSTANTES =========
 TEMPLATE_MAIN = "NAVLOG_FORM.pdf"
@@ -341,7 +334,7 @@ def dest_point(lat, lon, bearing_deg, dist_nm):
 
 def point_along_gc(lat1, lon1, lat2, lon2, dist_from_start_nm):
     total = gc_dist_nm(lat1, lon1, lat2, lon2)
-    if total <= 0: return (lat1, lon1)
+    if total <= 0: return lat1, lon1
     tc0 = gc_course_tc(lat1, lon1, lat2, lon2)
     return dest_point(lat1, lon1, tc0, dist_from_start_nm)
 
@@ -427,8 +420,11 @@ ens("preset_selected", [])
 ens("use_leg_filter", False)
 ens("leg_filter_ids", [])
 
-# NOVO: rotas padrão em Gist
-ens("saved_routes", {})
+# rotas padrão / Gist
+ens("saved_routes", [])          # lista de dicts {"name":..., "wps":[...]}
+ens("selected_route_name", "")
+ens("gist_token", "")
+ens("gist_id", "")
 
 # ========= FORM GLOBAL =========
 with st.form("globals"):
@@ -611,7 +607,6 @@ if st.session_state.db_points is None:
         "code": "RASQ",
         "name": "RASQUETE BRIDGE",
         "sector": "Montargil / Barragem de Montargil",
-        # Coordenadas aproximadas — ajusta se tiveres as oficiais
         "lat": 39.0538,
         "lon": -8.1762,
         "alt": 0.0,
@@ -704,7 +699,7 @@ def ensure_wp_ids():
 ensure_wp_ids()
 
 def make_unique_name(name: str) -> str:
-    # agora não acrescenta “#2”, “#3”… deixa o nome exatamente como foi escrito
+    # não acrescenta “#2” – deixa o nome como foi escrito
     return str(name)
 
 def new_wp_dict(name, lat, lon, alt, src=None):
@@ -722,7 +717,6 @@ def new_wp_dict(name, lat, lon, alt, src=None):
         "vor_pref":  "AUTO",
         "vor_ident": "",
     }
-    # se adicionas um VOR como WP, esse WP fica FIXED a esse VOR
     if src == "VOR":
         base["vor_pref"] = "FIXED"
         base["vor_ident"] = str(name).upper()
@@ -731,38 +725,21 @@ def new_wp_dict(name, lat, lon, alt, src=None):
 def append_wp(name, lat, lon, alt, src=None):
     st.session_state.wps.append(new_wp_dict(name, lat, lon, alt, src))
 
-# ========= ROTAS PADRÃO (GIST) =========
-
-def _get_gist_credentials():
-    # tenta first st.secrets, depois os.getenv
-    token = (
-        getattr(st, "secrets", {}).get("GITHUB_TOKEN")
-        if hasattr(st, "secrets") else None
-    ) or os.getenv("GITHUB_TOKEN")
-
-    gist_id = (
-        getattr(st, "secrets", {}).get("ROUTES_GIST_ID")
-        if hasattr(st, "secrets") else None
-    ) or os.getenv("ROUTES_GIST_ID")
-
-    return token, gist_id
-
+# ========= helpers Rotas padrão (só esqueleto) =========
 def _serialize_wp_for_route(wp: dict) -> dict:
-    """Só guardo o que é preciso para reconstruir a rota."""
+    """Só guarda o esqueleto da rota (sem vento/tempos)."""
     return {
         "name": wp["name"],
         "lat":  float(wp["lat"]),
         "lon":  float(wp["lon"]),
         "alt":  float(wp["alt"]),
         "stop_min": float(wp.get("stop_min", 0.0)),
-        "wind_from": int(wp.get("wind_from", st.session_state.wind_from)),
-        "wind_kt":   int(wp.get("wind_kt",   st.session_state.wind_kt)),
         "vor_pref":  wp.get("vor_pref", "AUTO"),
         "vor_ident": wp.get("vor_ident", ""),
     }
 
 def _deserialize_wp_for_route(data: dict) -> dict:
-    """Reconstrói o WP usando new_wp_dict para gerar ID novo."""
+    """Reconstrói o WP; vento será SEMPRE o global definido no dia."""
     base = new_wp_dict(
         data.get("name", "WP"),
         float(data.get("lat", 0.0)),
@@ -770,61 +747,65 @@ def _deserialize_wp_for_route(data: dict) -> dict:
         float(data.get("alt", 0.0)),
     )
     base["stop_min"]  = float(data.get("stop_min", 0.0))
-    base["wind_from"] = int(data.get("wind_from", st.session_state.wind_from))
-    base["wind_kt"]   = int(data.get("wind_kt",   st.session_state.wind_kt))
+    base["wind_from"] = int(st.session_state.wind_from)
+    base["wind_kt"]   = int(st.session_state.wind_kt)
     base["vor_pref"]  = data.get("vor_pref", "AUTO")
     base["vor_ident"] = data.get("vor_ident", "")
     return base
 
-def load_routes_from_gist():
-    token, gist_id = _get_gist_credentials()
-    if not token or not gist_id:
-        st.warning("GITHUB_TOKEN ou ROUTES_GIST_ID não configurados. Rotas padrão desativadas.")
-        return {}
+def _find_route_by_name(routes, name):
+    for r in routes:
+        if r.get("name") == name:
+            return r
+    return None
 
+def _load_routes_from_gist(token: str, gist_id: str):
+    if not gist_id:
+        return None, "Gist ID em falta."
     try:
-        r = requests.get(
-            f"https://api.github.com/gists/{gist_id}",
-            headers={"Authorization": f"token {token}"}
-        )
+        headers = {}
+        if token.strip():
+            headers["Authorization"] = f"token {token.strip()}"
+        r = requests.get(f"{GITHUB_API}/gists/{gist_id}", headers=headers, timeout=10)
         if r.status_code != 200:
-            st.warning(f"Não foi possível ler o Gist ({r.status_code}).")
-            return {}
+            return None, f"Erro HTTP {r.status_code} ao ler Gist."
         data = r.json()
-        files = data.get("files", {})
-        if "routes.json" not in files:
-            return {}
-        content = files["routes.json"]["content"]
-        return json.loads(content or "{}")
+        files = data.get("files") or {}
+        if not files:
+            return [], "Gist sem ficheiros; assume lista vazia."
+        first_file = next(iter(files.values()))
+        content = first_file.get("content", "") or ""
+        try:
+            obj = json.loads(content)
+        except Exception:
+            return None, "Conteúdo do Gist não é JSON válido."
+        routes = obj.get("routes", [])
+        if not isinstance(routes, list):
+            return None, "Formato inesperado (esperava 'routes': [...])."
+        return routes, None
     except Exception as e:
-        st.warning(f"Erro ao ler Gist: {e}")
-        return {}
+        return None, f"Exceção ao ler Gist: {e}"
 
-def save_routes_to_gist(routes_dict: dict):
-    token, gist_id = _get_gist_credentials()
-    if not token or not gist_id:
-        st.warning("GITHUB_TOKEN ou ROUTES_GIST_ID não configurados. Não foi possível gravar.")
-        return
-
+def _save_routes_to_gist(token: str, gist_id: str, routes):
+    if not gist_id:
+        return False, "Gist ID em falta."
     try:
+        headers = {"Accept": "application/vnd.github+json"}
+        if token.strip():
+            headers["Authorization"] = f"token {token.strip()}"
         payload = {
             "files": {
                 "routes.json": {
-                    "content": json.dumps(routes_dict, indent=2)
+                    "content": json.dumps({"routes": routes}, indent=2, ensure_ascii=False)
                 }
             }
         }
-        r = requests.patch(
-            f"https://api.github.com/gists/{gist_id}",
-            headers={"Authorization": f"token {token}"},
-            json=payload
-        )
-        if r.status_code not in (200, 201):
-            st.error(f"Erro ao gravar no Gist ({r.status_code}): {r.text}")
-        else:
-            st.success("Rotas padrão atualizadas no Gist.")
+        r = requests.patch(f"{GITHUB_API}/gists/{gist_id}", headers=headers, data=json.dumps(payload), timeout=10)
+        if r.status_code not in (200,201):
+            return False, f"Erro HTTP {r.status_code} ao gravar Gist."
+        return True, None
     except Exception as e:
-        st.error(f"Erro ao gravar Gist: {e}")
+        return False, f"Exceção ao gravar Gist: {e}"
 
 # ========= ABAS =========
 tab_csv, tab_map, tab_fpl = st.tabs(["🔎 Pesquisar CSV", "🗺️ Adicionar no mapa", "✈️ Flight Plan"])
@@ -964,56 +945,6 @@ with st.expander("🛡 Espaço aéreo / restrições"):
 
 st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
 
-# ========= ROTAS PADRÃO UI =========
-with st.expander("📁 Rotas padrão (Gist)", expanded=False):
-    # carregar do Gist quando abrimos este expander
-    if not st.session_state.saved_routes:
-        st.session_state.saved_routes = load_routes_from_gist()
-
-    routes = st.session_state.saved_routes
-    existing_names = sorted(routes.keys())
-
-    cR1, cR2 = st.columns([2,2])
-    with cR1:
-        new_route_name = st.text_input("Nome para guardar rota atual", "")
-        if st.button("💾 Guardar rota atual", use_container_width=True):
-            if not st.session_state.wps:
-                st.warning("Não há WPs na rota atual.")
-            elif not new_route_name.strip():
-                st.warning("Dá um nome à rota.")
-            else:
-                key = new_route_name.strip()
-                routes[key] = [
-                    _serialize_wp_for_route(w) for w in st.session_state.wps
-                ]
-                st.session_state.saved_routes = routes
-                save_routes_to_gist(routes)
-
-    with cR2:
-        if existing_names:
-            chosen = st.selectbox("Carregar rota guardada", existing_names)
-            load_btn = st.button("📥 Carregar rota selecionada", use_container_width=True)
-            if load_btn and chosen:
-                data = routes.get(chosen, [])
-                st.session_state.wps = [
-                    _deserialize_wp_for_route(d) for d in data
-                ]
-                st.success(f"Rota «{chosen}» carregada ({len(st.session_state.wps)} WPs).")
-        else:
-            st.info("Ainda não tens rotas guardadas no Gist.")
-
-    # opcional: apagar rota
-    if existing_names:
-        st.markdown("---")
-        del_name = st.selectbox("Apagar rota", ["(nenhuma)"] + existing_names)
-        if del_name != "(nenhuma)" and st.button("🗑 Apagar rota", use_container_width=True):
-            routes.pop(del_name, None)
-            st.session_state.saved_routes = routes
-            save_routes_to_gist(routes)
-            st.success(f"Rota «{del_name}» apagada.")
-
-st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
-
 # ========= EDITOR WPs =========
 ensure_wp_ids()
 remove_id = None
@@ -1034,10 +965,8 @@ if st.session_state.wps:
             with c4:
                 alt  = st.number_input(f"Alt (ft) — WP{i+1}", 0.0, 18000.0, float(w["alt"]), step=50.0, key=f"wpalt_{w['id']}")
 
-            # STOP / touch-and-go
             stop_min = st.number_input(f"STOP neste WP (min)", 0.0, 60.0, float(w.get("stop_min", 0.0)), step=0.5, key=f"wpstop_{w['id']}")
 
-            # vento por WP (se não usar global)
             if not st.session_state.use_global_wind:
                 c5,c6 = st.columns(2)
                 with c5:
@@ -1048,7 +977,6 @@ if st.session_state.wps:
                 wind_from_i = w.get("wind_from", st.session_state.wind_from)
                 wind_kt_i   = w.get("wind_kt",   st.session_state.wind_kt)
 
-            # guardar (sem UI de VOR — fica tudo por VOR em massa)
             st.session_state.wps[i] = {
                 "id": w["id"],
                 "name":name,
@@ -1088,11 +1016,96 @@ if move_down_id is not None:
 if remove_id is not None:
     st.session_state.wps = [w for w in st.session_state.wps if w["id"] != remove_id]
 
+# ========= ROTAS PADRÃO (GIST / ESQUELETO) =========
+st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+with st.expander("📚 Rotas padrão (Gist / esqueleto sem vento/tempo)", expanded=False):
+    cgt1, cgt2 = st.columns([2,2])
+    with cgt1:
+        st.session_state.gist_token = st.text_input(
+            "GitHub token (PAT) p/ Gist (opcional)",
+            st.session_state.gist_token,
+            type="password",
+            help="Usado para ler/gravar no Gist. Se deixares vazio, só Gists públicos."
+        )
+    with cgt2:
+        st.session_state.gist_id = st.text_input(
+            "Gist ID (onde ficam as rotas)",
+            st.session_state.gist_id,
+            help="Cria um Gist manualmente e cola aqui o ID (ex.: a1b2c3d4...)."
+        )
+
+    cc1, cc2 = st.columns([1,1])
+    with cc1:
+        if st.button("⬆️ Carregar rotas do Gist"):
+            routes, err = _load_routes_from_gist(st.session_state.gist_token, st.session_state.gist_id)
+            if err:
+                st.error(err)
+            else:
+                st.session_state.saved_routes = routes
+                st.success(f"{len(routes)} rotas carregadas do Gist.")
+    with cc2:
+        if st.button("💻 Enviar rotas atuais para o Gist"):
+            ok, err = _save_routes_to_gist(st.session_state.gist_token, st.session_state.gist_id, st.session_state.saved_routes)
+            if ok:
+                st.success("Rotas gravadas no Gist.")
+            else:
+                st.error(err)
+
+    st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+
+    cr1, cr2 = st.columns([3,1])
+    with cr1:
+        default_name = st.session_state.selected_route_name or ""
+        new_route_name = st.text_input("Nome da rota atual para guardar", default_name)
+    with cr2:
+        if st.button("💾 Guardar rota atual (só esqueleto)"):
+            if not st.session_state.wps or len(st.session_state.wps) < 2:
+                st.warning("Precisas de pelo menos 2 WPs para guardar uma rota.")
+            else:
+                nm = new_route_name.strip() or f"Rota {len(st.session_state.saved_routes)+1}"
+                route_wps = [_serialize_wp_for_route(w) for w in st.session_state.wps]
+                existing = _find_route_by_name(st.session_state.saved_routes, nm)
+                if existing:
+                    existing["wps"] = route_wps
+                else:
+                    st.session_state.saved_routes.append({"name": nm, "wps": route_wps})
+                st.session_state.selected_route_name = nm
+                st.success(f"Rota '{nm}' guardada localmente (sessão atual). Usa o botão do Gist para sincronizar.")
+
+    if st.session_state.saved_routes:
+        names = [r.get("name","(sem nome)") for r in st.session_state.saved_routes]
+        try:
+            idx_sel = names.index(st.session_state.selected_route_name) if st.session_state.selected_route_name in names else 0
+        except ValueError:
+            idx_sel = 0
+        sel_name = st.selectbox("Rotas guardadas", names, index=idx_sel)
+        st.session_state.selected_route_name = sel_name
+
+        ca1, ca2 = st.columns([1,1])
+        with ca1:
+            if st.button("📥 Carregar rota selecionada (substitui WPs atuais)"):
+                r = _find_route_by_name(st.session_state.saved_routes, sel_name)
+                if not r:
+                    st.error("Rota não encontrada.")
+                else:
+                    st.session_state.wps = [_deserialize_wp_for_route(wd) for wd in r.get("wps",[])]
+                    ensure_wp_ids()
+                    st.session_state.route_nodes = []
+                    st.session_state.legs = []
+                    st.success(f"Rota '{sel_name}' carregada. Agora define vento/var e carrega em «Gerar/Atualizar rota».")
+        with ca2:
+            if st.button("🗑️ Apagar rota selecionada da memória"):
+                st.session_state.saved_routes = [r for r in st.session_state.saved_routes if r.get("name") != sel_name]
+                if st.session_state.selected_route_name == sel_name:
+                    st.session_state.selected_route_name = ""
+                st.success("Rota removida da lista local. Não te esqueças de atualizar o Gist se quiseres refletir isto lá.")
+
+st.markdown("<div class='sep'></div>", unsafe_allow_html=True)
+
 # ========= VOR EM MASSA =========
 if st.session_state.wps:
     with st.expander("📡 VOR em massa para vários WPs", expanded=False):
         st.caption("Escolhe um VOR e aplica a uma série de pontos. Se escolheres AUTO, esses pontos passam a usar o VOR mais próximo.")
-        # lista de WPs
         wp_labels = [f"{i+1:02d} — {w['name']}" for i, w in enumerate(st.session_state.wps)]
         selected_wps = st.multiselect(
             "WPs a afetar",
@@ -1101,7 +1114,6 @@ if st.session_state.wps:
         )
         target_idx = [wp_labels.index(lbl) for lbl in selected_wps]
 
-        # lista de VORs
         vor_df_ui = st.session_state.vor_db
         vor_labels = [f"{row['ident']} — {row['name']} ({row['freq_mhz']:.2f})" for _, row in vor_df_ui.iterrows()]
         vor_idents = [str(row['ident']) for _, row in vor_df_ui.iterrows()]
@@ -1115,7 +1127,6 @@ if st.session_state.wps:
                 st.warning("Seleciona pelo menos um WP.")
             else:
                 if vor_choice.startswith("AUTO"):
-                    # volta tudo a AUTO
                     for i in target_idx:
                         st.session_state.wps[i]["vor_pref"] = "AUTO"
                         st.session_state.wps[i]["vor_ident"] = ""
@@ -1128,7 +1139,6 @@ if st.session_state.wps:
                         st.session_state.wps[i]["vor_ident"] = ident
                     applied_txt = ident
 
-                # também atualiza route_nodes se já existirem (TOC/TOD mantêm AUTO)
                 if st.session_state.route_nodes:
                     for node in st.session_state.route_nodes:
                         for i, w in enumerate(st.session_state.wps):
@@ -1163,7 +1173,6 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
         dist = gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"])
         _, _, gs_cl = wind_triangle(tc, CLIMB_TAS,   A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
         _, _, gs_de = wind_triangle(tc, DESCENT_TAS, A.get("wind_from", wind_from), A.get("wind_kt", wind_kt))
-        # TOC
         if B["alt"] > A["alt"]:
             dh = B["alt"] - A["alt"]
             t_need = dh / max(roc_fpm, 1.0)
@@ -1180,7 +1189,6 @@ def build_route_nodes(user_wps, wind_from, wind_kt, roc_fpm, rod_fpm):
                     "vor_pref":  "AUTO",
                     "vor_ident": "",
                 })
-        # TOD
         elif B["alt"] < A["alt"]:
             dh = A["alt"] - B["alt"]
             t_need = dh / max(rod_fpm, 1.0)
@@ -1214,7 +1222,7 @@ def build_legs_from_nodes(nodes, mag_var, mag_is_e, ck_every_min):
     if len(nodes) < 2:
         return legs
 
-    base_time = None    # início do cronómetro (15 min após off-blocks)
+    base_time = None
     if st.session_state.start_clock.strip():
         try:
             h,m = map(int, st.session_state.start_clock.split(":"))
@@ -1435,7 +1443,6 @@ def html_marker(m, lat, lon, html):
     ).add_to(m)
 
 def wp_label_html_rot(g, scale: float, angle_tc: float):
-    # agora só mostra EFOB, sem ETO
     rot = angle_tc - 90.0
     fs_name = int(14 * scale)
     fs_line = int(12 * scale)
@@ -1593,7 +1600,6 @@ def render_map(nodes, legs, base_choice):
 
     Fullscreen(position='topleft', title='Fullscreen', force_separate_button=True).add_to(m)
 
-    # PERNAS
     for L in legs:
         if L["profile"] == "STOP":
             continue
@@ -1602,7 +1608,6 @@ def render_map(nodes, legs, base_choice):
         folium.PolyLine(latlngs, color="#ffffff", weight=10, opacity=1.0).add_to(m)
         folium.PolyLine(latlngs, color=color, weight=4, opacity=1.0).add_to(m)
 
-    # TICKS CP
     if st.session_state.show_ticks:
         for L in legs:
             if L["profile"] == "STOP":
@@ -1616,7 +1621,6 @@ def render_map(nodes, legs, base_choice):
                 rlat, rlon = dest_point(latm, lonm, L["TC"]+90, CP_TICK_HALF)
                 folium.PolyLine([(llat,llon),(rlat,rlon)], color="#111111", weight=3, opacity=1).add_to(m)
 
-    # DOGHOUSES
     if st.session_state.show_doghouses:
         def z_clear(lat, lon, zs):
             if not zs: return 9e9
@@ -1664,7 +1668,6 @@ def render_map(nodes, legs, base_choice):
             folium.PolyLine([(mid_lat, mid_lon), (anchor_lat, anchor_lon)], color="#000000", weight=2, opacity=1.0).add_to(m)
             html_marker(m, anchor_lat, anchor_lon, doghouse_html_capsule(info, L["profile"], L["TC"], scale=s))
 
-    # NÓS
     for N in nodes:
         html_marker(
             m, N["lat"], N["lon"],
@@ -1673,7 +1676,6 @@ def render_map(nodes, legs, base_choice):
             "box-shadow:0 2px 4px rgba(0,0,0,.3)'></div>"
         )
 
-    # INFO EFOB / ETO por nó (ETO não mostrado nas labels)
     info_nodes = [{"eto": None, "efob": None} for _ in nodes]
     if legs:
         info_nodes[0]["eto"]  = legs[0]["clock_start"]
@@ -1894,12 +1896,6 @@ if use_alt and alt_choice and st.session_state.wps:
 
 # ========= PDF helpers =========
 def _pdf_mmss(sec:int):
-    """
-    Formato para o PDF:
-    - Se < 60 min:  MM:00
-    - Se ≥ 60 min:  HHhMM
-    Tudo arredondado ao minuto mais próximo.
-    """
     total_minutes = int(round(float(sec) / 60.0))
     if total_minutes >= 60:
         hours, mins = divmod(total_minutes, 60)
@@ -1956,16 +1952,9 @@ def _compose_clock_after(total_sec, extra_sec):
     return f"T+{mmss(t)}"
 
 def _choose_vor_for_point(P):
-    """
-    - Se for TOC/TOD → NÃO usa VOR (fica vazio).
-    - Se o ponto disser FIXED, tenta usar vor_ident ou o próprio nome.
-    - Caso contrário AUTO → VOR mais próximo.
-    """
     nm = str(P.get("name","")).upper()
     if nm.startswith("TOC ") or nm.startswith("TOD "):
-        # não preencher VOR para TOC/TOD
         return None
-
     if P.get("vor_pref") == "FIXED":
         cand = (P.get("vor_ident") or P.get("name") or "").strip()
         v = get_vor_by_ident(cand)
@@ -1994,8 +1983,7 @@ def _fill_leg_line(d:dict, idx:int, L:dict, use_point:str, acc_d:float, acc_t:in
     d[f"{prefix}{idx:02d}_Cumulative_Distance"] = f"{acc_d:.1f}"
     d[f"{prefix}{idx:02d}_Leg_ETE"]             = _pdf_mmss(L["time_sec"])
     d[f"{prefix}{idx:02d}_Cumulative_ETE"]      = _pdf_mmss(acc_t)
-    # ETO fica em branco
-    d[f"{prefix}{idx:02d}_ETO"]                 = ""
+    d[f"{prefix}{idx:02d}_ETO"]                 = ""  # ETO em branco
     d[f"{prefix}{idx:02d}_Planned_Burnoff"]     = f"{L['burn']:.1f}"
     d[f"{prefix}{idx:02d}_Estimated_FOB"]       = f"{L['efob_end']:.1f}"
 
@@ -2078,7 +2066,7 @@ def _build_payloads_main(
             "Alternate_Cumulative_Distance":f"{alt_info['dist']:.1f}",
             "Alternate_Leg_ETE":_pdf_mmss(alt_info['ete']),
             "Alternate_Cumulative_ETE":_pdf_mmss(alt_info['ete']),
-            "Alternate_ETO":"",  # ETO em branco também no alternante
+            "Alternate_ETO":"",
             "Alternate_Planned_Burnoff":f"{alt_info['burn']:.1f}",
             "Alternate_Estimated_FOB":f"{rfuel05(legs[-1]['efob_end'] - alt_info['burn']):.1f}",
         })
@@ -2108,6 +2096,7 @@ def _build_payload_cont(all_legs, start_idx, *, alt_info=None, alt_choice=None):
 
     if alt_info and alt_choice:
         total_sec_before_chunk = sum(L["time_sec"] for L in all_legs[:start_idx+len(legs_chunk)])
+        _ = total_sec_before_chunk
         d.update({
             "Alternate_Airfield":alt_choice["name"],
             "Alternate_Elevation":str(int(alt_choice["elev"])),
@@ -2120,139 +2109,80 @@ def _build_payload_cont(all_legs, start_idx, *, alt_info=None, alt_choice=None):
             "Alternate_Cumulative_Distance":f"{alt_info['dist']:.1f}",
             "Alternate_Leg_ETE":_pdf_mmss(alt_info['ete']),
             "Alternate_Cumulative_ETE":_pdf_mmss(alt_info['ete']),
-            "Alternate_ETO":"",  # em branco também na continuação
+            "Alternate_ETO":"",
             "Alternate_Planned_Burnoff":f"{alt_info['burn']:.1f}",
             "Alternate_Estimated_FOB":f"{rfuel05(all_legs[start_idx+len(legs_chunk)-1]['efob_end'] - alt_info['burn']):.1f}",
         })
     return d
 
-# ========= LEGS BRIEFING (TABELA / PDF) =========
-
-def _leg_altitude_profile_str(A, B):
-    a1 = int(round(A["alt"]))
-    a2 = int(round(B["alt"]))
-    if a2 > a1:
-        trend = "SUBIDA"
-    elif a2 < a1:
-        trend = "DESCIDA"
-    else:
-        trend = "MANTER"
-    return f"{a1} -> {a2} ({trend})"
-
-def build_leg_briefing_rows(legs):
-    rows = []
-    for idx, L in enumerate(legs, start=1):
-        A, B = L["A"], L["B"]
-
-        # radial / VOR
-        vor = None
-        radial_str = ""
-        vor_str = ""
-        try:
-            vor = _choose_vor_for_point(B)
-            if vor:
-                vor_str = fmt_ident_with_freq(vor)
-                radial_str = fmt_radial_distance_from(vor, B["lat"], B["lon"])
-        except Exception:
-            pass
-
-        rows.append({
-            "Leg": idx,
-            "From": A["name"],
-            "To": B["name"],
-            "MH": f"{int(round(L['MH'])):03d}",
-            "TC": f"{int(round(L['TC'])):03d}",
-            "VOR": vor_str,
-            "Radial/Dist": radial_str,
-            "Tempo": _pdf_mmss(L["time_sec"]),
-            "Alt": _leg_altitude_profile_str(A, B),
-            "Profile": L["profile"],
-        })
-    return rows
-
-def generate_legs_briefing_pdf(path: str, rows):
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import mm
-    except ImportError:
-        st.error("reportlab não está instalado. Instala 'reportlab' para gerar o briefing em PDF.")
+# ========= EXPORT ESQUELETO (CSV) =========
+def _export_skeleton_legs_from_wps(wps):
+    """Esqueleto de pernas baseado APENAS em WPs (sem vento/tempos)."""
+    if len(wps) < 2:
         return None
-
-    c = canvas.Canvas(path, pagesize=A4)
-    width, height = A4
-
-    x_margin = 15 * mm
-    y = height - 20 * mm
-
-    title = "Route briefing (legs)"
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x_margin, y, title)
-    y -= 10 * mm
-
-    # Cabeçalho da tabela
-    headers = ["Leg", "From", "To", "MH", "TC", "VOR", "Radial/Dist", "Tempo", "Alt", "Profile"]
-    col_widths = [12*mm, 28*mm, 28*mm, 12*mm, 12*mm, 28*mm, 28*mm, 18*mm, 30*mm, 20*mm]
-
-    c.setFont("Helvetica-Bold", 8)
-    x = x_margin
-    for h, w in zip(headers, col_widths):
-        c.drawString(x, y, h)
-        x += w
-    y -= 6 * mm
-    c.line(x_margin, y+2*mm, x_margin + sum(col_widths), y+2*mm)
-
-    # Linhas
-    c.setFont("Helvetica", 7)
-    for row in rows:
-        if y < 20 * mm:
-            c.showPage()
-            y = height - 20 * mm
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(x_margin, y, title + " (cont.)")
-            y -= 10 * mm
-            c.setFont("Helvetica-Bold", 8)
-            x = x_margin
-            for h, w in zip(headers, col_widths):
-                c.drawString(x, y, h)
-                x += w
-            y -= 6 * mm
-            c.line(x_margin, y+2*mm, x_margin + sum(col_widths), y+2*mm)
-            c.setFont("Helvetica", 7)
-
-        x = x_margin
-        vals = [
-            row["Leg"],
-            row["From"],
-            row["To"],
-            row["MH"],
-            row["TC"],
-            row["VOR"],
-            row["Radial/Dist"],
-            row["Tempo"],
-            row["Alt"],
-            row["Profile"],
-        ]
-        for val, w in zip(vals, col_widths):
-            c.drawString(x, y, str(val))
-            x += w
-        y -= 5 * mm
-
-    c.save()
+    lines = []
+    lines.append("Leg;From;To;TC_deg;MH_deg;Dist_nm;Alt_from_ft;Alt_to_ft;Profile;Radial")
+    for i in range(len(wps)-1):
+        A = wps[i]
+        B = wps[i+1]
+        tc = gc_course_tc(A["lat"], A["lon"], B["lat"], B["lon"])
+        mh_no_wind = apply_var(tc, st.session_state.mag_var, st.session_state.mag_is_e)
+        dist = rdist05(gc_dist_nm(A["lat"], A["lon"], B["lat"], B["lon"]))
+        alt_from = int(round(A["alt"]))
+        alt_to   = int(round(B["alt"]))
+        if alt_to > alt_from:
+            profile = "CLIMB"
+        elif alt_to < alt_from:
+            profile = "DESCENT"
+        else:
+            profile = "LEVEL"
+        P_for_vor = {
+            "name": B["name"],
+            "lat":  B["lat"],
+            "lon":  B["lon"],
+            "vor_pref": B.get("vor_pref","AUTO"),
+            "vor_ident": B.get("vor_ident",""),
+        }
+        vor = _choose_vor_for_point(P_for_vor)
+        if vor:
+            radial_str = fmt_radial_distance_from(vor, B["lat"], B["lon"])
+        else:
+            radial_str = ""
+        lines.append(
+            f"{i+1:02d};{A['name']};{B['name']};"
+            f"{int(round(tc))%360:03d};{int(round(mh_no_wind))%360:03d};"
+            f"{dist:.1f};{alt_from};{alt_to};{profile};{radial_str}"
+        )
+    txt = "\n".join(lines)
+    path = "NAVLOG_SKELETON_LEGS.csv"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
     return path
 
-# ========= BOTÕES PDF =========
-cX, cY = st.columns([1,1])
+# ========= BOTÕES PDF / CSV =========
+cX, cY, cZ = st.columns([1,1,1])
 with cX:
     make_pdfs = st.button("Gerar PDF(s) NAVLOG", type="primary", use_container_width=True)
 with cY:
-    st.caption("Principal até 22 legs; continuação se exceder + briefing por leg.")
+    if len(st.session_state.wps) >= 2:
+        skel_path = _export_skeleton_legs_from_wps(st.session_state.wps)
+        if skel_path:
+            with open(skel_path, "rb") as f:
+                st.download_button(
+                    "⬇️ Esqueleto da rota (CSV)",
+                    f.read(),
+                    file_name="NAVLOG_SKELETON_LEGS.csv",
+                    use_container_width=True
+                )
+    else:
+        st.caption("Adiciona pelo menos 2 WPs para exportar o esqueleto da rota.")
+with cZ:
+    st.caption("CSV contém: FROM, TO, TC, MH (sem vento), dist, alt FROM/TO, perfil, radial.")
 
 if make_pdfs:
     if not st.session_state.legs:
         st.error("Gera primeiro a rota.")
     else:
-        # NAVLOG principal
         d_main = _build_payloads_main(
             st.session_state.legs,
             callsign=callsign,
@@ -2277,7 +2207,6 @@ if make_pdfs:
                 use_container_width=True
             )
 
-        # NAVLOG continuação, se necessário
         if len(st.session_state.legs) > 22:
             d_cont = _build_payload_cont(
                 st.session_state.legs,
@@ -2294,28 +2223,3 @@ if make_pdfs:
                     use_container_width=True
                 )
 
-        # 🔹 NOVO: briefing por leg
-        rows = build_leg_briefing_rows(st.session_state.legs)
-
-        st.markdown("### 📋 Leg briefing")
-        st.dataframe(pd.DataFrame(rows))
-
-        # tenta gerar PDF (se reportlab existir)
-        briefing_pdf_path = generate_legs_briefing_pdf("NAVLOG_LEGS_BRIEFING.pdf", rows)
-        if briefing_pdf_path:
-            with open(briefing_pdf_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Briefing por leg (PDF)",
-                    f.read(),
-                    file_name="NAVLOG_LEGS_BRIEFING.pdf",
-                    use_container_width=True
-                )
-        else:
-            # fallback: CSV
-            csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Briefing por leg (CSV)",
-                csv_bytes,
-                file_name="NAVLOG_LEGS_BRIEFING.csv",
-                use_container_width=True
-            )
