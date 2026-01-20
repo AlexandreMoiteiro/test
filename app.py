@@ -52,6 +52,20 @@ def max_streak_by_gap(times: np.ndarray, gap_s: float) -> int:
     return int(max(best, streak))
 
 
+def effective_elapsed(t0: float | None, finished_at: float | None, paused_total: float,
+                     paused: bool, pause_started_at: float | None) -> float:
+    if not t0:
+        return 0.0
+    end = finished_at if finished_at else now()
+    total = end - t0
+
+    extra_pause = 0.0
+    if paused and pause_started_at and not finished_at:
+        extra_pause = end - pause_started_at
+
+    return max(0.0, total - (paused_total + extra_pause))
+
+
 def build_df(t0: float, ok_times: list[float]) -> pd.DataFrame:
     if not ok_times or not t0:
         return pd.DataFrame(columns=["t", "dt", "elapsed_s"])
@@ -70,227 +84,18 @@ def per_minute_counts(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"minute": s.index.values, "oks": s.values})
 
 
-def effective_elapsed(t0: float, finished_at: float | None, paused_total: float, paused: bool, pause_started_at: float | None) -> float:
-    if not t0:
-        return 0.0
-    end = finished_at if finished_at else now()
-    total = end - t0
-
-    extra_pause = 0.0
-    if paused and pause_started_at and not finished_at:
-        extra_pause = end - pause_started_at
-
-    return max(0.0, total - (paused_total + extra_pause))
-
-
-# -----------------------------
-# State
-# -----------------------------
-def init_state():
-    ss = st.session_state
-    ss.setdefault("started", False)
-    ss.setdefault("finished", False)
-    ss.setdefault("paused", False)
-
-    ss.setdefault("t0", None)
-    ss.setdefault("finished_at", None)
-
-    ss.setdefault("pause_started_at", None)
-    ss.setdefault("paused_total", 0.0)
-
-    ss.setdefault("ok_times", [])
-
-    # Report computed only when finishing
-    ss.setdefault("report", None)
-
-init_state()
-ss = st.session_state
-
-
-# -----------------------------
-# Page config + CSS (UI bonita)
-# -----------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-
-st.markdown(
-    """
-<style>
-/* layout */
-.block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1200px; }
-h1 { margin-bottom: 0.25rem; }
-
-/* top badge */
-.badge {
-  display:inline-block; padding:6px 10px; border-radius:999px;
-  background: rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12);
-  font-size: 0.9rem;
-}
-
-/* KPI cards */
-.kpi {
-  padding: 16px 16px;
-  border-radius: 16px;
-  background: rgba(255,255,255,0.04);
-  border: 1px solid rgba(255,255,255,0.10);
-}
-.kpi .label { font-size: 0.85rem; opacity: 0.75; margin-bottom: 6px; }
-.kpi .value { font-size: 1.6rem; font-weight: 800; line-height: 1.1; }
-.kpi .sub { font-size: 0.85rem; opacity: 0.75; margin-top: 6px; }
-
-/* BIG OK button */
-div.stButton > button {
-  width: 100%;
-  height: 110px;
-  border-radius: 24px;
-  font-size: 40px;
-  font-weight: 800;
-  border: 1px solid rgba(255,255,255,0.18);
-}
-.okwrap {
-  padding: 18px;
-  border-radius: 22px;
-  background: radial-gradient(80% 120% at 20% 0%, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
-  border: 1px solid rgba(255,255,255,0.10);
-}
-
-/* subtle separators */
-hr { border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 1rem 0; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# -----------------------------
-# Header
-# -----------------------------
-left, right = st.columns([3, 2], vertical_alignment="center")
-with left:
-    st.title(APP_TITLE)
-    st.caption("Clica no botão sempre que alguém disser “ok”. No fim, gera um report com estatísticas e gráficos.")
-with right:
-    # show state badge
-    state = "Pronto"
-    if ss.started and not ss.finished and not ss.paused:
-        state = "A contar"
-    elif ss.paused and not ss.finished:
-        state = "Pausado"
-    elif ss.finished:
-        state = "Finalizado"
-    st.markdown(f"<span class='badge'>Estado: <b>{state}</b></span>", unsafe_allow_html=True)
-
-st.markdown("<hr/>", unsafe_allow_html=True)
-
-
-# -----------------------------
-# Sidebar Controls
-# -----------------------------
-with st.sidebar:
-    st.header("Sessão")
-
-    if not ss.started:
-        if st.button("▶️ Start", use_container_width=True):
-            ss.started = True
-            ss.finished = False
-            ss.paused = False
-            ss.t0 = now()
-            ss.finished_at = None
-            ss.pause_started_at = None
-            ss.paused_total = 0.0
-            ss.ok_times = []
-            ss.report = None
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            if not ss.finished:
-                if not ss.paused:
-                    if st.button("⏸️ Pause", use_container_width=True):
-                        ss.paused = True
-                        ss.pause_started_at = now()
-                else:
-                    if st.button("▶️ Resume", use_container_width=True):
-                        if ss.pause_started_at:
-                            ss.paused_total += now() - ss.pause_started_at
-                        ss.paused = False
-                        ss.pause_started_at = None
-        with c2:
-            if not ss.finished:
-                if st.button("⏹️ Finish", use_container_width=True):
-                    # close pause if needed
-                    if ss.paused and ss.pause_started_at:
-                        ss.paused_total += now() - ss.pause_started_at
-                        ss.paused = False
-                        ss.pause_started_at = None
-                    ss.finished = True
-                    ss.finished_at = now()
-
-    st.divider()
-    st.header("Métricas (report)")
-    streak_gap_s = st.slider("Streak (gap máx em s)", 1, 12, 3)
-    window_s = st.select_slider("Pico (janela em s)", options=[5, 10, 15, 20, 30, 45, 60], value=10)
-
-    st.divider()
-    if st.button("🧹 Reset total", use_container_width=True):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        st.rerun()
-
-
-# -----------------------------
-# Main live KPIs (lightweight)
-# -----------------------------
-elapsed = effective_elapsed(ss.t0, ss.finished_at, ss.paused_total, ss.paused, ss.pause_started_at)
-oks = len(ss.ok_times)
-rate = (oks / elapsed * 60) if elapsed > 0 else 0.0
-
-k1, k2, k3, k4 = st.columns(4)
-with k1:
-    st.markdown(f"<div class='kpi'><div class='label'>Tempo (sem pausas)</div><div class='value'>{fmt_duration(elapsed)}</div></div>", unsafe_allow_html=True)
-with k2:
-    st.markdown(f"<div class='kpi'><div class='label'>Total OK</div><div class='value'>{oks}</div></div>", unsafe_allow_html=True)
-with k3:
-    st.markdown(f"<div class='kpi'><div class='label'>Média</div><div class='value'>{rate:.2f}</div><div class='sub'>OK/min</div></div>", unsafe_allow_html=True)
-with k4:
-    last = "-"
-    if ss.ok_times:
-        last = pd.to_datetime(ss.ok_times[-1], unit="s").strftime("%H:%M:%S")
-    st.markdown(f"<div class='kpi'><div class='label'>Último OK</div><div class='value'>{last}</div></div>", unsafe_allow_html=True)
-
-st.markdown("<hr/>", unsafe_allow_html=True)
-
-
-# -----------------------------
-# BIG OK button (no st.rerun)
-# -----------------------------
-ok_disabled = (not ss.started) or ss.finished or ss.paused
-
-center = st.columns([1, 2, 1])[1]
-with center:
-    st.markdown("<div class='okwrap'>", unsafe_allow_html=True)
-    pressed = st.button("✅ OK", disabled=ok_disabled, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-if pressed:
-    ss.ok_times.append(now())
-    # Sem st.rerun(): o Streamlit vai reexecutar sozinho (inevitável),
-    # mas o script é leve e não recalcula gráficos pesados em cada clique.
-
-
-# -----------------------------
-# Report (compute ONLY after Finish, once)
-# -----------------------------
-def compute_report():
-    times = np.array(sorted(ss.ok_times), dtype=float)
-    duration_s = effective_elapsed(ss.t0, ss.finished_at, ss.paused_total, False, None)  # finished: no live pause
+def compute_report(t0: float, finished_at: float, paused_total: float, ok_times: list[float],
+                   window_s: float, streak_gap_s: float):
+    times = np.array(sorted(ok_times), dtype=float)
+    duration_s = max(0.0, (finished_at - t0) - paused_total)
     total = int(times.size)
     avg_per_min = (total / duration_s * 60) if duration_s > 0 else 0.0
 
-    df = build_df(ss.t0, ss.ok_times)
+    df = build_df(t0, ok_times)
 
     intervals = np.diff(times) if times.size >= 2 else np.array([])
     median_gap = float(np.median(intervals)) if intervals.size else np.nan
     p90_gap = float(np.percentile(intervals, 90)) if intervals.size else np.nan
-    min_gap = float(np.min(intervals)) if intervals.size else np.nan
 
     pm = per_minute_counts(df)
     peak_per_min = int(pm["oks"].max()) if not pm.empty else 0
@@ -299,7 +104,7 @@ def compute_report():
     peak_window = sliding_window_peak(times, float(window_s))
     max_streak = max_streak_by_gap(times, float(streak_gap_s))
 
-    # extra: peak in 10s buckets
+    # Extra: densidade por bloco de 10s
     peak_10s = 0
     if not df.empty:
         b10 = (df["elapsed_s"] // 10).astype(int)
@@ -312,7 +117,6 @@ def compute_report():
         "avg_per_min": float(avg_per_min),
         "median_gap": median_gap,
         "p90_gap": p90_gap,
-        "min_gap": min_gap,
         "peak_per_min": peak_per_min,
         "peak_minute": peak_minute,
         "peak_window": peak_window,
@@ -321,19 +125,200 @@ def compute_report():
         "df": df,
         "pm": pm,
         "intervals": intervals,
+        "window_s": float(window_s),
+        "streak_gap_s": float(streak_gap_s),
     }
 
 
+# -----------------------------
+# State
+# -----------------------------
+def init_state():
+    ss = st.session_state
+    ss.setdefault("started", False)
+    ss.setdefault("finished", False)
+    ss.setdefault("paused", False)
+    ss.setdefault("t0", None)
+    ss.setdefault("finished_at", None)
+    ss.setdefault("pause_started_at", None)
+    ss.setdefault("paused_total", 0.0)
+    ss.setdefault("ok_times", [])
+    ss.setdefault("report", None)
+
+init_state()
+ss = st.session_state
+
+
+# -----------------------------
+# Page + Style
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.markdown(
+    """
+<style>
+.block-container { max-width: 1100px; padding-top: 1.2rem; }
+h1 { margin-bottom: 0.2rem; }
+.smallcap { opacity: 0.8; }
+
+/* KPI cards */
+.kpi {
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.10);
+}
+.kpi .label { font-size: 0.85rem; opacity: 0.75; margin-bottom: 6px; }
+.kpi .value { font-size: 1.6rem; font-weight: 800; line-height: 1.1; }
+
+/* BIG OK button */
+.okwrap {
+  padding: 18px;
+  border-radius: 22px;
+  background: radial-gradient(80% 120% at 20% 0%, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
+  border: 1px solid rgba(255,255,255,0.10);
+}
+div.stButton > button {
+  width: 100%;
+  height: 140px;
+  border-radius: 28px;
+  font-size: 52px;
+  font-weight: 900;
+  border: 1px solid rgba(255,255,255,0.18);
+}
+
+/* Make small buttons look consistent */
+div[data-testid="stHorizontalBlock"] div.stButton > button {
+  height: 44px;
+  font-size: 16px;
+  font-weight: 700;
+  border-radius: 14px;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# -----------------------------
+# Header
+# -----------------------------
+st.title(APP_TITLE)
+st.caption("Clica no botão sempre que alguém disser “ok”. Carrega Finish para gerar o report.")
+
+# Controls row (simple)
+c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1.2, 1.2])
+
+if c1.button("▶️ Start", use_container_width=True, disabled=ss.started and not ss.finished):
+    ss.started = True
+    ss.finished = False
+    ss.paused = False
+    ss.t0 = now()
+    ss.finished_at = None
+    ss.pause_started_at = None
+    ss.paused_total = 0.0
+    ss.ok_times = []
+    ss.report = None
+
+pause_disabled = (not ss.started) or ss.finished or ss.paused
+if c2.button("⏸️ Pause", use_container_width=True, disabled=pause_disabled):
+    ss.paused = True
+    ss.pause_started_at = now()
+
+resume_disabled = (not ss.started) or ss.finished or (not ss.paused)
+if c3.button("▶️ Resume", use_container_width=True, disabled=resume_disabled):
+    if ss.pause_started_at:
+        ss.paused_total += now() - ss.pause_started_at
+    ss.paused = False
+    ss.pause_started_at = None
+
+finish_disabled = (not ss.started) or ss.finished
+if c4.button("⏹️ Finish", use_container_width=True, disabled=finish_disabled):
+    # close pause
+    if ss.paused and ss.pause_started_at:
+        ss.paused_total += now() - ss.pause_started_at
+        ss.paused = False
+        ss.pause_started_at = None
+    ss.finished = True
+    ss.finished_at = now()
+
+# Settings right side (simple, inline)
+window_s = c5.selectbox("Pico (janela s)", [5, 10, 15, 20, 30, 45, 60], index=1)
+streak_gap_s = c6.slider("Streak gap (s)", 1, 12, 3)
+
+# Reset at bottom of controls
+if st.button("🧹 Reset", use_container_width=True):
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.rerun()
+
+st.divider()
+
+
+# -----------------------------
+# Live KPIs (lightweight)
+# -----------------------------
+elapsed = effective_elapsed(ss.t0, ss.finished_at, ss.paused_total, ss.paused, ss.pause_started_at)
+oks = len(ss.ok_times)
+rate = (oks / elapsed * 60) if elapsed > 0 else 0.0
+
+state = "Pronto"
+if ss.started and not ss.finished and not ss.paused:
+    state = "A contar"
+elif ss.paused and not ss.finished:
+    state = "Pausado"
+elif ss.finished:
+    state = "Finalizado"
+
+k1, k2, k3, k4 = st.columns(4)
+k1.markdown(f"<div class='kpi'><div class='label'>Estado</div><div class='value'>{state}</div></div>", unsafe_allow_html=True)
+k2.markdown(f"<div class='kpi'><div class='label'>Tempo (sem pausas)</div><div class='value'>{fmt_duration(elapsed)}</div></div>", unsafe_allow_html=True)
+k3.markdown(f"<div class='kpi'><div class='label'>Total OK</div><div class='value'>{oks}</div></div>", unsafe_allow_html=True)
+k4.markdown(f"<div class='kpi'><div class='label'>Média</div><div class='value'>{rate:.2f} OK/min</div></div>", unsafe_allow_html=True)
+
+st.divider()
+
+
+# -----------------------------
+# BIG OK Button (centered)
+# -----------------------------
+ok_disabled = (not ss.started) or ss.finished or ss.paused
+
+center = st.columns([1, 2.2, 1])[1]
+with center:
+    st.markdown("<div class='okwrap'>", unsafe_allow_html=True)
+    pressed = st.button("✅ OK", use_container_width=True, disabled=ok_disabled)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+if pressed:
+    ss.ok_times.append(now())
+    # Sem st.rerun() — re-execução acontece de qualquer forma,
+    # mas o app continua leve e sem gráficos pesados durante a contagem.
+
+# Small helper line
+if ss.ok_times:
+    last = pd.to_datetime(ss.ok_times[-1], unit="s").strftime("%H:%M:%S")
+    st.caption(f"Último OK: {last}")
+
+
+# -----------------------------
+# Report (only after Finish; compute once)
+# -----------------------------
 st.subheader("Report")
 
 if not ss.started:
     st.info("Carrega **Start** para começar.")
-elif oks == 0 and not ss.finished:
-    st.warning("Ainda não há OKs registados.")
-elif ss.finished:
-    # compute once
+elif not ss.finished:
+    st.info("Quando carregares **Finish**, o report aparece aqui.")
+else:
     if ss.report is None:
-        ss.report = compute_report()
+        ss.report = compute_report(
+            t0=ss.t0,
+            finished_at=ss.finished_at,
+            paused_total=ss.paused_total,
+            ok_times=ss.ok_times,
+            window_s=float(window_s),
+            streak_gap_s=float(streak_gap_s),
+        )
 
     r = ss.report
     df = r["df"]
@@ -350,19 +335,16 @@ elif ss.finished:
         a4.metric("Pico por minuto", r["peak_per_min"], help=f"Minuto #{r['peak_minute']} desde o início")
 
     b1, b2, b3, b4 = st.columns(4)
-    b1.metric(f"Pico em {window_s}s", r["peak_window"])
-    b2.metric(f"Max streak (≤ {streak_gap_s}s)", r["max_streak"])
+    b1.metric(f"Pico em {int(r['window_s'])}s", r["peak_window"])
+    b2.metric(f"Max streak (≤ {int(r['streak_gap_s'])}s)", r["max_streak"])
     b3.metric("Mediana intervalo", "-" if np.isnan(r["median_gap"]) else f"{r['median_gap']:.2f}s")
     b4.metric("P90 intervalo", "-" if np.isnan(r["p90_gap"]) else f"{r['p90_gap']:.2f}s")
 
-    st.caption(
-        f"Extra: maior densidade em blocos de 10s = **{r['peak_10s']} OKs**. "
-        "A streak considera OKs consecutivos com intervalo <= o gap escolhido."
-    )
+    st.caption(f"Extra: maior densidade em blocos de 10s = **{r['peak_10s']} OKs**.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Cumulativo", "📊 Por minuto", "⏱️ Intervalos", "🧾 Exportar"])
+    tabs = st.tabs(["📈 Cumulativo", "📊 Por minuto", "⏱️ Intervalos", "🧾 Exportar"])
 
-    with tab1:
+    with tabs[0]:
         if df.empty:
             st.info("Sem dados.")
         else:
@@ -370,23 +352,25 @@ elif ss.finished:
             cum["count"] = np.arange(1, len(cum) + 1)
             st.line_chart(cum.set_index("dt")[["count"]])
 
-    with tab2:
+    with tabs[1]:
         if pm.empty:
             st.info("Sem dados.")
         else:
             st.bar_chart(pm.set_index("minute")[["oks"]])
 
-    with tab3:
+    with tabs[2]:
         if intervals.size < 1:
             st.info("Precisas de pelo menos 2 OKs.")
         else:
             bins = np.array([0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233], dtype=float)
             b = pd.cut(intervals, bins=bins, include_lowest=True)
             hist = b.value_counts().sort_index()
-            hist_df = pd.DataFrame({"intervalo (s)": hist.index.astype(str), "contagem": hist.values}).set_index("intervalo (s)")
+            hist_df = pd.DataFrame(
+                {"intervalo (s)": hist.index.astype(str), "contagem": hist.values}
+            ).set_index("intervalo (s)")
             st.bar_chart(hist_df)
 
-    with tab4:
+    with tabs[3]:
         if df.empty:
             st.info("Sem dados para exportar.")
         else:
@@ -395,6 +379,3 @@ elif ss.finished:
             export_df = export_df[["timestamp_iso", "t", "elapsed_s"]]
             csv = export_df.to_csv(index=False).encode("utf-8")
             st.download_button("⬇️ Download CSV", data=csv, file_name="ok_counter_events.csv", mime="text/csv")
-
-else:
-    st.info("Quando carregares **Finish**, o report aparece aqui (com gráficos e estatísticas).")
