@@ -1,43 +1,65 @@
-import io
-from pathlib import Path
 
+from pathlib import Path
 import streamlit as st
-import pymupdf  # ✅ PyMuPDF (import robusto)
+import pymupdf  # PyMuPDF
 from PIL import Image, ImageDraw
 
-# =========================
-# CONFIG
-# =========================
+PDF_NAME = "PA28POH-ground-roll-20.pdf"
 
-PDF_NAME = "PA28POH-ground-roll-20.pdf"  # mesmo diretório do app.py
-
-# Tamanho do sistema de coordenadas das tuas coords (o print)
-# Se as tuas coords vierem desse print, deixa assim.
+# Sistema de coordenadas do teu print (imagem 1822x1178)
 REF_W = 1822
 REF_H = 1178
 
-# =========================
-# COORDENADAS (EDITA AQUI)
-# =========================
-# Cada item é uma polilinha: lista de pontos [(x1,y1), (x2,y2), ...]
+# =========================================================
+# RETAS / POLILINHAS (decididas por mim a partir dos pontos)
+# =========================================================
+# Convenção:
+# - Cada item é uma polilinha: [(x1,y1), (x2,y2), ...]
+# - Eu agrupei por alinhamento (colunas verticais do gráfico, diagonais, base, etc.)
 LINES = [
-    # EXEMPLOS (substitui pelas tuas):
-    [(122, 84), (170, 52), (217, 52), (265, 52)],
-    [(396, 137), (409, 86), (397, 67)],
+    # --- Base inferior (linha de referência em baixo) ---
+    [(121, 52), (178, 52), (265, 52), (409, 53)],
+
+    # --- Coluna vertical ~ x=397 (meio) ---
+    [(397, 97), (397, 118), (396, 137), (396, 175)],
+
+    # --- Coluna vertical ~ x=409 (meio-direita) ---
+    [(409, 53), (409, 150), (408, 183), (408, 214), (408, 247), (408, 271)],
+
+    # --- Coluna vertical ~ x=436/438 (direita) ---
+    [(438, 64), (438, 95), (437, 150), (435, 183), (434, 215), (436, 259)],
+
+    # --- Coluna vertical ~ x=497 (extrema direita) ---
+    [(497, 78), (497, 105), (496, 193), (496, 337)],
+
+    # --- Diagonal (grupo 1) - zona esquerda/meio ---
+    # (linha “a subir” para a esquerda no print)
+    [(254, 270), (259, 256), (269, 228), (287, 193), (308, 136)],
+
+    # --- Diagonal (grupo 2) - zona esquerda ---
+    [(176, 210), (186, 187), (194, 171), (205, 156), (265, 52)],
+
+    # --- Vertical curta ~ x=299/301 ---
+    [(299, 276), (299, 249), (301, 204)],
+
+    # --- Diagonal muito inclinada (3 pontos) ---
+    [(158, 170), (159, 153), (178, 52)],
+
+    # --- Segmento no painel de vento (2 pontos visíveis) ---
+    [(468, 73), (497, 78)],
+
+    # --- Segmento “passando” pelo ponto (368,180) (alinhado com a zona central) ---
+    [(368, 180), (396, 175), (408, 183), (435, 183)],
+
+    # --- Pequeno segmento na esquerda (pontos soltos visíveis) ---
+    [(142, 189), (171, 222)],
 ]
 
-# Opcional: pontos soltos
-POINTS = [
-    # (135, 202),
-]
-
-
-# =========================
-# FUNÇÕES
-# =========================
+# =========================================================
+# FUNÇÕES (só render + overlay)
+# =========================================================
 
 def locate_pdf(pdf_name: str) -> str:
-    """Procura o PDF no CWD e na pasta do ficheiro do app (robusto para Streamlit Cloud)."""
     candidates = [Path.cwd() / pdf_name]
     if "__file__" in globals():
         candidates.append(Path(__file__).resolve().parent / pdf_name)
@@ -50,7 +72,6 @@ def locate_pdf(pdf_name: str) -> str:
         f"Não encontrei '{pdf_name}'. Procurei em: " + ", ".join(str(x) for x in candidates)
     )
 
-
 def render_pdf_page_to_image(pdf_path: str, page_index: int = 0, zoom: float = 2.0) -> Image.Image:
     doc = pymupdf.open(pdf_path)
     page = doc.load_page(page_index)
@@ -60,28 +81,21 @@ def render_pdf_page_to_image(pdf_path: str, page_index: int = 0, zoom: float = 2
     doc.close()
     return img
 
-
 def draw_overlay_on_image(
     img: Image.Image,
     lines,
-    points,
     ref_w: int,
     ref_h: int,
-    scale_x: float = 1.0,
-    scale_y: float = 1.0,
-    offset_x: float = 0.0,
-    offset_y: float = 0.0,
-    line_width: int = 4,
+    scale_x: float,
+    scale_y: float,
+    offset_x: float,
+    offset_y: float,
+    line_width: int,
 ) -> Image.Image:
-    """
-    Desenha polilinhas por cima da imagem, convertendo coords (ref_w,ref_h) -> tamanho real da imagem.
-    offset_x/offset_y estão em "pixels do sistema REF".
-    """
     w, h = img.size
     sx = (w / ref_w) * scale_x
     sy = (h / ref_h) * scale_y
 
-    # offset em px do espaço da imagem (aplicando o mesmo sx/sy)
     ox = offset_x * sx
     oy = offset_y * sy
 
@@ -92,33 +106,21 @@ def draw_overlay_on_image(
         if len(poly) < 2:
             continue
         mapped = [((x * sx) + ox, (y * sy) + oy) for (x, y) in poly]
-        draw.line(mapped, width=line_width, fill=(255, 0, 0))  # vermelho
-
-    r = max(2, line_width)
-    for (x, y) in points:
-        px = (x * sx) + ox
-        py = (y * sy) + oy
-        draw.ellipse((px - r, py - r, px + r, py + r), outline=(255, 0, 0), width=2)
+        draw.line(mapped, width=line_width, fill=(255, 0, 0))
 
     return out
-
 
 def pdf_with_vector_overlay(
     pdf_path: str,
     lines,
-    points,
     ref_w: int,
     ref_h: int,
-    scale_x: float = 1.0,
-    scale_y: float = 1.0,
-    offset_x: float = 0.0,
-    offset_y: float = 0.0,
-    stroke_width: float = 2.0,
+    scale_x: float,
+    scale_y: float,
+    offset_x: float,
+    offset_y: float,
+    stroke_width: float,
 ) -> bytes:
-    """
-    Cria um novo PDF (bytes) com o overlay desenhado como VETORES na página 0.
-    offset_x/offset_y estão em "pixels do sistema REF".
-    """
     doc = pymupdf.open(pdf_path)
     page = doc.load_page(0)
     rect = page.rect
@@ -126,11 +128,9 @@ def pdf_with_vector_overlay(
     sx = (rect.width / ref_w) * scale_x
     sy = (rect.height / ref_h) * scale_y
 
-    # offsets convertidos do espaço REF para espaço da página
     ox = (offset_x / ref_w) * rect.width
     oy = (offset_y / ref_h) * rect.height
 
-    # linhas
     for poly in lines:
         if len(poly) < 2:
             continue
@@ -139,24 +139,17 @@ def pdf_with_vector_overlay(
             p2 = pymupdf.Point((x2 * sx) + ox, (y2 * sy) + oy)
             page.draw_line(p1, p2, color=(1, 0, 0), width=stroke_width)
 
-    # pontos (opcional)
-    for (x, y) in points:
-        p = pymupdf.Point((x * sx) + ox, (y * sy) + oy)
-        page.draw_circle(p, radius=max(1.0, stroke_width * 1.2), color=(1, 0, 0), width=stroke_width)
-
     out_bytes = doc.tobytes()
     doc.close()
     return out_bytes
 
+# =========================================================
+# UI
+# =========================================================
 
-# =========================
-# APP
-# =========================
+st.set_page_config(page_title="PDF Overlay (Landing Ground Roll)", layout="wide")
+st.title("Landing Ground Roll — Overlay de Retas (pré-definidas)")
 
-st.set_page_config(page_title="PDF Overlay (Performance Chart)", layout="wide")
-st.title("PDF Overlay – Retas por cima do gráfico")
-
-# Mostrar erros no próprio browser (em vez do “Oh no.” genérico)
 try:
     pdf_path = locate_pdf(PDF_NAME)
 except Exception as e:
@@ -164,29 +157,21 @@ except Exception as e:
     st.stop()
 
 with st.sidebar:
-    st.header("Debug (paths)")
-    st.write("CWD:", str(Path.cwd()))
-    if "__file__" in globals():
-        st.write("APP DIR:", str(Path(__file__).resolve().parent))
-    st.write("PDF:", pdf_path)
+    st.header("Ajustes (só para alinhar)")
+    zoom = st.slider("Zoom do preview", 1.0, 4.0, 2.0, 0.1)
 
-    st.header("Ajustes")
-    zoom = st.slider("Zoom do preview (imagem)", 1.0, 4.0, 2.0, 0.1)
-
-    st.subheader("Transformação das coordenadas")
     scale_x = st.slider("Scale X", 0.8, 1.2, 1.0, 0.001)
     scale_y = st.slider("Scale Y", 0.8, 1.2, 1.0, 0.001)
     offset_x = st.slider("Offset X (px ref)", -300.0, 300.0, 0.0, 1.0)
     offset_y = st.slider("Offset Y (px ref)", -300.0, 300.0, 0.0, 1.0)
 
-    st.subheader("Estilo")
     line_width_img = st.slider("Espessura (preview)", 1, 12, 4, 1)
     stroke_width_pdf = st.slider("Espessura (PDF)", 0.5, 8.0, 2.0, 0.5)
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("Preview (imagem + overlay)")
+    st.subheader("Preview")
     try:
         base_img = render_pdf_page_to_image(pdf_path, page_index=0, zoom=zoom)
     except Exception as e:
@@ -196,7 +181,6 @@ with col1:
     over_img = draw_overlay_on_image(
         base_img,
         lines=LINES,
-        points=POINTS,
         ref_w=REF_W,
         ref_h=REF_H,
         scale_x=scale_x,
@@ -208,12 +192,11 @@ with col1:
     st.image(over_img, use_container_width=True)
 
 with col2:
-    st.subheader("Download do PDF com overlay (vetorial)")
+    st.subheader("Download PDF com overlay (vetorial)")
     try:
         pdf_bytes = pdf_with_vector_overlay(
             pdf_path,
             lines=LINES,
-            points=POINTS,
             ref_w=REF_W,
             ref_h=REF_H,
             scale_x=scale_x,
@@ -227,11 +210,11 @@ with col2:
         st.stop()
 
     st.download_button(
-        label="⬇️ Download PDF com overlay",
+        "⬇️ Download landing_ground_roll_overlay.pdf",
         data=pdf_bytes,
         file_name="landing_ground_roll_overlay.pdf",
         mime="application/pdf",
     )
 
-    st.caption("Se as linhas não baterem certo, ajusta Scale/Offset até alinhar e volta a fazer download.")
+st.caption("Se alguma reta estiver ligeiramente fora, ajusta Scale/Offset até bater certo.")
 
