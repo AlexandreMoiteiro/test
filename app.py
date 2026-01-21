@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import streamlit as st
 import pymupdf
@@ -54,12 +53,6 @@ def render_pdf(pdf_path: str, zoom: float) -> Image.Image:
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
     return img
-
-
-def pil_to_png_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
 
 
 def init_state():
@@ -133,7 +126,7 @@ def draw_overlay(img: Image.Image) -> Image.Image:
         x, y = st.session_state.pending_point
         d.ellipse((x - 12, y - 12, x + 12, y + 12), outline=(0, 255, 0), width=5)
 
-    # last registered click (roxo) para feedback instantâneo
+    # last registered click (roxo) para feedback
     if st.session_state.last_registered is not None:
         x, y = st.session_state.last_registered
         d.ellipse((x - 10, y - 10, x + 10, y + 10), outline=(180, 0, 255), width=5)
@@ -142,7 +135,7 @@ def draw_overlay(img: Image.Image) -> Image.Image:
 
 
 def register_click(x: float, y: float):
-    # debounce
+    # debounce simples
     if st.session_state.last_click == (x, y):
         return
     st.session_state.last_click = (x, y)
@@ -158,7 +151,9 @@ def register_click(x: float, y: float):
 
     elif mode == "axis":
         axis = st.session_state.selected_axis
-        st.session_state.axis_ticks.setdefault(axis, []).append({"value": float(st.session_state.axis_value), "x": x, "y": y})
+        st.session_state.axis_ticks.setdefault(axis, []).append(
+            {"value": float(st.session_state.axis_value), "x": x, "y": y}
+        )
 
     elif mode == "line":
         key = st.session_state.selected_line
@@ -185,7 +180,10 @@ with st.sidebar:
     st.session_state.zoom = st.slider("Zoom", 1.0, 4.0, float(st.session_state.zoom), 0.1)
 
     st.header("Modo")
-    st.session_state.mode = st.radio("Capturar", ["panel", "axis", "line"], index=["panel", "axis", "line"].index(st.session_state.mode))
+    st.session_state.mode = st.radio(
+        "Capturar", ["panel", "axis", "line"],
+        index=["panel", "axis", "line"].index(st.session_state.mode)
+    )
 
     if st.session_state.mode == "panel":
         st.subheader("Painel")
@@ -196,11 +194,11 @@ with st.sidebar:
             st.rerun()
 
     elif st.session_state.mode == "axis":
-        st.subheader("Eixo")
+        st.subheader("Eixo / Tick")
         axis_names = [a[0] for a in AXES]
         st.session_state.selected_axis = st.selectbox("Qual eixo?", axis_names, index=axis_names.index(st.session_state.selected_axis))
         st.session_state.axis_value = st.number_input("Valor do tick", value=float(st.session_state.axis_value))
-        st.caption("Clica no tick/numero correspondente.")
+        st.caption("Clica no tick/número correspondente.")
         if st.button("Limpar ticks deste eixo"):
             st.session_state.axis_ticks[st.session_state.selected_axis] = []
             st.rerun()
@@ -229,7 +227,12 @@ with st.sidebar:
         "lines": st.session_state.lines,
         "notes": "Tudo em pixels da imagem renderizada com o zoom acima.",
     }
-    st.download_button("⬇️ Download capture.json", data=json.dumps(export, indent=2), file_name="capture.json", mime="application/json")
+    st.download_button(
+        "⬇️ Download capture.json",
+        data=json.dumps(export, indent=2),
+        file_name="capture.json",
+        mime="application/json",
+    )
 
     if st.button("RESET TOTAL"):
         st.session_state.panel_corners = {p: [] for p in PANELS}
@@ -239,18 +242,15 @@ with st.sidebar:
         st.session_state.last_registered = None
         st.rerun()
 
-# render e overlay
+# Render + overlay
 img = render_pdf(pdf_path, float(st.session_state.zoom))
 overlay_img = draw_overlay(img)
-overlay_png = pil_to_png_bytes(overlay_img)
 
 col1, col2 = st.columns([1.4, 1])
 
 with col1:
-    st.subheader("Clica na imagem (deve marcar em roxo/verde)")
-    click = streamlit_image_coordinates(overlay_png, key="click_img")  # ✅ bytes PNG
-
-    # debug visível
+    st.subheader("Clica na imagem (deve marcar a roxo/verde)")
+    click = streamlit_image_coordinates(overlay_img, key="click_img")  # ✅ PIL.Image
     st.write("Raw click:", click)
 
     if click and "x" in click and "y" in click:
@@ -265,5 +265,8 @@ with col2:
     st.write("Painéis completos:", {p: (len(st.session_state.panel_corners.get(p, [])) == 4) for p in PANELS})
     st.write("Ticks por eixo:", {a[0]: len(st.session_state.axis_ticks.get(a[0], [])) for a in AXES})
     st.write("Segmentos por reta:", {k: len(st.session_state.lines.get(k, [])) for k in LINE_KEYS})
+
+    st.caption("Se 'Raw click' ficar sempre None, então o componente não está a receber eventos (depêndencia/iframe).")
+
 
 
