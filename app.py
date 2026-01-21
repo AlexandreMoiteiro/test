@@ -1,385 +1,209 @@
-import time
-import numpy as np
-import pandas as pd
+import os
+import io
 import streamlit as st
 
-APP_TITLE = "ok counter"
+import fitz  # PyMuPDF
+from PIL import Image, ImageDraw
 
-# -----------------------------
-# Utils
-# -----------------------------
-def now() -> float:
-    return time.time()
+# =========================
+# CONFIG
+# =========================
 
-def fmt_duration(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    s = int(round(seconds))
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h}h {m:02d}m {s:02d}s"
-    return f"{m}m {s:02d}s"
+PDF_NAME = "PA28POH-ground-roll-20.pdf"  # <-- está na mesma pasta do app.py
 
-def effective_elapsed(t0: float | None, finished_at: float | None, paused_total: float, paused: bool, pause_started_at: float | None) -> float:
-    if not t0:
-        return 0.0
-    end = finished_at if finished_at else now()
-    total = end - t0
-    extra_pause = 0.0
-    if paused and pause_started_at and not finished_at:
-        extra_pause = end - pause_started_at
-    return max(0.0, total - (paused_total + extra_pause))
+# Tamanho do "sistema de coordenadas" das tuas coordenadas (o print que mostraste)
+# (se as tuas coords vierem desse print, deixa assim)
+REF_W = 1822
+REF_H = 1178
 
-def build_df(t0: float | None, ok_times: list[float]) -> pd.DataFrame:
-    if not t0 or not ok_times:
-        return pd.DataFrame(columns=["t", "dt", "elapsed_s"])
-    ts = sorted(ok_times)
-    df = pd.DataFrame({"t": ts})
-    df["dt"] = pd.to_datetime(df["t"], unit="s")
-    df["elapsed_s"] = df["t"] - t0
-    return df
+# =========================
+# COORDENADAS (EDITA AQUI)
+# =========================
+# Coloca aqui as tuas polilinhas.
+# Cada item em LINES é uma lista de pontos [(x1,y1), (x2,y2), ...] que serão ligados em sequência.
+#
+# Exemplo mínimo (SUBSTITUI pelas tuas coords reais):
+LINES = [
+    # Exemplo: uma linha/rota
+    [(122, 84), (170, 52), (217, 52), (265, 52)],
+    # Exemplo: outra linha
+    [(396, 137), (409, 86), (397, 67)],
+]
 
-def per_minute_counts(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["minute", "oks"])
-    minute = (df["elapsed_s"] // 60).astype(int)
-    s = minute.value_counts().sort_index()
-    return pd.DataFrame({"minute": s.index.values, "oks": s.values})
-
-def sliding_window_peak(times: np.ndarray, window_s: float) -> int:
-    """Max OKs within any window window_s (two pointers)."""
-    if times.size == 0:
-        return 0
-    i = 0
-    best = 1
-    for j in range(times.size):
-        while times[j] - times[i] > window_s:
-            i += 1
-        best = max(best, j - i + 1)
-    return int(best)
-
-def max_streak_by_gap(times: np.ndarray, gap_s: float) -> int:
-    """Max streak where consecutive OKs are <= gap_s apart."""
-    if times.size == 0:
-        return 0
-    if times.size == 1:
-        return 1
-    diffs = np.diff(times)
-    streak = 1
-    best = 1
-    for d in diffs:
-        if d <= gap_s:
-            streak += 1
-        else:
-            best = max(best, streak)
-            streak = 1
-    return int(max(best, streak))
+# Se quiseres pontos soltos (opcional):
+POINTS = [
+    # (135, 202),
+]
 
 
-# -----------------------------
-# State
-# -----------------------------
-def init_state():
-    ss = st.session_state
-    ss.setdefault("started", False)
-    ss.setdefault("finished", False)
-    ss.setdefault("paused", False)
+# =========================
+# FUNÇÕES
+# =========================
 
-    ss.setdefault("t0", None)
-    ss.setdefault("finished_at", None)
+def render_pdf_page_to_image(pdf_path: str, page_index: int = 0, zoom: float = 2.0) -> Image.Image:
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_index)
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    doc.close()
+    return img
 
-    ss.setdefault("pause_started_at", None)
-    ss.setdefault("paused_total", 0.0)
-
-    ss.setdefault("ok_times", [])
-    ss.setdefault("report", None)  # computed only when Finish
-
-init_state()
-ss = st.session_state
-
-
-# -----------------------------
-# Page + CSS (UI simples/bonita)
-# -----------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-
-st.markdown(
+def draw_overlay_on_image(
+    img: Image.Image,
+    lines,
+    points,
+    ref_w: int,
+    ref_h: int,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    line_width: int = 4,
+):
     """
-<style>
-.block-container { max-width: 1000px; padding-top: 1.4rem; padding-bottom: 2.2rem; }
-h1 { margin-bottom: 0.2rem; }
-.small { opacity: 0.75; }
+    Desenha as polilinhas em cima da imagem, convertendo coords do espaço REF_(W,H)
+    para o tamanho real da imagem (img.size), com ajustes opcionais.
+    """
+    w, h = img.size
+    sx = (w / ref_w) * scale_x
+    sy = (h / ref_h) * scale_y
 
-.topbar {
-  padding: 14px 16px; border-radius: 16px;
-  background: rgba(255,255,255,0.04);
-  border: 1px solid rgba(255,255,255,0.10);
-  margin-bottom: 16px;
-}
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
 
-.kpiwrap { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-@media (max-width: 900px) { .kpiwrap { grid-template-columns: repeat(2, 1fr); } }
+    # Polilinhas
+    for poly in lines:
+        if len(poly) < 2:
+            continue
+        mapped = [((x * sx) + offset_x, (y * sy) + offset_y) for (x, y) in poly]
+        draw.line(mapped, width=line_width, fill=(255, 0, 0))  # vermelho
 
-.kpi {
-  padding: 14px 14px; border-radius: 16px;
-  background: rgba(255,255,255,0.035);
-  border: 1px solid rgba(255,255,255,0.10);
-}
-.kpi .label { font-size: 0.85rem; opacity: 0.75; margin-bottom: 6px; }
-.kpi .value { font-size: 1.55rem; font-weight: 800; line-height: 1.1; }
-.kpi .sub { font-size: 0.85rem; opacity: 0.75; margin-top: 6px; }
+    # Pontos (opcional)
+    r = max(2, line_width)
+    for (x, y) in points:
+        px = (x * sx) + offset_x
+        py = (y * sy) + offset_y
+        draw.ellipse((px - r, py - r, px + r, py + r), outline=(255, 0, 0), width=2)
 
-.okcard {
-  padding: 18px;
-  border-radius: 22px;
-  background: radial-gradient(80% 120% at 20% 0%, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
-  border: 1px solid rgba(255,255,255,0.10);
-  margin: 16px 0;
-}
+    return out
 
-div.stButton > button {
-  width: 100%;
-  height: 120px;
-  border-radius: 26px;
-  font-size: 46px;
-  font-weight: 900;
-  border: 1px solid rgba(255,255,255,0.18);
-}
+def pdf_with_vector_overlay(
+    pdf_path: str,
+    lines,
+    points,
+    ref_w: int,
+    ref_h: int,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    stroke_width: float = 2.0,
+):
+    """
+    Cria um NOVO PDF baseado no original, desenhando as linhas como VETORES no PDF.
+    Mapeia coords do espaço REF_(W,H) para o espaço da página (page.rect).
+    """
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(0)
+    rect = page.rect
 
-.controls div.stButton > button {
-  height: 44px !important;
-  font-size: 15px !important;
-  font-weight: 700 !important;
-  border-radius: 14px !important;
-}
+    # Map ref coords -> page coords
+    # Primeiro escala proporcional ao tamanho da página; depois aplica ajustes (offset em "ref pixels")
+    # convertidos também para page coords.
+    sx = (rect.width / ref_w) * scale_x
+    sy = (rect.height / ref_h) * scale_y
 
-hr { border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 1.1rem 0; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+    ox = (offset_x / ref_w) * rect.width
+    oy = (offset_y / ref_h) * rect.height
 
-# -----------------------------
-# Header
-# -----------------------------
-st.title(APP_TITLE)
-st.caption("Clica ✅ OK sempre que alguém disser “ok”. No fim, carrega Finish para gerar o report.")
+    # Desenhar polilinhas
+    for poly in lines:
+        if len(poly) < 2:
+            continue
+        for (x1, y1), (x2, y2) in zip(poly[:-1], poly[1:]):
+            p1 = fitz.Point((x1 * sx) + ox, (y1 * sy) + oy)
+            p2 = fitz.Point((x2 * sx) + ox, (y2 * sy) + oy)
+            page.draw_line(p1, p2, color=(1, 0, 0), width=stroke_width)  # vermelho em RGB (0..1)
 
-# -----------------------------
-# Controls (top, no sidebar)
-# -----------------------------
-def reset_all():
-    for k in list(st.session_state.keys()):
-        del st.session_state[k]
-    st.rerun()
+    # Pontos (opcional)
+    for (x, y) in points:
+        p = fitz.Point((x * sx) + ox, (y * sy) + oy)
+        page.draw_circle(p, radius=max(1.0, stroke_width * 1.2), color=(1, 0, 0), width=stroke_width)
 
-def do_start():
-    ss.started = True
-    ss.finished = False
-    ss.paused = False
-    ss.t0 = now()
-    ss.finished_at = None
-    ss.pause_started_at = None
-    ss.paused_total = 0.0
-    ss.ok_times = []
-    ss.report = None
+    # Exportar bytes
+    out_bytes = doc.tobytes()
+    doc.close()
+    return out_bytes
 
-def do_pause():
-    ss.paused = True
-    ss.pause_started_at = now()
 
-def do_resume():
-    if ss.pause_started_at:
-        ss.paused_total += now() - ss.pause_started_at
-    ss.paused = False
-    ss.pause_started_at = None
+# =========================
+# UI
+# =========================
 
-def do_finish():
-    # close pause if needed
-    if ss.paused and ss.pause_started_at:
-        ss.paused_total += now() - ss.pause_started_at
-        ss.paused = False
-        ss.pause_started_at = None
-    ss.finished = True
-    ss.finished_at = now()
+st.set_page_config(page_title="PDF Overlay (Performance Chart)", layout="wide")
+st.title("PDF Overlay – Retas por cima do gráfico")
 
-controls = st.container()
-with controls:
-    st.markdown("<div class='topbar'>", unsafe_allow_html=True)
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1], vertical_alignment="center")
-    with c1:
-        if st.button("Start", use_container_width=True, disabled=ss.started and not ss.finished):
-            do_start()
-    with c2:
-        if st.button("Pause", use_container_width=True, disabled=(not ss.started) or ss.finished or ss.paused):
-            do_pause()
-    with c3:
-        if st.button("Resume", use_container_width=True, disabled=(not ss.started) or ss.finished or (not ss.paused)):
-            do_resume()
-    with c4:
-        if st.button("Finish", use_container_width=True, disabled=(not ss.started) or ss.finished):
-            do_finish()
-    with c5:
-        if st.button("Reset", use_container_width=True):
-            reset_all()
-    st.markdown("</div>", unsafe_allow_html=True)
+pdf_path = os.path.join(os.path.dirname(__file__), PDF_NAME)
+if not os.path.exists(pdf_path):
+    st.error(f"Não encontrei o ficheiro '{PDF_NAME}' na mesma pasta do app.py.")
+    st.stop()
 
-# -----------------------------
-# Settings (simple, inline)
-# -----------------------------
-with st.expander("Opções do report (simples)"):
-    streak_gap_s = st.slider("Streak: gap máximo entre OKs (s)", 1, 12, 3)
-    window_s = st.select_slider("Pico: janela deslizante (s)", options=[5, 10, 15, 20, 30, 45, 60], value=10)
+with st.sidebar:
+    st.header("Ajustes")
+    zoom = st.slider("Zoom do preview (imagem)", 1.0, 4.0, 2.0, 0.1)
 
-# -----------------------------
-# Live KPIs (light)
-# -----------------------------
-elapsed = effective_elapsed(ss.t0, ss.finished_at, ss.paused_total, ss.paused, ss.pause_started_at)
-oks = len(ss.ok_times)
-rate = (oks / elapsed * 60) if elapsed > 0 else 0.0
-state = "Pronto"
-if ss.started and not ss.finished and not ss.paused:
-    state = "A contar"
-elif ss.paused and not ss.finished:
-    state = "Pausado"
-elif ss.finished:
-    state = "Finalizado"
+    st.subheader("Transformação das coordenadas")
+    scale_x = st.slider("Scale X", 0.8, 1.2, 1.0, 0.001)
+    scale_y = st.slider("Scale Y", 0.8, 1.2, 1.0, 0.001)
+    offset_x = st.slider("Offset X (px ref)", -200.0, 200.0, 0.0, 1.0)
+    offset_y = st.slider("Offset Y (px ref)", -200.0, 200.0, 0.0, 1.0)
 
-last_ok = "-"
-if ss.ok_times:
-    last_ok = pd.to_datetime(ss.ok_times[-1], unit="s").strftime("%H:%M:%S")
+    st.subheader("Estilo")
+    line_width_img = st.slider("Espessura (preview)", 1, 12, 4, 1)
+    stroke_width_pdf = st.slider("Espessura (PDF)", 0.5, 8.0, 2.0, 0.5)
 
-st.markdown(
-    f"""
-<div class="kpiwrap">
-  <div class="kpi"><div class="label">Estado</div><div class="value">{state}</div></div>
-  <div class="kpi"><div class="label">Tempo (sem pausas)</div><div class="value">{fmt_duration(elapsed)}</div></div>
-  <div class="kpi"><div class="label">Total OK</div><div class="value">{oks}</div><div class="sub">Média: {rate:.2f} OK/min</div></div>
-  <div class="kpi"><div class="label">Último OK</div><div class="value">{last_ok}</div></div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+col1, col2 = st.columns([1, 1])
 
-st.markdown("<hr/>", unsafe_allow_html=True)
+# Preview
+with col1:
+    st.subheader("Preview (imagem + overlay)")
+    base_img = render_pdf_page_to_image(pdf_path, page_index=0, zoom=zoom)
+    over_img = draw_overlay_on_image(
+        base_img,
+        lines=LINES,
+        points=POINTS,
+        ref_w=REF_W,
+        ref_h=REF_H,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        line_width=line_width_img,
+    )
+    st.image(over_img, use_container_width=True)
 
-# -----------------------------
-# Big OK button
-# -----------------------------
-ok_disabled = (not ss.started) or ss.finished or ss.paused
+# Gerar PDF com overlay vetorial
+with col2:
+    st.subheader("Download do PDF com overlay (vetorial)")
+    pdf_bytes = pdf_with_vector_overlay(
+        pdf_path,
+        lines=LINES,
+        points=POINTS,
+        ref_w=REF_W,
+        ref_h=REF_H,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        stroke_width=stroke_width_pdf,
+    )
 
-center = st.columns([1, 2, 1])[1]
-with center:
-    st.markdown("<div class='okcard'>", unsafe_allow_html=True)
-    pressed = st.button("✅ OK", disabled=ok_disabled, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.download_button(
+        label="⬇️ Download PDF com overlay",
+        data=pdf_bytes,
+        file_name="landing_ground_roll_overlay.pdf",
+        mime="application/pdf",
+    )
 
-if pressed:
-    ss.ok_times.append(now())
-
-# Quick undo (optional, still simple)
-u1, u2, u3 = st.columns([1, 1, 1])
-with u2:
-    undo_disabled = (not ss.started) or (len(ss.ok_times) == 0) or ss.finished
-    if st.button("↩️ desfazer último OK", disabled=undo_disabled, use_container_width=True):
-        if ss.ok_times:
-            ss.ok_times.pop()
-
-st.markdown("<hr/>", unsafe_allow_html=True)
-
-# -----------------------------
-# Report (only after finish; compute once)
-# -----------------------------
-def compute_report():
-    times = np.array(sorted(ss.ok_times), dtype=float)
-    df = build_df(ss.t0, ss.ok_times)
-    duration_s = effective_elapsed(ss.t0, ss.finished_at, ss.paused_total, False, None)  # finished
-
-    total = int(times.size)
-    avg_per_min = (total / duration_s * 60) if duration_s > 0 else 0.0
-
-    intervals = np.diff(times) if times.size >= 2 else np.array([])
-    median_gap = float(np.median(intervals)) if intervals.size else np.nan
-    p90_gap = float(np.percentile(intervals, 90)) if intervals.size else np.nan
-
-    pm = per_minute_counts(df)
-    peak_per_min = int(pm["oks"].max()) if not pm.empty else 0
-
-    peak_window = sliding_window_peak(times, float(window_s))
-    max_streak = max_streak_by_gap(times, float(streak_gap_s))
-
-    return {
-        "df": df,
-        "pm": pm,
-        "intervals": intervals,
-        "total": total,
-        "duration_s": float(duration_s),
-        "avg_per_min": float(avg_per_min),
-        "median_gap": median_gap,
-        "p90_gap": p90_gap,
-        "peak_per_min": peak_per_min,
-        "peak_window": peak_window,
-        "max_streak": max_streak,
-    }
-
-st.subheader("Report")
-
-if not ss.started:
-    st.info("Carrega **Start** para começares.")
-elif not ss.finished:
-    st.info("Quando carregares **Finish**, aparece aqui o report com gráficos.")
-else:
-    if ss.report is None:
-        ss.report = compute_report()
-    r = ss.report
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total OK", r["total"])
-    m2.metric("Tempo", fmt_duration(r["duration_s"]))
-    m3.metric("Média", f"{r['avg_per_min']:.2f} OK/min")
-    m4.metric("Pico por minuto", r["peak_per_min"])
-
-    n1, n2, n3 = st.columns(3)
-    n1.metric(f"Pico em {window_s}s", r["peak_window"])
-    n2.metric(f"Max streak (<= {streak_gap_s}s)", r["max_streak"])
-    n3.metric("Mediana intervalo", "-" if np.isnan(r["median_gap"]) else f"{r['median_gap']:.2f}s")
-
-    tabs = st.tabs(["📈 Cumulativo", "📊 Por minuto", "⏱️ Intervalos", "🧾 Exportar"])
-
-    with tabs[0]:
-        df = r["df"]
-        if df.empty:
-            st.info("Sem dados.")
-        else:
-            cum = df.copy()
-            cum["count"] = np.arange(1, len(cum) + 1)
-            st.line_chart(cum.set_index("dt")[["count"]])
-
-    with tabs[1]:
-        pm = r["pm"]
-        if pm.empty:
-            st.info("Sem dados.")
-        else:
-            st.bar_chart(pm.set_index("minute")[["oks"]])
-
-    with tabs[2]:
-        intervals = r["intervals"]
-        if intervals.size < 1:
-            st.info("Precisas de pelo menos 2 OKs.")
-        else:
-            bins = np.array([0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233], dtype=float)
-            b = pd.cut(intervals, bins=bins, include_lowest=True)
-            hist = b.value_counts().sort_index()
-            hist_df = pd.DataFrame({"intervalo (s)": hist.index.astype(str), "contagem": hist.values}).set_index("intervalo (s)")
-            st.bar_chart(hist_df)
-
-    with tabs[3]:
-        df = r["df"]
-        if df.empty:
-            st.info("Sem dados para exportar.")
-        else:
-            export_df = df.copy()
-            export_df["timestamp_iso"] = export_df["dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            export_df = export_df[["timestamp_iso", "t", "elapsed_s"]]
-            csv = export_df.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download CSV", data=csv, file_name="ok_counter_events.csv", mime="text/csv")
+    st.caption("Dica: se as linhas estiverem ligeiramente fora, ajusta Scale/Offset até bater certo e volta a fazer download.")
