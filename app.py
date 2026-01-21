@@ -2,21 +2,39 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 import streamlit as st
 import pymupdf
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-
-# =========================
-# CONFIG
-# =========================
 PDF_NAME = "PA28POH-ground-roll.pdf"
 
-LINE_KEYS = [
+# ---------- O que vamos capturar ----------
+PANELS = ["panel_oat", "panel_weight", "panel_wind"]
+
+AXIS_POINTS = [
+    # y axis (ground roll)
+    ("y_gr_600",  "Clica no tick **600 ft** no eixo de Ground Roll (direita)"),
+    ("y_gr_1300", "Clica no tick **1300 ft** no eixo de Ground Roll (direita)"),
+
+    # x axis oat
+    ("x_oat_-10", "Clica no tick **-10°C** no eixo OAT (painel esquerdo)"),
+    ("x_oat_50",  "Clica no tick **50°C** no eixo OAT (painel esquerdo)"),
+
+    # x axis weight
+    ("x_wt_25",   "Clica no tick **25** no eixo WEIGHT x100 (painel do meio)"),
+    ("x_wt_20",   "Clica no tick **20** no eixo WEIGHT x100 (painel do meio)"),
+
+    # x axis wind
+    ("x_wind_0",  "Clica no tick **0 kt** no eixo WIND (painel direito)"),
+    ("x_wind_15", "Clica no tick **15 kt** no eixo WIND (painel direito)"),
+]
+
+LINES = [
+    # Painel OAT (altitude / ISA)
     "sea_level",
     "ft_2000",
     "ft_4000",
@@ -24,209 +42,224 @@ LINE_KEYS = [
     "ft_7000",
     "isa",
     "isa_m15",
-    "isa_p15",
-    "headwind_0",
-    "headwind_5",
-    "headwind_10",
-    "headwind_15",
+    "isa_p35",
+
+    # Painel WEIGHT
+    "ref_line_max_weight_2550",
+
+    # Painel WIND
+    "ref_line_zero_wind",
+    "headwind_main_1",
+    "headwind_main_2",
+    "headwind_main_3",
 ]
 
-CAPTURES_PER_LINE_DEFAULT = 1
-
-
-# =========================
-# HELPERS
-# =========================
 def locate_pdf(pdf_name: str) -> str:
-    candidates = [Path.cwd() / pdf_name]
-    if "__file__" in globals():
-        candidates.append(Path(__file__).resolve().parent / pdf_name)
-    for c in candidates:
+    for c in [Path.cwd()/pdf_name, Path(__file__).resolve().parent/pdf_name]:
         if c.exists():
             return str(c)
-    raise FileNotFoundError(
-        f"Não encontrei '{pdf_name}'. Procurei em: " + ", ".join(str(x) for x in candidates)
-    )
+    raise FileNotFoundError(f"Não encontrei '{pdf_name}' ao lado do app.py")
 
-
-def render_pdf_page_to_pil(pdf_path: str, page_index: int = 0, zoom: float = 2.0) -> Image.Image:
+def render_pdf(pdf_path: str, zoom: float) -> Image.Image:
     doc = pymupdf.open(pdf_path)
-    page = doc.load_page(page_index)
+    page = doc.load_page(0)
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
     return img
 
-
 def init_state():
-    if "captures" not in st.session_state:
-        st.session_state.captures = {}  # Dict[str, List[Dict[str,float]]]
-    if "selected_key" not in st.session_state:
-        st.session_state.selected_key = LINE_KEYS[0]
-    if "target_per_line" not in st.session_state:
-        st.session_state.target_per_line = CAPTURES_PER_LINE_DEFAULT
     if "zoom" not in st.session_state:
         st.session_state.zoom = 2.0
-    if "pending_point" not in st.session_state:
-        st.session_state.pending_point = None  # Optional[Tuple[float,float]]
+    if "step" not in st.session_state:
+        st.session_state.step = "panels"  # panels -> axes -> lines -> export
+    if "panel_rects" not in st.session_state:
+        st.session_state.panel_rects = {}  # name -> {"x1","y1","x2","y2"}
+    if "axis_pts" not in st.session_state:
+        st.session_state.axis_pts = {}     # key -> {"x","y"}
+    if "lines" not in st.session_state:
+        st.session_state.lines = {}        # name -> [{"x1","y1","x2","y2"}, ...] (permite 2 capturas)
+    if "pending" not in st.session_state:
+        st.session_state.pending = None    # guarda 1º clique (x,y)
+    if "current_key" not in st.session_state:
+        st.session_state.current_key = PANELS[0]
+    if "current_index" not in st.session_state:
+        st.session_state.current_index = 0
     if "last_click" not in st.session_state:
         st.session_state.last_click = None
 
-
-def count_done(key: str) -> int:
-    return len(st.session_state.captures.get(key, []))
-
-
-def total_done() -> int:
-    return sum(len(v) for v in st.session_state.captures.values())
-
-
-def draw_overlay_preview(img: Image.Image, captures: Dict[str, List[Dict[str, float]]], highlight_key: str) -> Image.Image:
+def overlay(img: Image.Image) -> Image.Image:
     out = img.copy()
     d = ImageDraw.Draw(out)
 
-    # desenhar todas as retas guardadas (vermelho)
-    for k, lines in captures.items():
-        for ln in lines:
-            x1, y1, x2, y2 = ln["x1"], ln["y1"], ln["x2"], ln["y2"]
-            width = 5 if k == highlight_key else 3
-            d.line([(x1, y1), (x2, y2)], fill=(255, 0, 0), width=width)
+    # rects dos painéis (verde)
+    for name, r in st.session_state.panel_rects.items():
+        d.rectangle([r["x1"], r["y1"], r["x2"], r["y2"]], outline=(0, 255, 0), width=4)
+        d.text((r["x1"]+5, r["y1"]+5), name, fill=(0, 255, 0))
 
-    # se houver 1 ponto pendente, desenhar um circulo
-    if st.session_state.pending_point is not None:
-        x, y = st.session_state.pending_point
-        r = 8
-        d.ellipse((x - r, y - r, x + r, y + r), outline=(0, 255, 0), width=3)
+    # pontos de eixo (azul)
+    for k, p in st.session_state.axis_pts.items():
+        x, y = p["x"], p["y"]
+        d.ellipse([x-6, y-6, x+6, y+6], outline=(0, 128, 255), width=3)
+        d.text((x+8, y-8), k, fill=(0, 128, 255))
+
+    # linhas (vermelho)
+    for name, arr in st.session_state.lines.items():
+        for ln in arr:
+            d.line([(ln["x1"], ln["y1"]), (ln["x2"], ln["y2"])], fill=(255, 0, 0), width=4)
+        # label perto do primeiro segmento
+        if arr:
+            ln0 = arr[0]
+            d.text((ln0["x1"]+5, ln0["y1"]+5), name, fill=(255, 0, 0))
+
+    # ponto pendente (amarelo)
+    if st.session_state.pending is not None:
+        x, y = st.session_state.pending
+        d.ellipse([x-8, y-8, x+8, y+8], outline=(255, 255, 0), width=4)
 
     return out
 
+def next_item():
+    st.session_state.pending = None
+    st.session_state.current_index += 1
 
-def save_line(key: str, p1: Tuple[float, float], p2: Tuple[float, float]):
-    st.session_state.captures.setdefault(key, []).append(
-        {"x1": float(p1[0]), "y1": float(p1[1]), "x2": float(p2[0]), "y2": float(p2[1])}
-    )
+def set_current_from_step():
+    if st.session_state.step == "panels":
+        st.session_state.current_key = PANELS[min(st.session_state.current_index, len(PANELS)-1)]
+    elif st.session_state.step == "axes":
+        st.session_state.current_key = AXIS_POINTS[min(st.session_state.current_index, len(AXIS_POINTS)-1)][0]
+    elif st.session_state.step == "lines":
+        st.session_state.current_key = LINES[min(st.session_state.current_index, len(LINES)-1)]
+    else:
+        st.session_state.current_key = ""
 
+def step_done() -> bool:
+    if st.session_state.step == "panels":
+        return st.session_state.current_index >= len(PANELS)
+    if st.session_state.step == "axes":
+        return st.session_state.current_index >= len(AXIS_POINTS)
+    if st.session_state.step == "lines":
+        return st.session_state.current_index >= len(LINES)
+    return True
 
-# =========================
-# APP
-# =========================
-st.set_page_config(page_title="Captura de Retas (por cliques)", layout="wide")
+def handle_click(x: float, y: float):
+    # evita processar o mesmo clique em reruns
+    if st.session_state.last_click == (x, y):
+        return
+    st.session_state.last_click = (x, y)
+
+    if st.session_state.step == "panels":
+        key = st.session_state.current_key
+        if st.session_state.pending is None:
+            st.session_state.pending = (x, y)
+        else:
+            x1, y1 = st.session_state.pending
+            st.session_state.panel_rects[key] = {
+                "x1": float(min(x1, x)), "y1": float(min(y1, y)),
+                "x2": float(max(x1, x)), "y2": float(max(y1, y)),
+            }
+            next_item()
+
+    elif st.session_state.step == "axes":
+        key = st.session_state.current_key
+        st.session_state.axis_pts[key] = {"x": float(x), "y": float(y)}
+        next_item()
+
+    elif st.session_state.step == "lines":
+        key = st.session_state.current_key
+        if st.session_state.pending is None:
+            st.session_state.pending = (x, y)
+        else:
+            x1, y1 = st.session_state.pending
+            st.session_state.lines.setdefault(key, []).append(
+                {"x1": float(x1), "y1": float(y1), "x2": float(x), "y2": float(y)}
+            )
+            next_item()
+
+def export_payload() -> Dict[str, Any]:
+    return {
+        "pdf_name": PDF_NAME,
+        "zoom_used_for_capture": float(st.session_state.zoom),
+        "panel_rects": st.session_state.panel_rects,
+        "axis_points": st.session_state.axis_pts,
+        "lines": st.session_state.lines,
+        "notes": "Tudo em pixels da imagem renderizada (zoom acima).",
+    }
+
+# ---------- UI ----------
+st.set_page_config(layout="wide", page_title="Nomograma Capture Wizard")
 init_state()
 
-st.title("Captura guiada de retas — (clicar 2 pontos por reta)")
-
-try:
-    pdf_path = locate_pdf(PDF_NAME)
-except Exception as e:
-    st.exception(e)
-    st.stop()
+pdf_path = locate_pdf(PDF_NAME)
 
 with st.sidebar:
     st.header("Config")
-    st.session_state.zoom = st.slider("Zoom do preview", 1.0, 4.0, st.session_state.zoom, 0.1)
-    st.session_state.target_per_line = st.number_input(
-        "Capturas por reta (1 recomendado)",
-        min_value=1, max_value=5,
-        value=int(st.session_state.target_per_line),
-        step=1,
-    )
+    st.session_state.zoom = st.slider("Zoom", 1.0, 4.0, st.session_state.zoom, 0.1)
 
     st.divider()
-    st.header("Reta atual")
-    st.session_state.selected_key = st.selectbox(
-        "Seleciona a reta",
-        LINE_KEYS,
-        index=LINE_KEYS.index(st.session_state.selected_key),
-    )
-    st.write("Progresso:", f"{count_done(st.session_state.selected_key)}/{st.session_state.target_per_line}")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("🧹 Limpar esta reta"):
-            st.session_state.captures[st.session_state.selected_key] = []
-            st.session_state.pending_point = None
-            st.rerun()
-    with c2:
-        if st.button("🗑️ Reset total"):
-            st.session_state.captures = {}
-            st.session_state.pending_point = None
-            st.rerun()
+    st.header("Modo")
+    mode = st.radio("Etapa", ["panels", "axes", "lines", "export"], index=["panels","axes","lines","export"].index(st.session_state.step))
+    st.session_state.step = mode
+    st.session_state.current_index = 0
+    set_current_from_step()
+    st.session_state.pending = None
 
     st.divider()
-    export = {
-        "pdf_name": PDF_NAME,
-        "zoom_used_for_capture": float(st.session_state.zoom),
-        "coords_space": "image_pixels",
-        "captures": st.session_state.captures,
-    }
-    st.download_button(
-        "⬇️ Download lines.json",
-        data=json.dumps(export, indent=2),
-        file_name="lines.json",
-        mime="application/json",
-    )
-    st.caption("Quando terminares, faz download do JSON e traz-me aqui.")
+    st.header("Controlo")
+    if st.button("↩️ Cancelar ponto pendente"):
+        st.session_state.pending = None
+        st.rerun()
+    if st.button("🗑️ Reset tudo"):
+        for k in ["panel_rects","axis_pts","lines"]:
+            st.session_state[k] = {}
+        st.session_state.pending = None
+        st.rerun()
 
-# Render PDF -> imagem
-try:
-    base_img = render_pdf_page_to_pil(pdf_path, page_index=0, zoom=st.session_state.zoom)
-except Exception as e:
-    st.exception(e)
-    st.stop()
+    st.divider()
+    payload = export_payload()
+    st.download_button("⬇️ Download schema.json", data=json.dumps(payload, indent=2), file_name="schema.json", mime="application/json")
 
-# Overlay para preview
-preview = draw_overlay_preview(base_img, st.session_state.captures, st.session_state.selected_key)
+# instruções do passo
+set_current_from_step()
 
-colA, colB = st.columns([1.35, 1])
+instr = ""
+if st.session_state.step == "panels" and not step_done():
+    instr = f"**PAINEL:** `{st.session_state.current_key}` → clica canto sup-esq e depois inf-dir."
+elif st.session_state.step == "axes" and not step_done():
+    key, msg = AXIS_POINTS[st.session_state.current_index]
+    instr = f"**EIXO:** `{key}` → {msg}"
+elif st.session_state.step == "lines" and not step_done():
+    instr = f"**RETA:** `{st.session_state.current_key}` → clica 2 pontos (extremos) da reta."
+else:
+    instr = "Etapa concluída. Faz download do `schema.json` e volta aqui."
 
-with colA:
-    st.subheader("Clica 2 pontos para definir a reta")
-    st.write(
-        f"**Reta atual:** `{st.session_state.selected_key}`  \n"
-        "- Clica o **ponto 1** (fica marcado a verde)  \n"
-        "- Clica o **ponto 2** para guardar a reta"
-    )
+st.title("Wizard de captura do nomograma")
+st.info(instr)
 
-    # componente devolve {"x":..., "y":...} quando clicas
-    click = streamlit_image_coordinates(preview, key="img_click")
+# imagem + overlay
+base = render_pdf(pdf_path, st.session_state.zoom)
+img = overlay(base)
 
-    if click is not None and ("x" in click and "y" in click):
-        x, y = float(click["x"]), float(click["y"])
-        # evitar reprocessar o mesmo clique em reruns (heurística simples)
-        if st.session_state.last_click != (x, y):
-            st.session_state.last_click = (x, y)
+col1, col2 = st.columns([1.3, 1])
 
-            if st.session_state.pending_point is None:
-                st.session_state.pending_point = (x, y)
-                st.rerun()
-            else:
-                p1 = st.session_state.pending_point
-                p2 = (x, y)
-                save_line(st.session_state.selected_key, p1, p2)
-                st.session_state.pending_point = None
-                st.success(f"Guardado `{st.session_state.selected_key}`: {p1} -> {p2}")
-                st.rerun()
+with col1:
+    click = streamlit_image_coordinates(img, key="img")
+    if click and "x" in click and "y" in click:
+        handle_click(float(click["x"]), float(click["y"]))
+        st.rerun()
 
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button("↩️ Cancelar ponto 1"):
-            st.session_state.pending_point = None
-            st.rerun()
-    with b2:
-        if st.button("➡️ Próxima reta"):
-            idx = LINE_KEYS.index(st.session_state.selected_key)
-            st.session_state.selected_key = LINE_KEYS[(idx + 1) % len(LINE_KEYS)]
-            st.session_state.pending_point = None
-            st.rerun()
+with col2:
+    st.subheader("Estado")
+    st.write("Step:", st.session_state.step)
+    st.write("Index:", st.session_state.current_index)
 
-with colB:
-    st.subheader("Resumo")
-    st.write("Total de retas capturadas:", total_done())
+    st.markdown("### Painéis")
+    st.code(json.dumps(st.session_state.panel_rects, indent=2), language="json")
 
-    st.markdown("### Capturas desta reta")
-    st.code(json.dumps(st.session_state.captures.get(st.session_state.selected_key, []), indent=2), language="json")
+    st.markdown("### Eixos")
+    st.code(json.dumps(st.session_state.axis_pts, indent=2), language="json")
 
-    st.markdown("### Checklist")
-    for k in LINE_KEYS:
-        st.write(f"- `{k}`: {count_done(k)}/{st.session_state.target_per_line}")
+    st.markdown("### Linhas")
+    st.code(json.dumps(st.session_state.lines, indent=2)[:2000] + ("\n... (truncado)" if len(json.dumps(st.session_state.lines)) > 2000 else ""), language="json")
+
 
