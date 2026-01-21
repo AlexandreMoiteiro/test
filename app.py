@@ -1,154 +1,126 @@
+from __future__ import annotations
 
+import json
 from pathlib import Path
-import streamlit as st
-import pymupdf  # PyMuPDF
-from PIL import Image, ImageDraw
+from typing import Dict, Any, List, Optional
 
+import streamlit as st
+import pymupdf
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
+
+
+# =========================
+# CONFIG
+# =========================
 PDF_NAME = "PA28POH-ground-roll-20.pdf"
 
-# Sistema de coordenadas do teu print (imagem 1822x1178)
-REF_W = 1822
-REF_H = 1178
-
-# =========================================================
-# RETAS / POLILINHAS (decididas por mim a partir dos pontos)
-# =========================================================
-# Convenção:
-# - Cada item é uma polilinha: [(x1,y1), (x2,y2), ...]
-# - Eu agrupei por alinhamento (colunas verticais do gráfico, diagonais, base, etc.)
-LINES = [
-    # --- Base inferior (linha de referência em baixo) ---
-    [(121, 52), (178, 52), (265, 52), (409, 53)],
-
-    # --- Coluna vertical ~ x=397 (meio) ---
-    [(397, 97), (397, 118), (396, 137), (396, 175)],
-
-    # --- Coluna vertical ~ x=409 (meio-direita) ---
-    [(409, 53), (409, 150), (408, 183), (408, 214), (408, 247), (408, 271)],
-
-    # --- Coluna vertical ~ x=436/438 (direita) ---
-    [(438, 64), (438, 95), (437, 150), (435, 183), (434, 215), (436, 259)],
-
-    # --- Coluna vertical ~ x=497 (extrema direita) ---
-    [(497, 78), (497, 105), (496, 193), (496, 337)],
-
-    # --- Diagonal (grupo 1) - zona esquerda/meio ---
-    # (linha “a subir” para a esquerda no print)
-    [(254, 270), (259, 256), (269, 228), (287, 193), (308, 136)],
-
-    # --- Diagonal (grupo 2) - zona esquerda ---
-    [(176, 210), (186, 187), (194, 171), (205, 156), (265, 52)],
-
-    # --- Vertical curta ~ x=299/301 ---
-    [(299, 276), (299, 249), (301, 204)],
-
-    # --- Diagonal muito inclinada (3 pontos) ---
-    [(158, 170), (159, 153), (178, 52)],
-
-    # --- Segmento no painel de vento (2 pontos visíveis) ---
-    [(468, 73), (497, 78)],
-
-    # --- Segmento “passando” pelo ponto (368,180) (alinhado com a zona central) ---
-    [(368, 180), (396, 175), (408, 183), (435, 183)],
-
-    # --- Pequeno segmento na esquerda (pontos soltos visíveis) ---
-    [(142, 189), (171, 222)],
+# Lista de retas “relevantes” (edita/expande à vontade)
+LINE_KEYS = [
+    "sea_level",
+    "ft_2000",
+    "ft_4000",
+    "ft_6000",
+    "ft_7000",
+    "isa",
+    "isa_m15",
+    "isa_p15",
+    # vento (exemplos)
+    "headwind_line_0",
+    "headwind_line_5",
+    "headwind_line_10",
+    "headwind_line_15",
 ]
 
-# =========================================================
-# FUNÇÕES (só render + overlay)
-# =========================================================
+# Quantas capturas por reta queres?
+# (Normalmente 1 chega: uma linha com 2 pontos. Se quiseres refinar, podes capturar 2-3 e depois eu faço média.)
+CAPTURES_PER_LINE_DEFAULT = 1
 
+
+# =========================
+# HELPERS
+# =========================
 def locate_pdf(pdf_name: str) -> str:
     candidates = [Path.cwd() / pdf_name]
     if "__file__" in globals():
         candidates.append(Path(__file__).resolve().parent / pdf_name)
-
     for c in candidates:
         if c.exists():
             return str(c)
-
     raise FileNotFoundError(
         f"Não encontrei '{pdf_name}'. Procurei em: " + ", ".join(str(x) for x in candidates)
     )
 
+
 def render_pdf_page_to_image(pdf_path: str, page_index: int = 0, zoom: float = 2.0) -> Image.Image:
     doc = pymupdf.open(pdf_path)
     page = doc.load_page(page_index)
-    mat = pymupdf.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
     return img
 
-def draw_overlay_on_image(
-    img: Image.Image,
-    lines,
-    ref_w: int,
-    ref_h: int,
-    scale_x: float,
-    scale_y: float,
-    offset_x: float,
-    offset_y: float,
-    line_width: int,
-) -> Image.Image:
-    w, h = img.size
-    sx = (w / ref_w) * scale_x
-    sy = (h / ref_h) * scale_y
 
-    ox = offset_x * sx
-    oy = offset_y * sy
+def extract_last_line_object(canvas_json: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Apanha o último objeto do tipo 'line' desenhado no canvas."""
+    if not canvas_json:
+        return None
+    objs = canvas_json.get("objects") or []
+    for obj in reversed(objs):
+        if obj.get("type") == "line":
+            return obj
+    return None
 
-    out = img.copy()
-    draw = ImageDraw.Draw(out)
 
-    for poly in lines:
-        if len(poly) < 2:
-            continue
-        mapped = [((x * sx) + ox, (y * sy) + oy) for (x, y) in poly]
-        draw.line(mapped, width=line_width, fill=(255, 0, 0))
+def normalize_line_obj(obj: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Converte o objeto 'line' do fabric.js para coordenadas absolutas na imagem:
+    x = left + x1, y = top + y1, etc.
+    """
+    left = float(obj.get("left", 0.0))
+    top = float(obj.get("top", 0.0))
+    x1 = float(obj["x1"]) + left
+    y1 = float(obj["y1"]) + top
+    x2 = float(obj["x2"]) + left
+    y2 = float(obj["y2"]) + top
+    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
-    return out
 
-def pdf_with_vector_overlay(
-    pdf_path: str,
-    lines,
-    ref_w: int,
-    ref_h: int,
-    scale_x: float,
-    scale_y: float,
-    offset_x: float,
-    offset_y: float,
-    stroke_width: float,
-) -> bytes:
-    doc = pymupdf.open(pdf_path)
-    page = doc.load_page(0)
-    rect = page.rect
+def init_state():
+    if "captures" not in st.session_state:
+        st.session_state.captures = {}  # type: Dict[str, List[Dict[str, float]]]
+    if "selected_key" not in st.session_state:
+        st.session_state.selected_key = LINE_KEYS[0]
+    if "target_per_line" not in st.session_state:
+        st.session_state.target_per_line = CAPTURES_PER_LINE_DEFAULT
+    if "zoom" not in st.session_state:
+        st.session_state.zoom = 2.0
+    if "stroke_pdf" not in st.session_state:
+        st.session_state.stroke_pdf = 2.0
 
-    sx = (rect.width / ref_w) * scale_x
-    sy = (rect.height / ref_h) * scale_y
 
-    ox = (offset_x / ref_w) * rect.width
-    oy = (offset_y / ref_h) * rect.height
+def count_done(key: str) -> int:
+    return len(st.session_state.captures.get(key, []))
 
-    for poly in lines:
-        if len(poly) < 2:
-            continue
-        for (x1, y1), (x2, y2) in zip(poly[:-1], poly[1:]):
-            p1 = pymupdf.Point((x1 * sx) + ox, (y1 * sy) + oy)
-            p2 = pymupdf.Point((x2 * sx) + ox, (y2 * sy) + oy)
-            page.draw_line(p1, p2, color=(1, 0, 0), width=stroke_width)
 
-    out_bytes = doc.tobytes()
-    doc.close()
-    return out_bytes
+def total_done() -> int:
+    return sum(len(v) for v in st.session_state.captures.values())
 
-# =========================================================
-# UI
-# =========================================================
 
-st.set_page_config(page_title="PDF Overlay (Landing Ground Roll)", layout="wide")
-st.title("Landing Ground Roll — Overlay de Retas (pré-definidas)")
+def all_keys_status() -> List[Dict[str, Any]]:
+    rows = []
+    for k in LINE_KEYS:
+        rows.append({"reta": k, "capturas": count_done(k), "alvo": st.session_state.target_per_line})
+    return rows
+
+
+# =========================
+# APP
+# =========================
+st.set_page_config(page_title="Captura de Retas (Nomograma)", layout="wide")
+init_state()
+
+st.title("Captura guiada de retas — Nomograma (POH)")
 
 try:
     pdf_path = locate_pdf(PDF_NAME)
@@ -157,64 +129,118 @@ except Exception as e:
     st.stop()
 
 with st.sidebar:
-    st.header("Ajustes (só para alinhar)")
-    zoom = st.slider("Zoom do preview", 1.0, 4.0, 2.0, 0.1)
-
-    scale_x = st.slider("Scale X", 0.8, 1.2, 1.0, 0.001)
-    scale_y = st.slider("Scale Y", 0.8, 1.2, 1.0, 0.001)
-    offset_x = st.slider("Offset X (px ref)", -300.0, 300.0, 0.0, 1.0)
-    offset_y = st.slider("Offset Y (px ref)", -300.0, 300.0, 0.0, 1.0)
-
-    line_width_img = st.slider("Espessura (preview)", 1, 12, 4, 1)
-    stroke_width_pdf = st.slider("Espessura (PDF)", 0.5, 8.0, 2.0, 0.5)
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader("Preview")
-    try:
-        base_img = render_pdf_page_to_image(pdf_path, page_index=0, zoom=zoom)
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-    over_img = draw_overlay_on_image(
-        base_img,
-        lines=LINES,
-        ref_w=REF_W,
-        ref_h=REF_H,
-        scale_x=scale_x,
-        scale_y=scale_y,
-        offset_x=offset_x,
-        offset_y=offset_y,
-        line_width=line_width_img,
+    st.header("1) Config")
+    st.session_state.zoom = st.slider("Zoom da imagem", 1.0, 4.0, st.session_state.zoom, 0.1)
+    st.session_state.target_per_line = st.number_input(
+        "Capturas por reta (recomendado: 1 ou 2)",
+        min_value=1,
+        max_value=5,
+        value=int(st.session_state.target_per_line),
+        step=1,
     )
-    st.image(over_img, use_container_width=True)
 
-with col2:
-    st.subheader("Download PDF com overlay (vetorial)")
-    try:
-        pdf_bytes = pdf_with_vector_overlay(
-            pdf_path,
-            lines=LINES,
-            ref_w=REF_W,
-            ref_h=REF_H,
-            scale_x=scale_x,
-            scale_y=scale_y,
-            offset_x=offset_x,
-            offset_y=offset_y,
-            stroke_width=stroke_width_pdf,
-        )
-    except Exception as e:
-        st.exception(e)
-        st.stop()
+    st.session_state.stroke_pdf = st.slider("Espessura (apenas preview)", 1.0, 8.0, st.session_state.stroke_pdf, 0.5)
 
+    st.header("2) Seleciona a reta")
+    st.session_state.selected_key = st.selectbox("Reta atual", LINE_KEYS, index=LINE_KEYS.index(st.session_state.selected_key))
+
+    done = count_done(st.session_state.selected_key)
+    target = st.session_state.target_per_line
+
+    st.markdown("### Instruções")
+    st.write(f"**Reta atual:** `{st.session_state.selected_key}`")
+    st.write(f"**Progresso:** {done}/{target} capturas")
+
+    st.info(
+        "Desenha **uma única linha** por cima da reta selecionada.\n"
+        "Depois carrega **Guardar captura**.\n\n"
+        "Se desenhares várias linhas, a app guarda **a última**."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🧹 Limpar capturas desta reta"):
+            st.session_state.captures[st.session_state.selected_key] = []
+            st.rerun()
+    with c2:
+        if st.button("🗑️ Reset TOTAL"):
+            st.session_state.captures = {}
+            st.rerun()
+
+    st.divider()
+    st.header("3) Export")
+    export = {
+        "pdf_name": PDF_NAME,
+        "zoom_used_for_capture": float(st.session_state.zoom),
+        "image_space": "pixel",
+        "notes": "Coordenadas em pixels no espaço da imagem renderizada (com o zoom selecionado).",
+        "captures": st.session_state.captures,
+    }
     st.download_button(
-        "⬇️ Download landing_ground_roll_overlay.pdf",
-        data=pdf_bytes,
-        file_name="landing_ground_roll_overlay.pdf",
-        mime="application/pdf",
+        "⬇️ Download lines.json",
+        data=json.dumps(export, indent=2),
+        file_name="lines.json",
+        mime="application/json",
+    )
+    st.caption("Quando acabares, faz download do JSON e traz-me aqui.")
+
+# Render da imagem
+img = render_pdf_page_to_image(pdf_path, page_index=0, zoom=st.session_state.zoom)
+img_w, img_h = img.size
+
+colA, colB = st.columns([1.35, 1])
+
+with colA:
+    st.subheader("Canvas (desenha a reta)")
+    canvas = st_canvas(
+        background_image=img,
+        drawing_mode="line",
+        stroke_width=3,
+        stroke_color="#ff0000",
+        fill_color="rgba(255, 0, 0, 0.0)",
+        update_streamlit=True,
+        height=img_h,
+        width=img_w,
+        key=f"canvas_{st.session_state.selected_key}",
     )
 
-st.caption("Se alguma reta estiver ligeiramente fora, ajusta Scale/Offset até bater certo.")
+    save_col1, save_col2 = st.columns([1, 1])
+    with save_col1:
+        if st.button("💾 Guardar captura (última linha desenhada)"):
+            if canvas.json_data is None:
+                st.error("Ainda não desenhaste nada.")
+            else:
+                obj = extract_last_line_object(canvas.json_data)
+                if not obj:
+                    st.error("Não encontrei nenhum objeto do tipo 'line'. Desenha uma linha.")
+                else:
+                    coords = normalize_line_obj(obj)
+                    st.session_state.captures.setdefault(st.session_state.selected_key, []).append(coords)
+                    st.success(f"Guardado: {st.session_state.selected_key} → {coords}")
+    with save_col2:
+        if st.button("➡️ Próxima reta"):
+            # passa para a próxima na lista
+            idx = LINE_KEYS.index(st.session_state.selected_key)
+            st.session_state.selected_key = LINE_KEYS[(idx + 1) % len(LINE_KEYS)]
+            st.rerun()
 
+with colB:
+    st.subheader("Estado / Dados guardados")
+
+    # Tabela simples de progresso
+    status_rows = all_keys_status()
+    st.dataframe(status_rows, use_container_width=True, hide_index=True)
+
+    st.markdown("### Capturas desta reta")
+    current = st.session_state.captures.get(st.session_state.selected_key, [])
+    st.code(json.dumps(current, indent=2), language="json")
+
+    st.markdown("### Total de capturas")
+    st.write(total_done())
+
+    st.markdown("### Dicas rápidas")
+    st.write(
+        "- Faz zoom suficiente para acertar nos endpoints.\n"
+        "- Para uma reta longa, desenha de extremo a extremo.\n"
+        "- Se uma reta for curvada (não devia), faz 2 capturas em segmentos."
+    )
