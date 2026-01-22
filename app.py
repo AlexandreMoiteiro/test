@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import pymupdf  # PyMuPDF
 
 
@@ -21,7 +21,8 @@ ASSETS = {
         "json_default": "ldg_ground_roll.json",
         "bg_kind": "pdf",
         "page_default": 0,
-        "round_to": 5,   # ft
+        "round_to": 5,    # ft
+        "label_font": 24, # bigger for landing
     },
     "takeoff": {
         "title": "Takeoff Ground Roll",
@@ -29,7 +30,8 @@ ASSETS = {
         "json_default": "to_ground_roll.json",
         "bg_kind": "image",
         "page_default": 0,
-        "round_to": 5,   # ft
+        "round_to": 5,     # ft
+        "label_font": 18,
     },
     "climb": {
         "title": "Climb Performance",
@@ -37,7 +39,8 @@ ASSETS = {
         "json_default": "climb_perf.json",
         "bg_kind": "image",
         "page_default": 0,
-        "round_to": 10,  # fpm (podes alterar)
+        "round_to": 10,    # fpm
+        "label_font": 18,
     },
 }
 
@@ -162,7 +165,7 @@ def parse_pa_levels_ft(lines: Dict[str, List[Dict[str, float]]]) -> List[Tuple[f
     for k, segs in lines.items():
         if not k.startswith("pa_"):
             continue
-        if not segs:  # ignore empty (ex: pa_sea_level pode estar vazio)
+        if not segs:
             continue
         if k == "pa_sea_level":
             out.append((0.0, k))
@@ -208,10 +211,6 @@ def interp_guides_y(
     y_ref: float,
     x_target: float
 ) -> Tuple[float, Dict[str, Any]]:
-    """
-    Evaluate each guide at x_ref and x_target, then interpolate between the two guides that bracket y_ref at x_ref.
-    Returns y_target and debug info.
-    """
     if not guides:
         return y_ref, {"used": "none"}
 
@@ -221,7 +220,7 @@ def interp_guides_y(
         yt = line_y_at_x(g, x_target)
         rows.append((yr, yt))
 
-    rows.sort(key=lambda t: t[0])  # sort by y at ref
+    rows.sort(key=lambda t: t[0])
 
     if y_ref <= rows[0][0]:
         return float(rows[0][1]), {"used": "clamp_low"}
@@ -241,26 +240,21 @@ def interp_guides_y(
 
 
 def pick_guides(cap: Dict[str, Any], mode: str) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
-    """
-    Return (weight_guides, wind_guides) with smart fallback:
-    - takeoff: guides_weight / guides_wind
-    - landing: prefer middle/right IF present, else guides_weight/guides_wind (as in your new landing json)
-    """
     g = cap.get("guides", {}) or {}
+
     if mode == "takeoff":
         return g.get("guides_weight", []) or [], g.get("guides_wind", []) or []
 
-    # landing
+    # landing: prefer middle/right if present, else guides_weight/guides_wind
     mid = g.get("middle", []) or []
     rgt = g.get("right", []) or []
     if len(mid) == 0 and len(rgt) == 0:
-        # your new landing json uses these keys
         return g.get("guides_weight", []) or [], g.get("guides_wind", []) or []
     return mid, rgt
 
 
 # =========================
-# Drawing arrows + label
+# Drawing (arrows + smart label)
 # =========================
 def draw_arrow(draw: ImageDraw.ImageDraw, p1: Tuple[float, float], p2: Tuple[float, float], color: Tuple[int, int, int], w: int = 4):
     draw.line([p1, p2], fill=color, width=w)
@@ -276,10 +270,97 @@ def draw_arrow(draw: ImageDraw.ImageDraw, p1: Tuple[float, float], p2: Tuple[flo
     draw.polygon([p2, h1, h2], fill=color)
 
 
-def draw_label(draw: ImageDraw.ImageDraw, xy: Tuple[float, float], text: str, color: Tuple[int, int, int]):
-    # tiny offset so it doesn't sit exactly on the arrow tip
-    x, y = xy
-    draw.text((x + 8, y - 10), text, fill=color)
+def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    # DejaVuSans costuma existir em Linux/Streamlit Cloud
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def text_bbox(draw: ImageDraw.ImageDraw, text: str, font) -> Tuple[int, int]:
+    # returns (w,h)
+    try:
+        x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+        return int(x1 - x0), int(y1 - y0)
+    except Exception:
+        # fallback rough
+        return (8 * len(text), 14)
+
+
+def place_label_smart(
+    draw: ImageDraw.ImageDraw,
+    img_w: int,
+    img_h: int,
+    tip: Tuple[float, float],
+    text: str,
+    font,
+    pad: int = 4,
+    safe_margin: int = 8,
+) -> Tuple[Tuple[int, int], Tuple[int, int, int, int]]:
+    """
+    Choose a label position around tip that:
+      - stays inside bounds
+      - avoids being glued to the right edge (where axis labels live)
+    Returns: (text_xy), (rect_xyxy)
+    """
+    tx, ty = int(tip[0]), int(tip[1])
+    tw, th = text_bbox(draw, text, font)
+
+    # candidate offsets (dx,dy) relative to tip
+    candidates = [
+        (10, -th - 10),          # right-up
+        (-tw - 10, -th - 10),    # left-up
+        (10, 10),                # right-down
+        (-tw - 10, 10),          # left-down
+        (-tw - 10, -th // 2),    # left-mid
+        (10, -th // 2),          # right-mid
+        (-tw // 2, -th - 12),    # above
+        (-tw // 2, 12),          # below
+    ]
+
+    def ok(x: int, y: int) -> bool:
+        # label rect with padding
+        rx0 = x - pad
+        ry0 = y - pad
+        rx1 = x + tw + pad
+        ry1 = y + th + pad
+        if rx0 < safe_margin or ry0 < safe_margin:
+            return False
+        if rx1 > img_w - safe_margin or ry1 > img_h - safe_margin:
+            return False
+        # extra: keep away from extreme right edge (axis labels)
+        if rx1 > img_w - 30:
+            return False
+        return True
+
+    for dx, dy in candidates:
+        x = tx + dx
+        y = ty + dy
+        if ok(x, y):
+            rect = (x - pad, y - pad, x + tw + pad, y + th + pad)
+            return (x, y), rect
+
+    # fallback: clamp inside
+    x = min(max(tx - tw - 10, safe_margin), img_w - tw - safe_margin - 30)
+    y = min(max(ty - th - 10, safe_margin), img_h - th - safe_margin)
+    rect = (x - pad, y - pad, x + tw + pad, y + th + pad)
+    return (x, y), rect
+
+
+def draw_label_smart(
+    draw: ImageDraw.ImageDraw,
+    img_w: int,
+    img_h: int,
+    tip: Tuple[float, float],
+    text: str,
+    font,
+    color_text: Tuple[int, int, int] = (255, 140, 0),
+):
+    (x, y), rect = place_label_smart(draw, img_w, img_h, tip, text, font)
+    # white background box
+    draw.rectangle(rect, fill=(255, 255, 255), outline=(0, 0, 0), width=2)
+    draw.text((x, y), text, fill=color_text, font=font)
 
 
 # =========================
@@ -293,21 +374,10 @@ def solve_ground_roll(
     weight_lb: float,
     wind_kt: float
 ) -> Tuple[float, List[Tuple[Tuple[float, float], Tuple[float, float]]], Dict[str, Any]]:
-    """
-    Landing/Takeoff solver:
-      - x_oat from ticks
-      - y_entry from PA family interpolation at x_oat
-      - transfer to weight REF line
-      - apply weight guides interpolation to x_weight
-      - transfer to wind REF line
-      - apply wind guides interpolation to x_wind
-      - read output from right axis
-    """
     ticks = cap["axis_ticks"]
     lines = cap["lines"]
     panels = normalize_panels(cap)
 
-    # axis fits
     ax_oat_a, ax_oat_b = fit_axis_value_from_ticks(ticks["oat_c"], "x")
     ax_wt_a, ax_wt_b = fit_axis_value_from_ticks(ticks["weight_x100_lb"], "x")
     ax_wind_a, ax_wind_b = fit_axis_value_from_ticks(ticks["wind_kt"], "x")
@@ -315,7 +385,6 @@ def solve_ground_roll(
     out_axis_key = "ground_roll_ft" if mode == "landing" else "takeoff_gr_ft"
     ax_out_a, ax_out_b = fit_axis_value_from_ticks(ticks[out_axis_key], "y")
 
-    # ref lines
     if not lines.get("weight_ref_line"):
         raise ValueError("Missing lines['weight_ref_line']")
     if not lines.get("wind_ref_zero"):
@@ -324,54 +393,36 @@ def solve_ground_roll(
     x_ref_mid = x_of_vertical_ref(lines["weight_ref_line"][0])
     x_ref_right = x_of_vertical_ref(lines["wind_ref_zero"][0])
 
-    # 1) OAT -> x
     x_oat = axis_coord_from_value(ax_oat_a, ax_oat_b, oat_c)
 
-    # 2) PA family (ignore empty lines; your new landing json has pa_sea_level empty) :contentReference[oaicite:1]{index=1}
     pa_levels = parse_pa_levels_ft(lines)
     (lo_ft, k_lo), (hi_ft, k_hi), alpha = interp_between_levels(pa_ft, pa_levels)
     seg_lo = lines[k_lo][0]
     seg_hi = lines[k_hi][0]
     y_entry = (1 - alpha) * line_y_at_x(seg_lo, x_oat) + alpha * line_y_at_x(seg_hi, x_oat)
 
-    # 3) weight -> x
     x_wt = axis_coord_from_value(ax_wt_a, ax_wt_b, weight_lb / 100.0)
 
-    # 4) guides (smart per-mode)
     g_mid, g_right = pick_guides(cap, mode=mode)
-
     y_mid, dbg_mid = interp_guides_y(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
 
-    # 5) wind -> x
     x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
-
     y_out, dbg_right = interp_guides_y(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
 
     out_val = axis_value(ax_out_a, ax_out_b, y_out)
 
-    # segments to draw (arrows)
     segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
-
-    # vertical in left panel (bottom -> entry)
     left_panel = panels.get("left") or []
     if not left_panel:
         raise ValueError("Missing panel_corners['left']")
     y_bottom_left = float(left_panel[2]["y"])
+
     segs.append(((x_oat, y_bottom_left), (x_oat, y_entry)))
-
-    # horizontal to weight REF line
     segs.append(((x_oat, y_entry), (x_ref_mid, y_entry)))
-
-    # diagonal along weight guide to x_wt
     segs.append(((x_ref_mid, y_entry), (x_wt, y_mid)))
-
-    # horizontal to wind REF line
     segs.append(((x_wt, y_mid), (x_ref_right, y_mid)))
-
-    # diagonal along wind guide to x_wind
     segs.append(((x_ref_right, y_mid), (x_wind, y_out)))
 
-    # horizontal to right edge for "reading"
     right_panel = panels.get("right") or []
     if not right_panel:
         raise ValueError("Missing panel_corners['right']")
@@ -390,10 +441,6 @@ def solve_ground_roll(
         "pa_interp": {"lo": (lo_ft, k_lo), "hi": (hi_ft, k_hi), "alpha": alpha},
         "guide_mid": dbg_mid,
         "guide_right": dbg_right,
-        "guides_used": {
-            "mid_len": len(g_mid),
-            "right_len": len(g_right),
-        },
     }
     return out_val, segs, debug
 
@@ -403,13 +450,6 @@ def solve_climb(
     oat_c: float,
     pa_ft: float
 ) -> Tuple[float, List[Tuple[Tuple[float, float], Tuple[float, float]]], Dict[str, Any]]:
-    """
-    CLIMB solver (correct reading):
-      - x from OAT
-      - y from PA family (interpolated) evaluated at x
-      - ROC from y-axis ticks
-      - Draw vertical to the curve point AND horizontal to right axis for reading.
-    """
     ticks = cap["axis_ticks"]
     lines = cap["lines"]
     panels = normalize_panels(cap)
@@ -431,13 +471,11 @@ def solve_climb(
     if not main:
         raise ValueError("Missing panel_corners['main']")
     y_bottom = float(main[2]["y"])
-
-    # Right edge for reading (use panel rightmost x)
     x_right_edge = float(main[1]["x"])
 
     segs = [
-        ((x_oat, y_bottom), (x_oat, y)),        # vertical
-        ((x_oat, y), (x_right_edge, y)),        # horizontal to axis
+        ((x_oat, y_bottom), (x_oat, y)),
+        ((x_oat, y), (x_right_edge, y)),
     ]
 
     debug = {
@@ -458,46 +496,43 @@ def draw_overlay(
     show_overlay: bool,
     show_path: bool,
     path_segs: List[Tuple[Tuple[float, float], Tuple[float, float]]],
-    label: Optional[Tuple[str, Tuple[float, float]]],
+    label_text: Optional[str],
+    label_tip: Optional[Tuple[float, float]],
+    label_font_size: int,
 ) -> Image.Image:
     img = base.copy()
     d = ImageDraw.Draw(img)
+    W, H = img.size
 
     panels = normalize_panels(cap)
 
     if show_overlay:
-        # lines (red)
         for _, seglist in cap.get("lines", {}).items():
             for s in seglist:
                 d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(255, 0, 0), width=3)
 
-        # guides (blue)
         for _, seglist in cap.get("guides", {}).items():
             for s in seglist:
                 d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(0, 0, 255), width=4)
 
-        # ticks (green)
         for _, tlist in cap.get("axis_ticks", {}).items():
             for t in tlist:
                 x, y = float(t["x"]), float(t["y"])
                 d.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(0, 160, 0), width=3)
 
-        # panels (cyan)
         for panel, pts in panels.items():
             if len(pts) == 4:
                 poly = [(pts[i]["x"], pts[i]["y"]) for i in range(4)]
                 d.line(poly + [poly[0]], fill=(0, 140, 255), width=3)
                 d.text((poly[0][0] + 6, poly[0][1] + 6), str(panel), fill=(0, 140, 255))
 
-    # path arrows (orange)
     if show_path:
         for p1, p2 in path_segs:
             draw_arrow(d, p1, p2, color=(255, 140, 0), w=5)
 
-    # label near final arrow tip
-    if label is not None:
-        text, xy = label
-        draw_label(d, xy, text, color=(255, 140, 0))
+    if label_text and label_tip:
+        font = load_font(label_font_size)
+        draw_label_smart(d, W, H, label_tip, label_text, font)
 
     return img
 
@@ -536,7 +571,9 @@ with right:
     segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
     dbg: Dict[str, Any] = {}
     raw = 0.0
-    label: Optional[Tuple[str, Tuple[float, float]]] = None
+
+    label_text: Optional[str] = None
+    label_tip: Optional[Tuple[float, float]] = None
 
     if mode in ("landing", "takeoff"):
         oat = st.number_input("OAT (°C)", value=21.0 if mode == "landing" else 23.0, step=1.0)
@@ -551,10 +588,10 @@ with right:
         name = "Ground roll (ft)" if mode == "landing" else "Takeoff GR (ft)"
         st.metric(name, f"{out:.0f}", help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}")
 
-        # label at the end of last segment
         if segs:
             _, tip = segs[-1]
-            label = (f"{out:.0f} ft", tip)
+            label_text = f"{out:.0f} ft"
+            label_tip = tip
 
     else:
         oat = st.number_input("OAT (°C)", value=19.0, step=1.0)
@@ -565,8 +602,9 @@ with right:
         st.metric("Rate of climb (FPM)", f"{out:.0f}", help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}")
 
         if segs:
-            _, tip = segs[-1]  # horizontal segment end
-            label = (f"{out:.0f} fpm", tip)
+            _, tip = segs[-1]
+            label_text = f"{out:.0f} fpm"
+            label_tip = tip
 
     st.markdown("---")
     show_overlay = st.checkbox("Mostrar overlay das linhas capturadas", value=True)
@@ -582,9 +620,12 @@ with left:
         show_overlay=show_overlay,
         show_path=show_path,
         path_segs=segs,
-        label=label,
+        label_text=label_text,
+        label_tip=label_tip,
+        label_font_size=int(info["label_font"]),
     )
     st.image(img, use_container_width=True)
     st.caption("Vermelho: linhas. Azul: guides. Verde: ticks. Ciano: painéis. Laranja: caminho do solver + valor.")
+
 
 
