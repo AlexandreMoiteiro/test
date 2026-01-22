@@ -2,5 +2,4 @@ streamlit>=1.30
 pymupdf>=1.23
 pillow>=10.0
 numpy>=1.26
-opencv-python-headless>=4.10
-
+streamlit-image-coordinates>=0.2.0
