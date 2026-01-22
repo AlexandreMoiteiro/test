@@ -90,14 +90,14 @@ def render_pdf_page_to_pil(pdf_path: str, page_index: int = 0, zoom: float = 2.3
 
 
 # =========================
-# ROBUST CALIBRATION (para o solver)
+# ROBUST CALIBRATION
 # =========================
 def robust_fit_x_from_value(ticks: List[Dict[str, float]]) -> Tuple[float, float]:
     vals = np.array([t["value"] for t in ticks], dtype=float)
     xs = np.array([t["x"] for t in ticks], dtype=float)
     n = len(vals)
     if n < 2:
-        raise ValueError("Poucos ticks para calibrar.")
+        raise ValueError("Poucos ticks para calibrar eixo (precisas >=2).")
     slopes = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -115,7 +115,7 @@ def robust_fit_value_from_y(ticks: List[Dict[str, float]]) -> Tuple[float, float
     vals = np.array([t["value"] for t in ticks], dtype=float)
     n = len(ys)
     if n < 2:
-        raise ValueError("Poucos ticks para calibrar.")
+        raise ValueError("Poucos ticks para calibrar eixo (precisas >=2).")
     slopes = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -128,6 +128,9 @@ def robust_fit_value_from_y(ticks: List[Dict[str, float]]) -> Tuple[float, float
     return m, b
 
 
+# =========================
+# NOMOGRAM HELPERS
+# =========================
 def std_atm_isa_temp_c(pressure_alt_ft: float) -> float:
     return 15.0 - 1.98 * (pressure_alt_ft / 1000.0)
 
@@ -136,6 +139,7 @@ def interpolate_line(pairs: List[Tuple[float, LineABC]], value: float) -> LineAB
     pairs = sorted(pairs, key=lambda t: t[0])
     values = [v for v, _ in pairs]
     v = clamp(value, values[0], values[-1])
+
     for i in range(len(pairs) - 1):
         v1, l1 = pairs[i]
         v2, l2 = pairs[i + 1]
@@ -148,6 +152,7 @@ def interpolate_line(pairs: List[Tuple[float, LineABC]], value: float) -> LineAB
             if n == 0:
                 return LineABC(0.0, 0.0, 0.0)
             return LineABC(a / n, b / n, c / n)
+
     return pairs[-1][1]
 
 
@@ -162,6 +167,9 @@ def choose_nearest_guide(guide_segs: List[Dict[str, float]], p_start: Tuple[floa
     return min(lines, key=lambda ln: ln.distance_to_point(p_start))
 
 
+# =========================
+# GUIDES JSON STRUCT
+# =========================
 def ensure_guide_struct(capture: Dict[str, Any]) -> None:
     if "guide_lines" not in capture or not isinstance(capture["guide_lines"], dict):
         capture["guide_lines"] = {}
@@ -178,24 +186,32 @@ def add_segment(capture: Dict[str, Any], key: str, p1: Tuple[float, float], p2: 
     )
 
 
-def overlay_existing_guides(img: Image.Image, capture: Dict[str, Any], key: str,
-                           pending: Optional[Tuple[float, float]] = None,
-                           last_click: Optional[Tuple[float, float]] = None) -> Image.Image:
+# =========================
+# DRAWING (Editor overlay + Solver arrows)
+# =========================
+def overlay_existing_guides(
+    img: Image.Image,
+    capture: Dict[str, Any],
+    key: str,
+    pending: Optional[Tuple[float, float]] = None,
+    last_click: Optional[Tuple[float, float]] = None,
+) -> Image.Image:
     out = img.copy()
     d = ImageDraw.Draw(out)
 
     ensure_guide_struct(capture)
-    # existing lines
-    for seg in capture["guide_lines"][key]:
-        d.line([(seg["x1"], seg["y1"]), (seg["x2"], seg["y2"])], fill=(0, 160, 0), width=4)
 
-    # pending first point
+    # linhas guardadas (verde)
+    for seg in capture["guide_lines"][key]:
+        d.line([(seg["x1"], seg["y1"]), (seg["x2"], seg["y2"])], fill=(0, 170, 0), width=4)
+
+    # ponto pendente P1 (laranja)
     if pending is not None:
         x, y = pending
-        d.ellipse((x - 7, y - 7, x + 7, y + 7), outline=(255, 120, 0), width=4)
-        d.text((x + 10, y - 10), "P1", fill=(255, 120, 0))
+        d.ellipse((x - 7, y - 7, x + 7, y + 7), outline=(255, 140, 0), width=4)
+        d.text((x + 10, y - 10), "P1", fill=(255, 140, 0))
 
-    # last click point
+    # último clique (azul)
     if last_click is not None:
         x, y = last_click
         d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=(0, 0, 255), width=3)
@@ -219,13 +235,16 @@ def draw_arrow(draw: ImageDraw.ImageDraw, p1, p2, width=5):
     draw.polygon(tri, fill=(255, 0, 0))
 
 
+# =========================
+# SOLVER (uses captured guides)
+# =========================
 def solve_with_guides(
     capture: Dict[str, Any],
     base_img: Image.Image,
     pressure_alt_ft: float,
     oat_c: float,
     weight_lb: float,
-    wind_kt_signed: float,
+    wind_kt_signed: float,  # tailwind negativo
 ) -> Tuple[float, float, List[Tuple[float, float]]]:
 
     ensure_guide_struct(capture)
@@ -257,28 +276,33 @@ def solve_with_guides(
     isa_m15 = get_line("isa_m15")
     isa_0 = get_line("isa")
     isa_p35 = get_line("isa_p35")
+
     pa0 = get_line("pa_sea_level")
     pa2 = get_line("pa_2000")
     pa4 = get_line("pa_4000")
     pa6 = get_line("pa_6000")
     pa7 = get_line("pa_7000")
+
     w_ref = get_line("weight_ref_line")
     z_wind = get_line("wind_ref_zero")
 
     dev = oat_c - std_atm_isa_temp_c(pressure_alt_ft)
     isa_line = interpolate_line([(-15.0, isa_m15), (0.0, isa_0), (35.0, isa_p35)], dev)
     pa_line = interpolate_line([(0.0, pa0), (2000.0, pa2), (4000.0, pa4), (6000.0, pa6), (7000.0, pa7)], pressure_alt_ft)
+
     p_left = isa_line.intersect(pa_line)
     if p_left is None:
         raise ValueError("Falhou ISA/PA")
 
+    # seta para cima: do eixo OAT até ao ponto do painel esquerdo
     p_oat = (float(x_from_oat(oat_c)), oat_axis_y)
 
+    # horizontal para weight_ref
     p_wref = w_ref.intersect(horiz_line(p_left[1]))
     if p_wref is None:
-        raise ValueError("Falhou weight ref")
+        raise ValueError("Falhou weight_ref_line")
 
-    # weight
+    # painel weight: guia mais próxima ao ponto p_wref
     guide_w = choose_nearest_guide(capture["guide_lines"]["weight_guides"], p_wref)
     xw = float(x_from_weight_lb(weight_lb))
     if guide_w is None:
@@ -287,19 +311,17 @@ def solve_with_guides(
         ln = parallel_line_through(guide_w, p_wref)
         p_w = ln.intersect(vert_line(xw)) or (xw, p_wref[1])
 
+    # horizontal para wind_ref_zero
     p_z = z_wind.intersect(horiz_line(p_w[1]))
     if p_z is None:
-        raise ValueError("Falhou wind ref")
+        raise ValueError("Falhou wind_ref_zero")
 
+    # escolhe conjunto headwind/tailwind
     wind_mag = abs(float(wind_kt_signed))
-    if wind_kt_signed >= 0:
-        wind_guides = capture["guide_lines"]["wind_headwind_guides"]
-    else:
-        wind_guides = capture["guide_lines"]["wind_tailwind_guides"]
+    wind_key = "wind_headwind_guides" if wind_kt_signed >= 0 else "wind_tailwind_guides"
+    guide_wind = choose_nearest_guide(capture["guide_lines"][wind_key], p_z)
 
-    guide_wind = choose_nearest_guide(wind_guides, p_z)
     xwind = float(x_from_wind(wind_mag))
-
     if guide_wind is None:
         p_wind = (xwind, p_z[1])
     else:
@@ -333,20 +355,30 @@ if pdf_up is not None:
     Path("uploaded.pdf").write_bytes(pdf_up.read())
     pdf_path = str(Path("uploaded.pdf"))
 
-if cap_up is not None:
-    Path("capture.json").write_bytes(cap_up.read())
-    cap_path = str(Path("capture.json"))
-
 if not pdf_path:
     st.error(f"Não encontrei '{PDF_NAME_DEFAULT}' e não fizeste upload.")
     st.stop()
 
-if cap_path and Path(cap_path).exists():
-    capture = json.loads(Path(cap_path).read_text(encoding="utf-8"))
-else:
-    capture = {"zoom": 2.3, "lines": {}, "axis_ticks": {}, "panel_corners": {}}
 
+# ---- session-state capture (THIS IS THE FIX) ----
+if "capture" not in st.session_state:
+    # inicializa uma vez
+    if cap_up is not None:
+        st.session_state.capture = json.loads(cap_up.read().decode("utf-8"))
+    elif cap_path and Path(cap_path).exists():
+        st.session_state.capture = json.loads(Path(cap_path).read_text(encoding="utf-8"))
+    else:
+        st.session_state.capture = {"zoom": 2.3, "lines": {}, "axis_ticks": {}, "panel_corners": {}}
+    ensure_guide_struct(st.session_state.capture)
+else:
+    # se fizerem upload novo, substitui explicitamente
+    if cap_up is not None:
+        st.session_state.capture = json.loads(cap_up.read().decode("utf-8"))
+        ensure_guide_struct(st.session_state.capture)
+
+capture = st.session_state.capture
 ensure_guide_struct(capture)
+
 zoom = float(capture.get("zoom", 2.3))
 base_img = render_pdf_page_to_pil(pdf_path, zoom=zoom)
 
@@ -357,24 +389,26 @@ if "pending_p1" not in st.session_state:
 if "last_click" not in st.session_state:
     st.session_state.last_click = None
 
+
 if mode == "Editor de guias (JSON)":
     st.subheader("Editor: clica 2 pontos por linha (P1 e P2)")
     st.markdown(
-        "**Recomendação:** mete as linhas **de baixo para cima** (mas qualquer ordem funciona).  \n"
-        "**WEIGHT**: 5–7 linhas.  \n"
-        "**WIND HEADWIND**: 5–7 linhas.  \n"
-        "**WIND TAILWIND**: 5–7 linhas."
+        "- Recomendo: **de baixo para cima** (mas qualquer ordem dá).  \n"
+        "- WEIGHT: 5–7 linhas  \n"
+        "- WIND headwind: 5–7 linhas  \n"
+        "- WIND tailwind: 5–7 linhas"
     )
 
     key = st.selectbox("Conjunto", ["weight_guides", "wind_headwind_guides", "wind_tailwind_guides"])
 
+    # overlay SEMPRE a partir do capture em session_state
     img_overlay = overlay_existing_guides(
         base_img, capture, key,
         pending=st.session_state.pending_p1,
         last_click=st.session_state.last_click
     )
 
-    # IMPORTANT: pass numpy array (more reliable)
+    # numpy array é mais fiável para o componente
     img_np = np.array(img_overlay)
 
     click = streamlit_image_coordinates(img_np, key=f"coords_{key}")
@@ -383,7 +417,7 @@ if mode == "Editor de guias (JSON)":
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.write("Ponto pendente (P1):", st.session_state.pending_p1)
+        st.write("P1 pendente:", st.session_state.pending_p1)
     with c2:
         if st.button("Limpar P1"):
             st.session_state.pending_p1 = None
@@ -404,7 +438,7 @@ if mode == "Editor de guias (JSON)":
         else:
             p1 = st.session_state.pending_p1
             p2 = p
-            add_segment(capture, key, p1, p2)
+            add_segment(capture, key, p1, p2)  # <- agora fica no session_state
             st.session_state.pending_p1 = None
             st.rerun()
 
@@ -453,5 +487,4 @@ else:
         d.text((x + 8, y - 14), f"{int(gr_round)} ft", fill=(0, 0, 0))
 
         st.image(img, use_container_width=True)
-
 
