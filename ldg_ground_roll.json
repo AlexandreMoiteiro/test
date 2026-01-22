@@ -89,4 +89,12 @@
     "wind_ref_zero": [
       { "x1": 1295.0, "y1": 1143.0, "x2": 1290.0, "y2": 427.0 }
     ]
+  },
+  "notes": "Tudo em pixels da imagem renderizada com o zoom acima.",
+  "guides": {
+    "middle": [
+    ],
+    "right": [
+    ]
+  }
 }
