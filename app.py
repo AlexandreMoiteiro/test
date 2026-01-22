@@ -55,9 +55,9 @@ def vert_line(x: float) -> LineABC:
     return LineABC(1.0, 0.0, -float(x))
 
 
-def parallel_line_through(line: LineABC, p: Tuple[float, float]) -> LineABC:
+def parallel_line_through(base: LineABC, p: Tuple[float, float]) -> LineABC:
     x, y = p
-    return LineABC(line.a, line.b, -(line.a * x + line.b * y))
+    return LineABC(base.a, base.b, -(base.a * x + base.b * y))
 
 
 # =========================
@@ -90,7 +90,7 @@ def robust_fit_x_from_value(ticks: List[Dict[str, float]]) -> Tuple[float, float
     xs = np.array([t["x"] for t in ticks], dtype=float)
     n = len(vals)
     if n < 2:
-        raise ValueError("Poucos ticks para calibrar eixo (>=2).")
+        raise ValueError("Poucos ticks para calibrar.")
     slopes = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -108,7 +108,7 @@ def robust_fit_value_from_y(ticks: List[Dict[str, float]]) -> Tuple[float, float
     vals = np.array([t["value"] for t in ticks], dtype=float)
     n = len(ys)
     if n < 2:
-        raise ValueError("Poucos ticks para calibrar eixo (>=2).")
+        raise ValueError("Poucos ticks para calibrar.")
     slopes = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -126,7 +126,7 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 # =========================
-# Nomogram model helpers
+# Nomogram model
 # =========================
 def std_atm_isa_temp_c(pressure_alt_ft: float) -> float:
     return 15.0 - 1.98 * (pressure_alt_ft / 1000.0)
@@ -146,30 +146,47 @@ def interpolate_line(pairs: List[Tuple[float, LineABC]], value: float) -> LineAB
             b = (1 - t) * l1.b + t * l2.b
             c = (1 - t) * l1.c + t * l2.c
             n = float(np.hypot(a, b))
-            if n == 0:
-                return LineABC(0.0, 0.0, 0.0)
             return LineABC(a / n, b / n, c / n)
-
     return pairs[-1][1]
 
 
-def get_line_from_capture(capture: Dict[str, Any], key: str) -> Optional[LineABC]:
-    if "lines" in capture and key in capture["lines"] and capture["lines"][key]:
-        seg = capture["lines"][key][0]
-        return LineABC.from_points((seg["x1"], seg["y1"]), (seg["x2"], seg["y2"]))
-    if "guides" in capture and key in capture["guides"]:
-        seg = capture["guides"][key]
-        return LineABC.from_points((seg["x1"], seg["y1"]), (seg["x2"], seg["y2"]))
-    return None
+def choose_guide_and_intersect(
+    guide_low: Optional[LineABC],
+    guide_high: Optional[LineABC],
+    p_start: Tuple[float, float],
+    x_target: float,
+) -> Optional[Tuple[float, float]]:
+    """
+    Usa 1 ou 2 guias capturadas.
+    - Se só existir uma: usa essa direção (reta paralela por p_start).
+    - Se existirem duas: escolhe a mais próxima em y (ou interpola direção).
+    """
+    if guide_low is None and guide_high is None:
+        return None
+
+    if guide_low is not None and guide_high is None:
+        ln = parallel_line_through(guide_low, p_start)
+        return ln.intersect(vert_line(x_target))
+    if guide_high is not None and guide_low is None:
+        ln = parallel_line_through(guide_high, p_start)
+        return ln.intersect(vert_line(x_target))
+
+    # ambas existem: escolher a mais próxima em y ao ponto inicial
+    assert guide_low is not None and guide_high is not None
+
+    # distância perpendicular ao ponto
+    d_low = abs(guide_low.a * p_start[0] + guide_low.b * p_start[1] + guide_low.c)
+    d_high = abs(guide_high.a * p_start[0] + guide_high.b * p_start[1] + guide_high.c)
+
+    # opção simples: escolher a mais próxima
+    base = guide_low if d_low <= d_high else guide_high
+
+    ln = parallel_line_through(base, p_start)
+    return ln.intersect(vert_line(x_target))
 
 
-def solve_ground_roll(
-    capture: Dict[str, Any],
-    pressure_alt_ft: float,
-    oat_c: float,
-    weight_lb: float,
-    headwind_kt: float,
-) -> Tuple[float, float, Dict[str, Tuple[float, float]]]:
+def solve_ground_roll(capture: Dict[str, Any], base_img: Image.Image,
+                      pressure_alt_ft: float, oat_c: float, weight_lb: float, headwind_kt: float):
     ticks_oat = capture["axis_ticks"]["oat_c"]
     ticks_wt  = capture["axis_ticks"]["weight_x100_lb"]
     ticks_wnd = capture["axis_ticks"]["wind_kt"]
@@ -188,27 +205,41 @@ def solve_ground_roll(
     def x_from_wind(v): return mwd * v + bwd
     def gr_from_y(y): return mgr * y + bgr
 
-    # Required lines
-    isa_m15 = get_line_from_capture(capture, "isa_m15")
-    isa_0   = get_line_from_capture(capture, "isa")
-    isa_p35 = get_line_from_capture(capture, "isa_p35")
+    lines = capture["lines"]
 
-    pa0 = get_line_from_capture(capture, "pa_sea_level")
-    pa2 = get_line_from_capture(capture, "pa_2000")
-    pa4 = get_line_from_capture(capture, "pa_4000")
-    pa6 = get_line_from_capture(capture, "pa_6000")
-    pa7 = get_line_from_capture(capture, "pa_7000")
+    def seg_to_line(key: str) -> LineABC:
+        seg = lines[key][0]
+        return LineABC.from_points((seg["x1"], seg["y1"]), (seg["x2"], seg["y2"]))
 
-    w_ref  = get_line_from_capture(capture, "weight_ref_line")
-    z_wind = get_line_from_capture(capture, "wind_ref_zero")
+    # fixed lines
+    isa_m15 = seg_to_line("isa_m15")
+    isa_0   = seg_to_line("isa")
+    isa_p35 = seg_to_line("isa_p35")
 
-    if not all([isa_m15, isa_0, isa_p35, pa0, pa2, pa4, pa6, pa7, w_ref, z_wind]):
-        raise ValueError("Faltam linhas base no capture.json (ISA/PA/ref lines).")
+    pa0 = seg_to_line("pa_sea_level")
+    pa2 = seg_to_line("pa_2000")
+    pa4 = seg_to_line("pa_4000")
+    pa6 = seg_to_line("pa_6000")
+    pa7 = seg_to_line("pa_7000")
 
-    # Optional guides you will capture:
-    weight_guide = get_line_from_capture(capture, "weight_guide")
-    wind_guide   = get_line_from_capture(capture, "wind_guide")
+    w_ref  = seg_to_line("weight_ref_line")
+    z_wind = seg_to_line("wind_ref_zero")
 
+    # optional guides (NEW)
+    guide_lines = capture.get("guide_lines", {})
+    def read_guide(name: str) -> Optional[LineABC]:
+        segs = guide_lines.get(name)
+        if not segs:
+            return None
+        s = segs[0]
+        return LineABC.from_points((s["x1"], s["y1"]), (s["x2"], s["y2"]))
+
+    w_low = read_guide("weight_guide_low")
+    w_high = read_guide("weight_guide_high")
+    v_low = read_guide("wind_guide_low")
+    v_high = read_guide("wind_guide_high")
+
+    # left intersection
     dev = oat_c - std_atm_isa_temp_c(pressure_alt_ft)
     isa_line = interpolate_line([(-15.0, isa_m15), (0.0, isa_0), (35.0, isa_p35)], dev)
     pa_line  = interpolate_line([(0.0, pa0), (2000.0, pa2), (4000.0, pa4), (6000.0, pa6), (7000.0, pa7)], pressure_alt_ft)
@@ -219,45 +250,34 @@ def solve_ground_roll(
 
     p_oat = (float(x_from_oat(oat_c)), oat_axis_y)
 
+    # to weight ref
     p_wref = w_ref.intersect(horiz_line(p_left[1]))
     if p_wref is None:
-        raise ValueError("Falhou interseção com weight_ref_line.")
+        raise ValueError("Falhou weight_ref_line.")
 
-    # middle
-    xw = float(x_from_weight_lb(weight_lb))
-    if weight_guide is not None:
-        ln = parallel_line_through(weight_guide, p_wref)
-        p_w = ln.intersect(vert_line(xw))
-    else:
-        theta = np.deg2rad(-55.0)
-        fallback = LineABC.from_points(p_wref, (p_wref[0] + 100*np.cos(theta), p_wref[1] + 100*np.sin(theta)))
-        p_w = fallback.intersect(vert_line(xw))
-
+    # to weight using guides
+    x_weight = x_from_weight_lb(weight_lb)
+    p_w = choose_guide_and_intersect(w_low, w_high, p_wref, x_weight)
     if p_w is None:
-        raise ValueError("Falhou projeção no painel do weight (captura weight_guide).")
+        # fallback simples: diagonal aproximada
+        p_w = (x_weight, p_wref[1])
 
+    # to wind ref
     p_z = z_wind.intersect(horiz_line(p_w[1]))
     if p_z is None:
-        raise ValueError("Falhou interseção com wind_ref_zero.")
+        raise ValueError("Falhou wind_ref_zero.")
 
-    # right
-    xv = float(x_from_wind(headwind_kt))
-    if wind_guide is not None:
-        ln = parallel_line_through(wind_guide, p_z)
-        p_wind = ln.intersect(vert_line(xv))
-    else:
-        theta = np.deg2rad(-55.0)
-        fallback = LineABC.from_points(p_z, (p_z[0] + 100*np.cos(theta), p_z[1] + 100*np.sin(theta)))
-        p_wind = fallback.intersect(vert_line(xv))
-
+    # to wind using guides
+    x_wind = x_from_wind(headwind_kt)
+    p_wind = choose_guide_and_intersect(v_low, v_high, p_z, x_wind)
     if p_wind is None:
-        raise ValueError("Falhou projeção no painel do vento (captura wind_guide).")
+        p_wind = (x_wind, p_z[1])
 
     gr_raw = float(gr_from_y(p_wind[1]))
     gr_round = float(5.0 * round(gr_raw / 5.0))
     p_gr = (gr_axis_x, p_wind[1])
 
-    pts = {
+    points = {
         "p_oat": p_oat,
         "p_left": p_left,
         "p_wref": p_wref,
@@ -266,13 +286,13 @@ def solve_ground_roll(
         "p_wind": p_wind,
         "p_gr": p_gr,
     }
-    return gr_raw, gr_round, pts
+    return gr_raw, gr_round, points
 
 
 # =========================
 # Drawing
 # =========================
-def draw_arrow_pil(draw: ImageDraw.ImageDraw, p1, p2, width=5):
+def draw_arrow(draw: ImageDraw.ImageDraw, p1, p2, width=5):
     draw.line([p1, p2], fill=(255, 0, 0), width=width)
     x1, y1 = p1
     x2, y2 = p2
@@ -288,231 +308,171 @@ def draw_arrow_pil(draw: ImageDraw.ImageDraw, p1, p2, width=5):
     draw.polygon(tri, fill=(255, 0, 0))
 
 
-def overlay_segments(img: Image.Image, capture: Dict[str, Any], pending: Optional[Tuple[float, float]] = None) -> Image.Image:
+def draw_preview(img: Image.Image, points: Dict[str, Tuple[float, float]], gr_round: float) -> Image.Image:
     out = img.copy()
     d = ImageDraw.Draw(out)
 
-    if "lines" in capture:
-        for _, segs in capture["lines"].items():
-            for seg in segs:
-                d.line([(seg["x1"], seg["y1"]), (seg["x2"], seg["y2"])], fill=(0, 140, 0), width=2)
+    draw_arrow(d, points["p_oat"], points["p_left"], width=5)
+    draw_arrow(d, points["p_left"], points["p_wref"], width=5)
+    draw_arrow(d, points["p_wref"], points["p_w"], width=5)
+    draw_arrow(d, points["p_w"], points["p_z"], width=5)
+    draw_arrow(d, points["p_z"], points["p_wind"], width=5)
+    draw_arrow(d, points["p_wind"], points["p_gr"], width=5)
 
-    if "guides" in capture:
-        for _, seg in capture["guides"].items():
-            d.line([(seg["x1"], seg["y1"]), (seg["x2"], seg["y2"])], fill=(0, 0, 200), width=3)
-
-    if pending is not None:
-        x, y = pending
-        r = 7
-        d.ellipse((x - r, y - r, x + r, y + r), outline=(255, 120, 0), width=4)
-
-    return out
-
-
-def draw_solution(img: Image.Image, pts: Dict[str, Tuple[float, float]], gr_round: float) -> Image.Image:
-    out = img.copy()
-    d = ImageDraw.Draw(out)
-
-    draw_arrow_pil(d, pts["p_oat"], pts["p_left"], width=5)
-    draw_arrow_pil(d, pts["p_left"], pts["p_wref"], width=5)
-    draw_arrow_pil(d, pts["p_wref"], pts["p_w"], width=5)
-    draw_arrow_pil(d, pts["p_w"], pts["p_z"], width=5)
-    draw_arrow_pil(d, pts["p_z"], pts["p_wind"], width=5)
-    draw_arrow_pil(d, pts["p_wind"], pts["p_gr"], width=5)
-
-    def mark(p, color, r=6):
+    def mark(p, r=6, col=(0, 140, 0)):
         x, y = p
-        d.ellipse((x - r, y - r, x + r, y + r), outline=color, width=4)
+        d.ellipse((x - r, y - r, x + r, y + r), outline=col, width=4)
 
     for k in ["p_oat", "p_left", "p_wref", "p_w", "p_z", "p_wind", "p_gr"]:
-        mark(pts[k], (0, 120, 0) if k != "p_wind" else (0, 0, 200))
+        mark(points[k], col=(0, 0, 200) if k == "p_wind" else (0, 140, 0))
 
-    xg, yg = pts["p_gr"]
+    xg, yg = points["p_gr"]
     d.text((xg + 8, yg - 14), f"{int(gr_round)} ft", fill=(0, 0, 0))
     return out
 
 
 # =========================
-# Streamlit
+# CAPTURE / EDIT JSON helpers
 # =========================
-st.set_page_config(page_title="PA28 Ground Roll", layout="wide")
-st.title("PA-28 Landing Ground Roll — Solver + Editor (2 cliques = guarda)")
-
-colA, colB = st.columns(2)
-with colA:
-    pdf_up = st.file_uploader("PDF (opcional, senão usa o da pasta)", type=["pdf"])
-with colB:
-    cap_up = st.file_uploader("capture.json (opcional, senão usa o da pasta)", type=["json"])
-
-pdf_path = locate_file(PDF_NAME_DEFAULT)
-cap_path = locate_file(CAPTURE_NAME_DEFAULT)
-
-if pdf_up is not None:
-    Path("uploaded.pdf").write_bytes(pdf_up.read())
-    pdf_path = "uploaded.pdf"
-if cap_up is not None:
-    Path("capture.json").write_bytes(cap_up.read())
-    cap_path = "capture.json"
-
-if not pdf_path:
-    st.error(f"Não encontrei '{PDF_NAME_DEFAULT}' e não fizeste upload.")
-    st.stop()
-if not cap_path:
-    st.error(f"Não encontrei '{CAPTURE_NAME_DEFAULT}' e não fizeste upload.")
-    st.stop()
-
-capture_disk = json.loads(Path(cap_path).read_text(encoding="utf-8"))
-if "capture" not in st.session_state:
-    st.session_state.capture = capture_disk
-
-capture = st.session_state.capture
-capture.setdefault("lines", {})
-capture.setdefault("guides", {})
-zoom = float(capture.get("zoom", 2.3))
-
-# editor state
-if "pending_point" not in st.session_state:
-    st.session_state.pending_point = None
-if "last_click" not in st.session_state:
-    st.session_state.last_click = None  # to dedupe repeated clicks
-if "selected_kind" not in st.session_state:
-    st.session_state.selected_kind = "guides"
-if "selected_key" not in st.session_state:
-    st.session_state.selected_key = "weight_guide"
-
-tabs = st.tabs(["✅ Solver", "🛠️ Editor do JSON (2 cliques = guarda e avança)"])
+def ensure_capture_structure(cap: Dict[str, Any]) -> Dict[str, Any]:
+    cap.setdefault("guide_lines", {})
+    return cap
 
 
-with tabs[0]:
-    st.subheader("Inputs")
-    c1, c2, c3, c4 = st.columns(4)
+def add_segment(cap: Dict[str, Any], key: str, p1: Tuple[int, int], p2: Tuple[int, int]) -> None:
+    cap = ensure_capture_structure(cap)
+    cap["guide_lines"][key] = [{
+        "x1": int(p1[0]), "y1": int(p1[1]),
+        "x2": int(p2[0]), "y2": int(p2[1]),
+    }]
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="Nomogram Tool", layout="wide")
+st.title("PA-28 Landing Ground Roll — Captura + Solver")
+
+tab1, tab2 = st.tabs(["1) Capturar/Editar JSON (guias)", "2) Solver (calcular + desenhar)"])
+
+# Load PDF and capture.json
+with tab1:
+    st.subheader("Ficheiros")
+    c1, c2 = st.columns(2)
     with c1:
-        pressure_alt_ft = st.number_input("Pressure Altitude (ft)", value=2500.0, step=100.0)
+        pdf_up = st.file_uploader("PDF (opcional; senão usa o da pasta)", type=["pdf"], key="pdf_up_1")
     with c2:
-        oat_c = st.number_input("OAT (°C)", value=21.0, step=1.0)
-    with c3:
-        weight_lb = st.number_input("Weight (lb)", value=2240.0, step=10.0)
-    with c4:
-        headwind_kt = st.number_input("Headwind component (kt)", value=5.0, step=1.0)
+        cap_up = st.file_uploader("capture.json (opcional; senão usa o da pasta)", type=["json"], key="cap_up_1")
 
-    run = st.button("Calcular e desenhar", key="run_solver")
+    pdf_path = locate_file(PDF_NAME_DEFAULT)
+    cap_path = locate_file(CAPTURE_NAME_DEFAULT)
 
+    if pdf_up is not None:
+        Path("uploaded.pdf").write_bytes(pdf_up.read())
+        pdf_path = "uploaded.pdf"
+    if cap_up is not None:
+        Path("capture.json").write_bytes(cap_up.read())
+        cap_path = "capture.json"
+
+    if not pdf_path or not cap_path:
+        st.warning("Faz upload do PDF e do capture.json ou mete-os na mesma pasta do app.py")
+        st.stop()
+
+    capture = ensure_capture_structure(json.loads(Path(cap_path).read_text(encoding="utf-8")))
+    zoom = float(capture.get("zoom", 2.3))
     base_img = render_pdf_page_to_pil(pdf_path, zoom=zoom)
-    base_overlay = overlay_segments(base_img, capture)
 
+    st.markdown("### Adicionar linhas-guia (2 cliques por linha)")
+    st.markdown(
+        "- Recomendo criares 2 por painel (weight e wind):\n"
+        "  - `weight_guide_low` e `weight_guide_high`\n"
+        "  - `wind_guide_low` e `wind_guide_high`\n"
+        "- Ordem: **de baixo para cima** (low primeiro, high depois)."
+    )
+
+    key = st.selectbox(
+        "Qual linha queres capturar?",
+        ["weight_guide_low", "weight_guide_high", "wind_guide_low", "wind_guide_high"],
+    )
+
+    if "click_points" not in st.session_state:
+        st.session_state.click_points = []
+
+    st.info("Clica 2 pontos em cima da linha grossa escolhida. Quando tiver 2 pontos, a linha é guardada.")
+
+    click = streamlit_image_coordinates(base_img, key="img_coords")
+    if click is not None:
+        st.session_state.click_points.append((int(click["x"]), int(click["y"])))
+
+    # show pending points
+    st.write("Pontos selecionados (pendentes):", st.session_state.click_points)
+
+    if len(st.session_state.click_points) >= 2:
+        p1 = st.session_state.click_points[-2]
+        p2 = st.session_state.click_points[-1]
+        add_segment(capture, key, p1, p2)
+        st.success(f"Guardado: {key} = {p1} -> {p2}")
+        st.session_state.click_points = []
+
+    st.markdown("### Preview das guias no JSON")
+    st.json(capture.get("guide_lines", {}))
+
+    out_json = json.dumps(capture, indent=2).encode("utf-8")
+    st.download_button("⬇️ Download capture.json atualizado", data=out_json, file_name="capture.json", mime="application/json")
+
+
+with tab2:
+    st.subheader("Solver")
+    c1, c2 = st.columns(2)
+    with c1:
+        pdf_up2 = st.file_uploader("PDF (opcional; senão usa o da pasta)", type=["pdf"], key="pdf_up_2")
+    with c2:
+        cap_up2 = st.file_uploader("capture.json (opcional; senão usa o da pasta)", type=["json"], key="cap_up_2")
+
+    pdf_path2 = locate_file(PDF_NAME_DEFAULT)
+    cap_path2 = locate_file(CAPTURE_NAME_DEFAULT)
+
+    if pdf_up2 is not None:
+        Path("uploaded2.pdf").write_bytes(pdf_up2.read())
+        pdf_path2 = "uploaded2.pdf"
+    if cap_up2 is not None:
+        Path("capture2.json").write_bytes(cap_up2.read())
+        cap_path2 = "capture2.json"
+
+    if not pdf_path2 or not cap_path2:
+        st.warning("Faz upload do PDF e do capture.json ou mete-os na mesma pasta do app.py")
+        st.stop()
+
+    capture2 = ensure_capture_structure(json.loads(Path(cap_path2).read_text(encoding="utf-8")))
+    zoom2 = float(capture2.get("zoom", 2.3))
+    base_img2 = render_pdf_page_to_pil(pdf_path2, zoom=zoom2)
+
+    i1, i2, i3, i4 = st.columns(4)
+    with i1:
+        pressure_alt_ft = st.number_input("Pressure Altitude (ft)", value=2500.0, step=100.0)
+    with i2:
+        oat_c = st.number_input("OAT (°C)", value=21.0, step=1.0)
+    with i3:
+        weight_lb = st.number_input("Weight (lb)", value=2240.0, step=10.0)
+    with i4:
+        headwind_kt = st.number_input("Headwind (kt)", value=5.0, step=1.0)
+
+    run = st.button("Calcular", key="run_solver")
     if run:
         try:
             gr_raw, gr_round, pts = solve_ground_roll(
-                capture=capture,
-                pressure_alt_ft=float(pressure_alt_ft),
-                oat_c=float(oat_c),
-                weight_lb=float(weight_lb),
-                headwind_kt=float(headwind_kt),
+                capture2, base_img2,
+                float(pressure_alt_ft), float(oat_c), float(weight_lb), float(headwind_kt)
             )
-            st.success(f"Landing Ground Roll ≈ **{gr_round:.0f} ft** (arredondado de 5 em 5)")
-            st.caption(f"Bruto: {gr_raw:.1f} ft")
-            out_img = draw_solution(base_overlay, pts, gr_round)
-            st.image(out_img, use_container_width=True)
         except Exception as e:
             st.exception(e)
-    else:
-        st.image(base_overlay, use_container_width=True)
+            st.stop()
 
+        st.success(f"Landing Ground Roll ≈ {gr_round:.0f} ft (arredondado 5 em 5)")
+        st.caption(f"Bruto: {gr_raw:.1f} ft")
 
-with tabs[1]:
-    st.subheader("Editor — dois cliques guardam um segmento e ficam prontos para o próximo")
+        preview = draw_preview(base_img2, pts, gr_round)
+        st.image(preview, use_container_width=True)
 
-    st.markdown(
-        """
-**Fluxo:**
-- 1º clique: fica “armado” (ponto laranja).
-- 2º clique: grava o segmento e **reseta automaticamente** para começares outro.
-
-**Dica:** para `weight_guide` e `wind_guide`, clica em 2 pontos bem afastados na diagonal grossa.
-"""
-    )
-
-    # selection UI
-    kind = st.radio("Tipo", ["guides (1 segmento)", "lines (lista de segmentos)"], horizontal=True)
-    kind_norm = "guides" if kind.startswith("guides") else "lines"
-    st.session_state.selected_kind = kind_norm
-
-    if kind_norm == "guides":
-        key = st.selectbox("Guide key", ["weight_guide", "wind_guide"] + sorted([k for k in capture["guides"].keys() if k not in ("weight_guide", "wind_guide")]))
-    else:
-        default_line_keys = [
-            "isa", "isa_m15", "isa_p35",
-            "pa_sea_level", "pa_2000", "pa_4000", "pa_6000", "pa_7000",
-            "weight_ref_line", "wind_ref_zero",
-        ]
-        existing = sorted(list(capture["lines"].keys()))
-        key = st.selectbox("Line key", sorted(list(set(default_line_keys + existing))))
-
-    # whenever key changes, cancel pending point to avoid carry-over
-    if st.session_state.selected_key != key:
-        st.session_state.selected_key = key
-        st.session_state.pending_point = None
-        st.session_state.last_click = None
-
-    # buttons
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("Cancelar ponto pendente"):
-            st.session_state.pending_point = None
-            st.session_state.last_click = None
-    with b2:
-        if st.button("Undo último (desta key)"):
-            if kind_norm == "guides":
-                capture["guides"].pop(key, None)
-            else:
-                if key in capture["lines"] and capture["lines"][key]:
-                    capture["lines"][key].pop()
-                    if not capture["lines"][key]:
-                        capture["lines"].pop(key, None)
-            st.session_state.pending_point = None
-            st.session_state.last_click = None
-    with b3:
-        st.download_button(
-            "⬇️ Download capture.json atualizado",
-            data=json.dumps(capture, indent=2).encode("utf-8"),
-            file_name="capture.json",
-            mime="application/json",
-        )
-
-    # image with overlay + pending point marker
-    base_img = render_pdf_page_to_pil(pdf_path, zoom=zoom)
-    img_show = overlay_segments(base_img, capture, pending=st.session_state.pending_point)
-    img_arr = np.array(img_show)
-
-    click = streamlit_image_coordinates(img_arr, key="img_clicker_fixed")
-
-    # process click with de-dupe
-    if click is not None:
-        x = float(click["x"])
-        y = float(click["y"])
-        current = (round(x, 1), round(y, 1))
-
-        # ignore repeated last click (component sometimes repeats on rerun)
-        if st.session_state.last_click != current:
-            st.session_state.last_click = current
-
-            if st.session_state.pending_point is None:
-                st.session_state.pending_point = (x, y)
-                st.toast(f"1º ponto: ({x:.1f}, {y:.1f}) — clica no 2º ponto")
-            else:
-                x1, y1 = st.session_state.pending_point
-                x2, y2 = x, y
-                seg = {"x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2)}
-
-                if kind_norm == "guides":
-                    capture["guides"][key] = seg
-                else:
-                    capture["lines"].setdefault(key, [])
-                    capture["lines"][key].append(seg)
-
-                st.session_state.pending_point = None
-                st.toast(f"Guardado: {kind_norm}.{key}  ({x1:.1f},{y1:.1f}) → ({x2:.1f},{y2:.1f})")
-
-    st.image(img_show, use_container_width=True)
 
 
