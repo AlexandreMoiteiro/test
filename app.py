@@ -9,8 +9,7 @@ import numpy as np
 import streamlit as st
 import pymupdf
 from PIL import Image, ImageDraw
-
-import cv2  # opencv-python-headless
+import cv2
 
 
 # =========================
@@ -25,7 +24,7 @@ CAPTURE_NAME_DEFAULT = "capture.json"
 # =========================
 @dataclass(frozen=True)
 class LineABC:
-    """Reta na forma a*x + b*y + c = 0, com (a,b) normalizado."""
+    """Reta a*x + b*y + c = 0 (a,b) normalizado."""
     a: float
     b: float
     c: float
@@ -51,12 +50,12 @@ class LineABC:
         return (float(x), float(y))
 
 
-def line_through_point_with_angle(p: Tuple[float, float], theta_rad: float) -> LineABC:
-    x0, y0 = p
-    dx = float(np.cos(theta_rad))
-    dy = float(np.sin(theta_rad))
-    p2 = (x0 + dx * 100.0, y0 + dy * 100.0)
-    return LineABC.from_points((x0, y0), p2)
+def horiz_line(y: float) -> LineABC:
+    return LineABC(0.0, 1.0, -float(y))
+
+
+def vert_line(x: float) -> LineABC:
+    return LineABC(1.0, 0.0, -float(x))
 
 
 # =========================
@@ -85,7 +84,6 @@ def render_pdf_page_to_pil(pdf_path: str, page_index: int = 0, zoom: float = 2.3
 # CALIBRATION
 # =========================
 def fit_linear_x_from_value(ticks: List[Dict[str, float]]) -> Tuple[float, float]:
-    """Ajusta x ≈ m*value + b."""
     vals = np.array([t["value"] for t in ticks], dtype=float)
     xs = np.array([t["x"] for t in ticks], dtype=float)
     A = np.vstack([vals, np.ones_like(vals)]).T
@@ -94,7 +92,6 @@ def fit_linear_x_from_value(ticks: List[Dict[str, float]]) -> Tuple[float, float
 
 
 def fit_linear_value_from_y(ticks: List[Dict[str, float]]) -> Tuple[float, float]:
-    """Ajusta value ≈ m*y + b (para ground roll vs y)."""
     ys = np.array([t["y"] for t in ticks], dtype=float)
     vals = np.array([t["value"] for t in ticks], dtype=float)
     A = np.vstack([ys, np.ones_like(ys)]).T
@@ -107,46 +104,36 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 # =========================
-# GUIDES (Hough) — “linhas do piloto”
+# GUIDE LINE DETECTION + BEST-LINE CHOICE (DARKNESS SCORE)
 # =========================
-def _crop_panel(img: Image.Image, panel_quad: List[List[float]]) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+def panel_bbox(panel_quad: List[List[float]]) -> Tuple[float, float, float, float]:
     xs = [p[0] for p in panel_quad]
     ys = [p[1] for p in panel_quad]
-    x0, x1 = int(min(xs)), int(max(xs))
-    y0, y1 = int(min(ys)), int(max(ys))
-    crop = img.crop((x0, y0, x1, y1)).convert("RGB")
+    return float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
+
+
+def detect_guide_lines(img_rgb: Image.Image, panel_quad: List[List[float]]) -> List[LineABC]:
+    """
+    Deteta linhas diagonais grossas no painel via HoughLines.
+    Retorna linhas em coords globais da imagem.
+    """
+    x0, y0, x1, y1 = panel_bbox(panel_quad)
+    crop = img_rgb.crop((int(x0), int(y0), int(x1), int(y1))).convert("RGB")
     arr = np.asarray(crop)
-    return arr, (x0, y0, x1, y1)
-
-
-def _line_distance_to_point(line: LineABC, p: Tuple[float, float]) -> float:
-    # line normalizado => distância = |ax+by+c|
-    return abs(line.a * p[0] + line.b * p[1] + line.c)
-
-
-def detect_guide_lines(img: Image.Image, panel_quad: List[List[float]]) -> List[LineABC]:
-    """
-    Deteta as diagonais grossas (linhas-guia) num painel via Hough.
-    Retorna linhas em coords globais da imagem (a*x+b*y+c=0).
-    """
-    arr, (x0, y0, x1, y1) = _crop_panel(img, panel_quad)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-    # Realçar as linhas grossas:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 60, 180, apertureSize=3)
 
-    # Hough standard
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, 150)
-    if lines is None:
+    # threshold a 150 funciona bem no teu PDF/zoom; se falhar, ajustamos.
+    raw = cv2.HoughLines(edges, 1, np.pi / 180, 150)
+    if raw is None:
         return []
 
     guides: List[LineABC] = []
-    # limitar quantidade
-    for rho_theta in lines[:250]:
+    for rho_theta in raw[:250]:
         rho, theta = float(rho_theta[0][0]), float(rho_theta[0][1])
 
-        # Equação Hough: x*cosθ + y*sinθ = rho  => a*x + b*y + c=0 com a=cosθ, b=sinθ, c=-rho
         a = float(np.cos(theta))
         b = float(np.sin(theta))
         c = -rho
@@ -156,21 +143,19 @@ def detect_guide_lines(img: Image.Image, panel_quad: List[List[float]]) -> List[
         if abs(ang - 0) < np.deg2rad(10) or abs(ang - np.pi / 2) < np.deg2rad(10):
             continue
 
-        # converter para coords globais
-        # a*(x-x0)+b*(y-y0)+c=0 => a*x + b*y + (c - a*x0 - b*y0)=0
+        # converter do crop para global:
+        # a*(x-x0)+b*(y-y0)+c=0  => a*x + b*y + (c - a*x0 - b*y0)=0
         c_global = c - a * x0 - b * y0
-
         n = float(np.hypot(a, b))
         if n == 0:
             continue
         guides.append(LineABC(a / n, b / n, c_global / n))
 
-    # Dedup: há muitas repetidas
+    # dedup (muitas linhas repetidas)
     dedup: List[LineABC] = []
     for ln in guides:
         dup = False
         for ex in dedup:
-            # praticamente paralelas e offset parecido
             if abs(ln.a - ex.a) < 0.02 and abs(ln.b - ex.b) < 0.02 and abs(ln.c - ex.c) < 12:
                 dup = True
                 break
@@ -180,57 +165,79 @@ def detect_guide_lines(img: Image.Image, panel_quad: List[List[float]]) -> List[
     return dedup
 
 
-def snap_to_nearest_guide(guides: List[LineABC], p: Tuple[float, float]) -> Optional[LineABC]:
-    if not guides:
+def mean_darkness_along_segment(gray_full: np.ndarray, p1: Tuple[float, float], p2: Tuple[float, float], n=60) -> float:
+    """
+    Score: média da intensidade (0=preto, 255=branco) ao longo do segmento.
+    Queremos MIN (mais escuro = mais provável ser a guia grossa).
+    """
+    h, w = gray_full.shape[:2]
+    xs = np.linspace(p1[0], p2[0], n)
+    ys = np.linspace(p1[1], p2[1], n)
+
+    vals = []
+    for x, y in zip(xs, ys):
+        xi = int(round(x))
+        yi = int(round(y))
+        if 0 <= xi < w and 0 <= yi < h:
+            vals.append(gray_full[yi, xi])
+        else:
+            # fora da imagem: penaliza forte
+            vals.append(255)
+    return float(np.mean(vals))
+
+
+def pick_best_guide_by_darkness(
+    guides: List[LineABC],
+    p_start: Tuple[float, float],
+    x_target: float,
+    bbox: Tuple[float, float, float, float],
+    gray_full: np.ndarray,
+) -> Optional[Tuple[LineABC, Tuple[float, float]]]:
+    """
+    Para cada guia:
+      - intersecta com vertical x=x_target => p_end
+      - só aceita se p_end cair dentro da bbox do painel
+      - score = "darkness" médio do segmento p_start->p_end
+    Escolhe a guia com score mínimo (mais escura).
+    Retorna (line, p_end).
+    """
+    x_min, y_min, x_max, y_max = bbox
+    vline = vert_line(x_target)
+
+    best = None
+    best_score = 1e9
+    best_end = None
+
+    for ln in guides:
+        p_end = ln.intersect(vline)
+        if p_end is None:
+            continue
+
+        x, y = p_end
+        # dentro do painel (com margem pequena)
+        if not (x_min - 2 <= x <= x_max + 2 and y_min - 2 <= y <= y_max + 2):
+            continue
+
+        score = mean_darkness_along_segment(gray_full, p_start, p_end, n=70)
+
+        # pequena preferência por segmentos "mais longos" (evita apanhar ruído curto)
+        seg_len = float(np.hypot(p_end[0] - p_start[0], p_end[1] - p_start[1]))
+        score2 = score - 0.03 * seg_len  # quanto maior o segmento, ligeira vantagem
+
+        if score2 < best_score:
+            best_score = score2
+            best = ln
+            best_end = p_end
+
+    if best is None or best_end is None:
         return None
-    return min(guides, key=lambda ln: _line_distance_to_point(ln, p))
-
-
-def estimate_dominant_diagonal_angle_fallback(img: Image.Image, panel_quad: List[List[float]]) -> float:
-    """
-    Fallback caso o Hough falhe. Estima ângulo dominante por gradientes.
-    """
-    arr, (x0, y0, x1, y1) = _crop_panel(img, panel_quad)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float32) / 255.0
-
-    gy, gx = np.gradient(gray)
-    mag = np.hypot(gx, gy)
-    ang_g = np.arctan2(gy, gx)
-    ang_line = ang_g + np.pi / 2.0
-    ang_line = (ang_line + np.pi / 2) % np.pi - np.pi / 2
-
-    m = mag > np.percentile(mag, 85)
-    ang = ang_line[m]
-    w = mag[m]
-
-    if ang.size < 200:
-        return float(np.deg2rad(45.0))
-
-    mask_diag = (np.abs(ang) > np.deg2rad(15)) & (np.abs(ang) < np.deg2rad(75))
-    ang = ang[mask_diag]
-    w = w[mask_diag]
-    if ang.size < 200:
-        return float(np.deg2rad(45.0))
-
-    hist, edges = np.histogram(ang, bins=180, range=(-np.pi / 2, np.pi / 2), weights=w)
-    idx = int(np.argmax(hist))
-    theta = float((edges[idx] + edges[idx + 1]) / 2)
-
-    # orientar para dx>0
-    dx = np.cos(theta)
-    if dx < 0:
-        theta += np.pi
-    return float(theta)
+    return best, best_end
 
 
 # =========================
 # NOMOGRAM CORE
 # =========================
 def interpolate_line(pairs: List[Tuple[float, LineABC]], value: float) -> LineABC:
-    """
-    Interpola entre linhas por value (interpolação em (a,b,c) com renormalização).
-    """
     pairs = sorted(pairs, key=lambda t: t[0])
     values = [v for v, _ in pairs]
     v = clamp(value, values[0], values[-1])
@@ -252,7 +259,6 @@ def interpolate_line(pairs: List[Tuple[float, LineABC]], value: float) -> LineAB
 
 
 def std_atm_isa_temp_c(pressure_alt_ft: float) -> float:
-    """ISA temp aproximada: 15 - 1.98°C por 1000 ft."""
     return 15.0 - 1.98 * (pressure_alt_ft / 1000.0)
 
 
@@ -264,21 +270,22 @@ def solve_landing_ground_roll(
     weight_lb: float,
     headwind_kt: float,
 ) -> Tuple[float, float, Dict[str, Tuple[float, float]]]:
-    """
-    Retorna:
-      - ground_roll_raw
-      - ground_roll_rounded_to_5
-      - pontos do percurso (para desenhar)
-    """
-    ticks_oat = capture["axis_ticks"]["oat_c"]
-    ticks_wt = capture["axis_ticks"]["weight_x100_lb"]
-    ticks_wnd = capture["axis_ticks"]["wind_kt"]
-    ticks_gr = capture["axis_ticks"]["ground_roll_ft"]
 
-    mo, bo = fit_linear_x_from_value(ticks_oat)       # x = mo*oat + bo
-    mw, bw = fit_linear_x_from_value(ticks_wt)        # x = mw*(w/100) + bw
-    mwd, bwd = fit_linear_x_from_value(ticks_wnd)     # x = mwd*wind + bwd
-    mgr, bgr = fit_linear_value_from_y(ticks_gr)      # gr = mgr*y + bgr
+    # grayscale full image for darkness scoring
+    gray_full = np.asarray(base_img.convert("L"))
+
+    ticks_oat = capture["axis_ticks"]["oat_c"]
+    ticks_wt  = capture["axis_ticks"]["weight_x100_lb"]
+    ticks_wnd = capture["axis_ticks"]["wind_kt"]
+    ticks_gr  = capture["axis_ticks"]["ground_roll_ft"]
+
+    mo, bo   = fit_linear_x_from_value(ticks_oat)      # x = mo*oat + bo
+    mw, bw   = fit_linear_x_from_value(ticks_wt)       # x = mw*(w/100) + bw
+    mwd, bwd = fit_linear_x_from_value(ticks_wnd)      # x = mwd*wind + bwd
+    mgr, bgr = fit_linear_value_from_y(ticks_gr)       # gr = mgr*y + bgr
+
+    def x_from_oat(oat: float) -> float:
+        return mo * oat + bo
 
     def x_from_weight_lb(w_lb: float) -> float:
         return mw * (w_lb / 100.0) + bw
@@ -289,15 +296,18 @@ def solve_landing_ground_roll(
     def gr_from_y(y: float) -> float:
         return mgr * y + bgr
 
+    # ground roll axis X is (quase) constante → usar média dos ticks
+    gr_axis_x = float(np.mean([t["x"] for t in ticks_gr]))
+
     lines = capture["lines"]
 
     def seg_to_line(key: str) -> LineABC:
         seg = lines[key][0]
         return LineABC.from_points((seg["x1"], seg["y1"]), (seg["x2"], seg["y2"]))
 
-    # ISA family (-15, 0, +35)
+    # ISA family
     line_isa_m15 = seg_to_line("isa_m15")
-    line_isa_0 = seg_to_line("isa")
+    line_isa_0   = seg_to_line("isa")
     line_isa_p35 = seg_to_line("isa_p35")
 
     # PA family
@@ -308,85 +318,111 @@ def solve_landing_ground_roll(
     pa7 = seg_to_line("pa_7000")
 
     # references
-    w_ref = seg_to_line("weight_ref_line")
+    w_ref  = seg_to_line("weight_ref_line")
     z_wind = seg_to_line("wind_ref_zero")
 
-    # --- left panel (ISA deviation line + PA line) ---
-    isa_temp = std_atm_isa_temp_c(pressure_alt_ft)
-    dev = oat_c - isa_temp  # OAT - ISA
+    # panel bounding boxes
+    left_bbox   = panel_bbox(capture["panel_corners"]["left"])
+    middle_bbox = panel_bbox(capture["panel_corners"]["middle"])
+    right_bbox  = panel_bbox(capture["panel_corners"]["right"])
 
-    isa_line = interpolate_line(
-        [(-15.0, line_isa_m15), (0.0, line_isa_0), (35.0, line_isa_p35)],
-        dev,
-    )
-    pa_line = interpolate_line(
-        [(0.0, pa0), (2000.0, pa2), (4000.0, pa4), (6000.0, pa6), (7000.0, pa7)],
-        pressure_alt_ft,
-    )
+    # --------- LEFT: ISA deviation + PA ---------
+    isa_temp = std_atm_isa_temp_c(pressure_alt_ft)
+    dev = oat_c - isa_temp
+
+    isa_line = interpolate_line([(-15.0, line_isa_m15), (0.0, line_isa_0), (35.0, line_isa_p35)], dev)
+    pa_line  = interpolate_line([(0.0, pa0), (2000.0, pa2), (4000.0, pa4), (6000.0, pa6), (7000.0, pa7)], pressure_alt_ft)
 
     p_left = isa_line.intersect(pa_line)
     if p_left is None:
-        raise ValueError("Falhou interseção ISA/PA (linhas quase paralelas).")
+        raise ValueError("Falhou interseção ISA/PA.")
 
-    # horizontal from left point to weight ref line
-    y_left = p_left[1]
-    horiz = LineABC(0.0, 1.0, -y_left)
-    p_wref = w_ref.intersect(horiz)
+    # --------- EXTRA: OAT point at bottom of left panel (arrow up) ---------
+    x_oat = x_from_oat(oat_c)
+    x_min_l, y_min_l, x_max_l, y_max_l = left_bbox
+    p_oat = (float(clamp(x_oat, x_min_l, x_max_l)), float(y_max_l))  # bottom edge of left panel
+
+    # --------- to WEIGHT REF (horizontal) ---------
+    p_wref = w_ref.intersect(horiz_line(p_left[1]))
     if p_wref is None:
         raise ValueError("Falhou interseção com weight_ref_line.")
 
-    # --- middle panel: snap to nearest guide line ---
+    # --------- MIDDLE: choose best pilot guide by darkness ---------
     guides_mid = detect_guide_lines(base_img, capture["panel_corners"]["middle"])
-    snap_mid = snap_to_nearest_guide(guides_mid, p_wref)
-    if snap_mid is None:
-        theta_mid = estimate_dominant_diagonal_angle_fallback(base_img, capture["panel_corners"]["middle"])
-        snap_mid = line_through_point_with_angle(p_wref, theta_mid)
-
     x_weight = x_from_weight_lb(weight_lb)
-    vert_w = LineABC(1.0, 0.0, -x_weight)
-    p_w = snap_mid.intersect(vert_w)
-    if p_w is None:
-        raise ValueError("Falhou projeção para o peso (interseção no painel middle).")
 
-    # horizontal to wind zero line
-    y_w = p_w[1]
-    horiz2 = LineABC(0.0, 1.0, -y_w)
-    p_z = z_wind.intersect(horiz2)
+    best_mid = pick_best_guide_by_darkness(
+        guides=guides_mid,
+        p_start=p_wref,
+        x_target=x_weight,
+        bbox=middle_bbox,
+        gray_full=gray_full,
+    )
+
+    if best_mid is not None:
+        _, p_w = best_mid
+    else:
+        # fallback: se Hough falhar, usa interseção simples com “linha média” por regressão do conjunto
+        # (neste caso, escolhe a guia mais próxima por distância só para não crashar)
+        if not guides_mid:
+            raise ValueError("Não consegui detetar guias no painel do weight (Hough falhou).")
+        # fallback fraco
+        p_w = min(
+            [ln.intersect(vert_line(x_weight)) for ln in guides_mid if ln.intersect(vert_line(x_weight)) is not None],
+            key=lambda pt: abs(pt[1] - p_wref[1]),
+        )
+
+    # --------- to WIND REF ZERO (horizontal) ---------
+    p_z = z_wind.intersect(horiz_line(p_w[1]))
     if p_z is None:
         raise ValueError("Falhou interseção com wind_ref_zero.")
 
-    # --- right panel: snap to nearest guide line ---
+    # --------- RIGHT: choose best pilot guide by darkness ---------
     guides_r = detect_guide_lines(base_img, capture["panel_corners"]["right"])
-    snap_r = snap_to_nearest_guide(guides_r, p_z)
-    if snap_r is None:
-        theta_r = estimate_dominant_diagonal_angle_fallback(base_img, capture["panel_corners"]["right"])
-        snap_r = line_through_point_with_angle(p_z, theta_r)
-
     x_wind = x_from_wind(headwind_kt)
-    vert_wind = LineABC(1.0, 0.0, -x_wind)
-    p_wind = snap_r.intersect(vert_wind)
-    if p_wind is None:
-        raise ValueError("Falhou projeção para o vento (interseção no painel right).")
 
+    best_r = pick_best_guide_by_darkness(
+        guides=guides_r,
+        p_start=p_z,
+        x_target=x_wind,
+        bbox=right_bbox,
+        gray_full=gray_full,
+    )
+
+    if best_r is not None:
+        _, p_wind = best_r
+    else:
+        if not guides_r:
+            raise ValueError("Não consegui detetar guias no painel do vento (Hough falhou).")
+        p_wind = min(
+            [ln.intersect(vert_line(x_wind)) for ln in guides_r if ln.intersect(vert_line(x_wind)) is not None],
+            key=lambda pt: abs(pt[1] - p_z[1]),
+        )
+
+    # --------- Ground roll read + rounding ---------
     ground_roll_raw = float(gr_from_y(p_wind[1]))
     ground_roll_rounded = float(5.0 * round(ground_roll_raw / 5.0))
 
+    # --------- EXTRA: point on ground roll axis (arrow) ---------
+    p_gr = (gr_axis_x, p_wind[1])
+
     points = {
+        "p_oat": p_oat,         # new
         "p_left": p_left,
         "p_wref": p_wref,
         "p_w": p_w,
         "p_z": p_z,
         "p_wind": p_wind,
+        "p_gr": p_gr,           # new
     }
     return ground_roll_raw, ground_roll_rounded, points
 
 
 # =========================
-# DRAWING (SETAS)
+# DRAWING (ARROWS + LABEL)
 # =========================
 def draw_arrow_pil(draw: ImageDraw.ImageDraw, p1, p2, width=5):
     draw.line([p1, p2], fill=(255, 0, 0), width=width)
-
     x1, y1 = p1
     x2, y2 = p2
     vx, vy = x2 - x1, y2 - y1
@@ -406,23 +442,29 @@ def draw_arrow_pil(draw: ImageDraw.ImageDraw, p1, p2, width=5):
     draw.polygon([pA, pB, pC], fill=(255, 0, 0))
 
 
-def draw_path_preview(img: Image.Image, points: Dict[str, Tuple[float, float]]) -> Image.Image:
+def draw_path_preview(img: Image.Image, points: Dict[str, Tuple[float, float]], gr_rounded: float) -> Image.Image:
     out = img.copy()
     d = ImageDraw.Draw(out)
 
-    order = ["p_left", "p_wref", "p_w", "p_z", "p_wind"]
-    for a, b in zip(order[:-1], order[1:]):
-        draw_arrow_pil(d, points[a], points[b], width=5)
+    # Segmentos principais (com setas)
+    draw_arrow_pil(d, points["p_oat"], points["p_left"], width=5)     # UP in first block
+    draw_arrow_pil(d, points["p_left"], points["p_wref"], width=5)
+    draw_arrow_pil(d, points["p_wref"], points["p_w"], width=5)
+    draw_arrow_pil(d, points["p_w"], points["p_z"], width=5)
+    draw_arrow_pil(d, points["p_z"], points["p_wind"], width=5)
+    draw_arrow_pil(d, points["p_wind"], points["p_gr"], width=5)      # to ground roll axis
 
-    # marcar pontos
+    # pontos
     def mark(p, color, r=6):
         x, y = p
         d.ellipse((x - r, y - r, x + r, y + r), outline=color, width=4)
 
-    for name in order:
-        p = points[name]
-        mark(p, (0, 120, 0) if name != "p_wind" else (0, 0, 200))
-        d.text((p[0] + 8, p[1] - 12), name, fill=(0, 0, 0))
+    for k in ["p_oat", "p_left", "p_wref", "p_w", "p_z", "p_wind", "p_gr"]:
+        mark(points[k], (0, 120, 0) if k != "p_wind" else (0, 0, 200))
+
+    # label do ground roll no eixo
+    xg, yg = points["p_gr"]
+    d.text((xg + 10, yg - 14), f"{int(gr_rounded)} ft", fill=(0, 0, 0))
 
     return out
 
@@ -450,12 +492,11 @@ def draw_arrow_pdf(page, p1: pymupdf.Point, p2: pymupdf.Point, width=2.5):
     page.draw_polygon(tri, color=(1, 0, 0), fill=(1, 0, 0))
 
 
-def add_path_to_pdf(pdf_path: str, zoom: float, points: Dict[str, Tuple[float, float]]) -> bytes:
+def add_path_to_pdf(pdf_path: str, zoom: float, points: Dict[str, Tuple[float, float]], gr_rounded: float) -> bytes:
     doc = pymupdf.open(pdf_path)
     page = doc.load_page(0)
     rect = page.rect
 
-    # render size at zoom
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
     w_img, h_img = pix.width, pix.height
 
@@ -465,13 +506,18 @@ def add_path_to_pdf(pdf_path: str, zoom: float, points: Dict[str, Tuple[float, f
     def map_pt(p):
         return pymupdf.Point(p[0] * sx, p[1] * sy)
 
-    order = ["p_left", "p_wref", "p_w", "p_z", "p_wind"]
+    # setas
+    order = ["p_oat", "p_left", "p_wref", "p_w", "p_z", "p_wind", "p_gr"]
     for a, b in zip(order[:-1], order[1:]):
         draw_arrow_pdf(page, map_pt(points[a]), map_pt(points[b]), width=2.5)
 
     # pontos
     for k in order:
         page.draw_circle(map_pt(points[k]), radius=3.0, color=(0, 0.6, 0), width=2.0)
+
+    # texto ground roll
+    pgr = map_pt(points["p_gr"])
+    page.insert_text(pymupdf.Point(pgr.x + 6, pgr.y - 6), f"{int(gr_rounded)} ft", fontsize=10, color=(0, 0, 0))
 
     out = doc.tobytes()
     doc.close()
@@ -482,7 +528,7 @@ def add_path_to_pdf(pdf_path: str, zoom: float, points: Dict[str, Tuple[float, f
 # STREAMLIT APP
 # =========================
 st.set_page_config(page_title="Landing Ground Roll Solver", layout="wide")
-st.title("Landing Ground Roll — Solver do nomograma (snap às guias + setas)")
+st.title("Landing Ground Roll — Solver do nomograma (pilot-guides + setas + GR no eixo)")
 
 colA, colB = st.columns(2)
 with colA:
@@ -542,28 +588,26 @@ if run:
         st.exception(e)
         st.stop()
 
-    st.success(f"Landing Ground Roll ≈ **{gr_rounded:.0f} ft**  (arredondado de 5 em 5)")
+    st.success(f"Landing Ground Roll ≈ **{gr_rounded:.0f} ft** (arredondado de 5 em 5)")
     if show_raw:
         st.caption(f"Bruto: {gr_raw:.1f} ft")
 
-    debug_img = draw_path_preview(base_img, points)
+    debug_img = draw_path_preview(base_img, points, gr_rounded)
 
     col1, col2 = st.columns([1.4, 1])
     with col1:
-        st.subheader("Debug visual (trajetória com setas)")
+        st.subheader("Debug visual (setas + GR no eixo)")
         st.image(debug_img, use_container_width=True)
     with col2:
         st.subheader("Pontos (pixels)")
         st.json({k: {"x": v[0], "y": v[1]} for k, v in points.items()})
 
-        pdf_out = add_path_to_pdf(pdf_path, zoom=zoom, points=points)
+        pdf_out = add_path_to_pdf(pdf_path, zoom=zoom, points=points, gr_rounded=gr_rounded)
         st.download_button(
-            "⬇️ Download PDF com trajetória (setas)",
+            "⬇️ Download PDF com trajetória (setas + GR no eixo)",
             data=pdf_out,
-            file_name="landing_ground_roll_debug_arrows.pdf",
+            file_name="landing_ground_roll_debug_arrows_gr.pdf",
             mime="application/pdf",
         )
 
-st.caption("Se a trajetória ainda não estiver 100% colada às guias, ajustamos só 2 parâmetros do Hough (threshold e Canny).")
-
-
+st.caption("Se ainda houver 1 caso em que a linha 'agarra' a grelha em vez da guia grossa, ajustamos só o threshold do Hough e o score.")
