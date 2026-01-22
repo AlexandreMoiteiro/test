@@ -90,85 +90,7 @@ def render_pdf_page_to_pil(pdf_path: str, page_index: int = 0, zoom: float = 2.3
 
 
 # =========================
-# ROBUST CALIBRATION
-# =========================
-def robust_fit_x_from_value(ticks: List[Dict[str, float]]) -> Tuple[float, float]:
-    vals = np.array([t["value"] for t in ticks], dtype=float)
-    xs = np.array([t["x"] for t in ticks], dtype=float)
-    n = len(vals)
-    if n < 2:
-        raise ValueError("Poucos ticks para calibrar eixo (precisas >=2).")
-    slopes = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            dv = vals[j] - vals[i]
-            if abs(dv) < 1e-9:
-                continue
-            slopes.append((xs[j] - xs[i]) / dv)
-    m = float(np.median(slopes))
-    b = float(np.median(xs - m * vals))
-    return m, b
-
-
-def robust_fit_value_from_y(ticks: List[Dict[str, float]]) -> Tuple[float, float]:
-    ys = np.array([t["y"] for t in ticks], dtype=float)
-    vals = np.array([t["value"] for t in ticks], dtype=float)
-    n = len(ys)
-    if n < 2:
-        raise ValueError("Poucos ticks para calibrar eixo (precisas >=2).")
-    slopes = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            dy = ys[j] - ys[i]
-            if abs(dy) < 1e-9:
-                continue
-            slopes.append((vals[j] - vals[i]) / dy)
-    m = float(np.median(slopes))
-    b = float(np.median(vals - m * ys))
-    return m, b
-
-
-# =========================
-# NOMOGRAM HELPERS
-# =========================
-def std_atm_isa_temp_c(pressure_alt_ft: float) -> float:
-    return 15.0 - 1.98 * (pressure_alt_ft / 1000.0)
-
-
-def interpolate_line(pairs: List[Tuple[float, LineABC]], value: float) -> LineABC:
-    pairs = sorted(pairs, key=lambda t: t[0])
-    values = [v for v, _ in pairs]
-    v = clamp(value, values[0], values[-1])
-
-    for i in range(len(pairs) - 1):
-        v1, l1 = pairs[i]
-        v2, l2 = pairs[i + 1]
-        if v1 <= v <= v2:
-            t = 0.0 if v2 == v1 else (v - v1) / (v2 - v1)
-            a = (1 - t) * l1.a + t * l2.a
-            b = (1 - t) * l1.b + t * l2.b
-            c = (1 - t) * l1.c + t * l2.c
-            n = float(np.hypot(a, b))
-            if n == 0:
-                return LineABC(0.0, 0.0, 0.0)
-            return LineABC(a / n, b / n, c / n)
-
-    return pairs[-1][1]
-
-
-def seg_to_line(seg: Dict[str, float]) -> LineABC:
-    return LineABC.from_points((seg["x1"], seg["y1"]), (seg["x2"], seg["y2"]))
-
-
-def choose_nearest_guide(guide_segs: List[Dict[str, float]], p_start: Tuple[float, float]) -> Optional[LineABC]:
-    if not guide_segs:
-        return None
-    lines = [seg_to_line(g) for g in guide_segs]
-    return min(lines, key=lambda ln: ln.distance_to_point(p_start))
-
-
-# =========================
-# GUIDES JSON STRUCT
+# CAPTURE STRUCT
 # =========================
 def ensure_guide_struct(capture: Dict[str, Any]) -> None:
     if "guide_lines" not in capture or not isinstance(capture["guide_lines"], dict):
@@ -186,37 +108,182 @@ def add_segment(capture: Dict[str, Any], key: str, p1: Tuple[float, float], p2: 
     )
 
 
+def seg_to_line(seg: Dict[str, float]) -> LineABC:
+    return LineABC.from_points((seg["x1"], seg["y1"]), (seg["x2"], seg["y2"]))
+
+
+def choose_nearest_guide(guide_segs: List[Dict[str, float]], p_start: Tuple[float, float]) -> Optional[LineABC]:
+    if not guide_segs:
+        return None
+    lines = [seg_to_line(g) for g in guide_segs]
+    return min(lines, key=lambda ln: ln.distance_to_point(p_start))
+
+
 # =========================
-# DRAWING (Editor overlay + Solver arrows)
+# PANEL BBOX + CROPS
 # =========================
-def overlay_existing_guides(
-    img: Image.Image,
+def panel_bbox(panel_quad: List[List[float]]) -> Tuple[int, int, int, int]:
+    xs = [p[0] for p in panel_quad]
+    ys = [p[1] for p in panel_quad]
+    x0, y0, x1, y1 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+    return x0, y0, x1, y1
+
+
+def get_panel_for_key(capture: Dict[str, Any], key: str) -> str:
+    if key == "weight_guides":
+        return "middle"
+    if key in ("wind_headwind_guides", "wind_tailwind_guides"):
+        return "right"
+    return "middle"
+
+
+# =========================
+# EDITOR: FIT LINE FROM MANY POINTS
+# =========================
+def fit_line_pca(points: List[Tuple[float, float]]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    PCA line fit:
+      returns (point_on_line, direction_unit_vector)
+    """
+    P = np.array(points, dtype=float)
+    mu = P.mean(axis=0)
+    C = np.cov(P.T)
+    w, v = np.linalg.eigh(C)          # eigenvectors
+    d = v[:, np.argmax(w)]            # principal direction
+    d = d / (np.linalg.norm(d) + 1e-12)
+    return (float(mu[0]), float(mu[1])), (float(d[0]), float(d[1]))
+
+
+def line_rect_intersections(p0: Tuple[float, float], d: Tuple[float, float],
+                            rect: Tuple[float, float, float, float]) -> List[Tuple[float, float]]:
+    """
+    Interseções da reta p(t)=p0+t*d com o retângulo [x0,x1]x[y0,y1].
+    Retorna até 2 pontos (idealmente 2).
+    """
+    x0, y0, x1, y1 = rect
+    px, py = p0
+    dx, dy = d
+    pts = []
+
+    def add_if_inside(x, y):
+        if x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1:
+            pts.append((float(x), float(y)))
+
+    # Intersect with x = x0, x1
+    if abs(dx) > 1e-9:
+        t = (x0 - px) / dx
+        add_if_inside(x0, py + t * dy)
+        t = (x1 - px) / dx
+        add_if_inside(x1, py + t * dy)
+
+    # Intersect with y = y0, y1
+    if abs(dy) > 1e-9:
+        t = (y0 - py) / dy
+        add_if_inside(px + t * dx, y0)
+        t = (y1 - py) / dy
+        add_if_inside(px + t * dx, y1)
+
+    # remover duplicados aproximados
+    uniq = []
+    for p in pts:
+        if all((p[0]-q[0])**2 + (p[1]-q[1])**2 > 4 for q in uniq):
+            uniq.append(p)
+
+    # se houver mais de 2, escolhe os 2 mais afastados
+    if len(uniq) <= 2:
+        return uniq
+    best = None
+    best_d = -1
+    for i in range(len(uniq)):
+        for j in range(i+1, len(uniq)):
+            dd = (uniq[i][0]-uniq[j][0])**2 + (uniq[i][1]-uniq[j][1])**2
+            if dd > best_d:
+                best_d = dd
+                best = (uniq[i], uniq[j])
+    return list(best) if best else uniq[:2]
+
+
+def overlay_editor_crop(
+    crop: Image.Image,
     capture: Dict[str, Any],
     key: str,
-    pending: Optional[Tuple[float, float]] = None,
-    last_click: Optional[Tuple[float, float]] = None,
+    offset: Tuple[int, int],
+    sample_pts_crop: List[Tuple[float, float]],
 ) -> Image.Image:
-    out = img.copy()
+    out = crop.copy()
     d = ImageDraw.Draw(out)
-
     ensure_guide_struct(capture)
 
-    # linhas guardadas (verde)
+    ox, oy = offset
+
+    # existing segments for this key (draw in crop coords)
     for seg in capture["guide_lines"][key]:
-        d.line([(seg["x1"], seg["y1"]), (seg["x2"], seg["y2"])], fill=(0, 170, 0), width=4)
+        x1, y1 = seg["x1"] - ox, seg["y1"] - oy
+        x2, y2 = seg["x2"] - ox, seg["y2"] - oy
+        d.line([(x1, y1), (x2, y2)], fill=(0, 170, 0), width=4)
 
-    # ponto pendente P1 (laranja)
-    if pending is not None:
-        x, y = pending
-        d.ellipse((x - 7, y - 7, x + 7, y + 7), outline=(255, 140, 0), width=4)
-        d.text((x + 10, y - 10), "P1", fill=(255, 140, 0))
-
-    # último clique (azul)
-    if last_click is not None:
-        x, y = last_click
-        d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=(0, 0, 255), width=3)
+    # sample points being clicked (blue dots)
+    for i, (x, y) in enumerate(sample_pts_crop):
+        r = 5
+        d.ellipse((x-r, y-r, x+r, y+r), outline=(0, 0, 255), width=3)
+        if i == 0:
+            d.text((x+8, y-10), "P", fill=(0, 0, 255))
 
     return out
+
+
+# =========================
+# SOLVER (igual, usa guias)
+# =========================
+def robust_fit_x_from_value(ticks: List[Dict[str, float]]) -> Tuple[float, float]:
+    vals = np.array([t["value"] for t in ticks], dtype=float)
+    xs = np.array([t["x"] for t in ticks], dtype=float)
+    slopes = []
+    for i in range(len(vals)):
+        for j in range(i+1, len(vals)):
+            dv = vals[j] - vals[i]
+            if abs(dv) < 1e-9:
+                continue
+            slopes.append((xs[j]-xs[i])/dv)
+    m = float(np.median(slopes))
+    b = float(np.median(xs - m*vals))
+    return m, b
+
+
+def robust_fit_value_from_y(ticks: List[Dict[str, float]]) -> Tuple[float, float]:
+    ys = np.array([t["y"] for t in ticks], dtype=float)
+    vals = np.array([t["value"] for t in ticks], dtype=float)
+    slopes = []
+    for i in range(len(ys)):
+        for j in range(i+1, len(ys)):
+            dy = ys[j] - ys[i]
+            if abs(dy) < 1e-9:
+                continue
+            slopes.append((vals[j]-vals[i])/dy)
+    m = float(np.median(slopes))
+    b = float(np.median(vals - m*ys))
+    return m, b
+
+
+def std_atm_isa_temp_c(pressure_alt_ft: float) -> float:
+    return 15.0 - 1.98 * (pressure_alt_ft / 1000.0)
+
+
+def interpolate_line(pairs: List[Tuple[float, LineABC]], value: float) -> LineABC:
+    pairs = sorted(pairs, key=lambda t: t[0])
+    values = [v for v, _ in pairs]
+    v = clamp(value, values[0], values[-1])
+    for i in range(len(pairs)-1):
+        v1, l1 = pairs[i]
+        v2, l2 = pairs[i+1]
+        if v1 <= v <= v2:
+            t = 0.0 if v2 == v1 else (v - v1) / (v2 - v1)
+            a = (1-t)*l1.a + t*l2.a
+            b = (1-t)*l1.b + t*l2.b
+            c = (1-t)*l1.c + t*l2.c
+            n = float(np.hypot(a,b)) + 1e-12
+            return LineABC(a/n, b/n, c/n)
+    return pairs[-1][1]
 
 
 def draw_arrow(draw: ImageDraw.ImageDraw, p1, p2, width=5):
@@ -235,46 +302,41 @@ def draw_arrow(draw: ImageDraw.ImageDraw, p1, p2, width=5):
     draw.polygon(tri, fill=(255, 0, 0))
 
 
-# =========================
-# SOLVER (uses captured guides)
-# =========================
 def solve_with_guides(
     capture: Dict[str, Any],
     base_img: Image.Image,
     pressure_alt_ft: float,
     oat_c: float,
     weight_lb: float,
-    wind_kt_signed: float,  # tailwind negativo
+    wind_kt_signed: float,
 ) -> Tuple[float, float, List[Tuple[float, float]]]:
 
     ensure_guide_struct(capture)
 
     ticks_oat = capture["axis_ticks"]["oat_c"]
-    ticks_wt = capture["axis_ticks"]["weight_x100_lb"]
+    ticks_wt  = capture["axis_ticks"]["weight_x100_lb"]
     ticks_wnd = capture["axis_ticks"]["wind_kt"]
-    ticks_gr = capture["axis_ticks"]["ground_roll_ft"]
+    ticks_gr  = capture["axis_ticks"]["ground_roll_ft"]
 
-    mo, bo = robust_fit_x_from_value(ticks_oat)
-    mw, bw = robust_fit_x_from_value(ticks_wt)
+    mo, bo   = robust_fit_x_from_value(ticks_oat)
+    mw, bw   = robust_fit_x_from_value(ticks_wt)
     mwd, bwd = robust_fit_x_from_value(ticks_wnd)
     mgr, bgr = robust_fit_value_from_y(ticks_gr)
 
     oat_axis_y = float(np.median([t["y"] for t in ticks_oat]))
-    gr_axis_x = float(np.median([t["x"] for t in ticks_gr]))
+    gr_axis_x  = float(np.median([t["x"] for t in ticks_gr]))
 
-    def x_from_oat(v): return mo * v + bo
-    def x_from_weight_lb(v): return mw * (v / 100.0) + bw
-    def x_from_wind(v): return mwd * v + bwd
-    def gr_from_y(y): return mgr * y + bgr
-
-    lines = capture["lines"]
+    def x_from_oat(v): return mo*v + bo
+    def x_from_weight_lb(v): return mw*(v/100.0) + bw
+    def x_from_wind(v): return mwd*v + bwd
+    def gr_from_y(y): return mgr*y + bgr
 
     def get_line(key: str) -> LineABC:
-        seg = lines[key][0]
+        seg = capture["lines"][key][0]
         return LineABC.from_points((seg["x1"], seg["y1"]), (seg["x2"], seg["y2"]))
 
     isa_m15 = get_line("isa_m15")
-    isa_0 = get_line("isa")
+    isa_0   = get_line("isa")
     isa_p35 = get_line("isa_p35")
 
     pa0 = get_line("pa_sea_level")
@@ -283,26 +345,23 @@ def solve_with_guides(
     pa6 = get_line("pa_6000")
     pa7 = get_line("pa_7000")
 
-    w_ref = get_line("weight_ref_line")
+    w_ref  = get_line("weight_ref_line")
     z_wind = get_line("wind_ref_zero")
 
     dev = oat_c - std_atm_isa_temp_c(pressure_alt_ft)
     isa_line = interpolate_line([(-15.0, isa_m15), (0.0, isa_0), (35.0, isa_p35)], dev)
-    pa_line = interpolate_line([(0.0, pa0), (2000.0, pa2), (4000.0, pa4), (6000.0, pa6), (7000.0, pa7)], pressure_alt_ft)
+    pa_line  = interpolate_line([(0.0, pa0), (2000.0, pa2), (4000.0, pa4), (6000.0, pa6), (7000.0, pa7)], pressure_alt_ft)
 
     p_left = isa_line.intersect(pa_line)
     if p_left is None:
         raise ValueError("Falhou ISA/PA")
 
-    # seta para cima: do eixo OAT até ao ponto do painel esquerdo
     p_oat = (float(x_from_oat(oat_c)), oat_axis_y)
 
-    # horizontal para weight_ref
     p_wref = w_ref.intersect(horiz_line(p_left[1]))
     if p_wref is None:
         raise ValueError("Falhou weight_ref_line")
 
-    # painel weight: guia mais próxima ao ponto p_wref
     guide_w = choose_nearest_guide(capture["guide_lines"]["weight_guides"], p_wref)
     xw = float(x_from_weight_lb(weight_lb))
     if guide_w is None:
@@ -311,17 +370,15 @@ def solve_with_guides(
         ln = parallel_line_through(guide_w, p_wref)
         p_w = ln.intersect(vert_line(xw)) or (xw, p_wref[1])
 
-    # horizontal para wind_ref_zero
     p_z = z_wind.intersect(horiz_line(p_w[1]))
     if p_z is None:
         raise ValueError("Falhou wind_ref_zero")
 
-    # escolhe conjunto headwind/tailwind
     wind_mag = abs(float(wind_kt_signed))
     wind_key = "wind_headwind_guides" if wind_kt_signed >= 0 else "wind_tailwind_guides"
     guide_wind = choose_nearest_guide(capture["guide_lines"][wind_key], p_z)
-
     xwind = float(x_from_wind(wind_mag))
+
     if guide_wind is None:
         p_wind = (xwind, p_z[1])
     else:
@@ -337,10 +394,10 @@ def solve_with_guides(
 
 
 # =========================
-# STREAMLIT UI
+# STREAMLIT APP
 # =========================
 st.set_page_config(page_title="Nomogram Editor + Solver", layout="wide")
-st.title("Nomograma — Editor (guias) + Solver (Headwind / Tailwind)")
+st.title("Nomograma — Editor (fit por pontos) + Solver (Headwind/Tailwind)")
 
 colA, colB = st.columns(2)
 with colA:
@@ -359,10 +416,8 @@ if not pdf_path:
     st.error(f"Não encontrei '{PDF_NAME_DEFAULT}' e não fizeste upload.")
     st.stop()
 
-
-# ---- session-state capture (THIS IS THE FIX) ----
+# ---- capture in session state (persist) ----
 if "capture" not in st.session_state:
-    # inicializa uma vez
     if cap_up is not None:
         st.session_state.capture = json.loads(cap_up.read().decode("utf-8"))
     elif cap_path and Path(cap_path).exists():
@@ -371,7 +426,6 @@ if "capture" not in st.session_state:
         st.session_state.capture = {"zoom": 2.3, "lines": {}, "axis_ticks": {}, "panel_corners": {}}
     ensure_guide_struct(st.session_state.capture)
 else:
-    # se fizerem upload novo, substitui explicitamente
     if cap_up is not None:
         st.session_state.capture = json.loads(cap_up.read().decode("utf-8"))
         ensure_guide_struct(st.session_state.capture)
@@ -384,68 +438,102 @@ base_img = render_pdf_page_to_pil(pdf_path, zoom=zoom)
 
 mode = st.radio("Modo", ["Editor de guias (JSON)", "Solver"], horizontal=True)
 
-if "pending_p1" not in st.session_state:
-    st.session_state.pending_p1 = None
-if "last_click" not in st.session_state:
-    st.session_state.last_click = None
-
+# editor state: points for current line (in crop coords)
+if "sample_pts" not in st.session_state:
+    st.session_state.sample_pts = []
 
 if mode == "Editor de guias (JSON)":
-    st.subheader("Editor: clica 2 pontos por linha (P1 e P2)")
-    st.markdown(
-        "- Recomendo: **de baixo para cima** (mas qualquer ordem dá).  \n"
-        "- WEIGHT: 5–7 linhas  \n"
-        "- WIND headwind: 5–7 linhas  \n"
-        "- WIND tailwind: 5–7 linhas"
+    st.subheader("Editor (melhor): clica vários pontos na guia e depois 'Criar linha (fit)'")
+
+    key = st.selectbox("Conjunto",
+                       ["weight_guides", "wind_headwind_guides", "wind_tailwind_guides"],
+                       help="WEIGHT= painel do meio; WIND= painel direito (headwind e tailwind separados)")
+
+    # choose panel bbox for this key
+    panel_name = get_panel_for_key(capture, key)
+    if "panel_corners" not in capture or panel_name not in capture["panel_corners"]:
+        st.error("Faltam panel_corners no capture.json (preciso de left/middle/right).")
+        st.stop()
+
+    x0, y0, x1, y1 = panel_bbox(capture["panel_corners"][panel_name])
+    crop = base_img.crop((x0, y0, x1, y1))
+
+    zoom_editor = st.slider("Zoom do editor", 1.0, 4.0, 2.0, 0.1)
+
+    # overlay + resize for easier clicking
+    img_overlay = overlay_editor_crop(
+        crop=crop,
+        capture=capture,
+        key=key,
+        offset=(x0, y0),
+        sample_pts_crop=st.session_state.sample_pts,
     )
 
-    key = st.selectbox("Conjunto", ["weight_guides", "wind_headwind_guides", "wind_tailwind_guides"])
+    if zoom_editor != 1.0:
+        w, h = img_overlay.size
+        img_overlay = img_overlay.resize((int(w * zoom_editor), int(h * zoom_editor)), Image.NEAREST)
 
-    # overlay SEMPRE a partir do capture em session_state
-    img_overlay = overlay_existing_guides(
-        base_img, capture, key,
-        pending=st.session_state.pending_p1,
-        last_click=st.session_state.last_click
-    )
+    click = streamlit_image_coordinates(np.array(img_overlay), key=f"coords_{key}")
 
-    # numpy array é mais fiável para o componente
-    img_np = np.array(img_overlay)
-
-    click = streamlit_image_coordinates(img_np, key=f"coords_{key}")
-
-    st.write("Último clique:", click)
-
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.write("P1 pendente:", st.session_state.pending_p1)
+        st.write("Pontos na linha:", len(st.session_state.sample_pts))
     with c2:
-        if st.button("Limpar P1"):
-            st.session_state.pending_p1 = None
-            st.rerun()
+        if st.button("Undo ponto"):
+            if st.session_state.sample_pts:
+                st.session_state.sample_pts.pop()
+                st.rerun()
     with c3:
-        if st.button("Apagar última linha"):
+        if st.button("Limpar pontos"):
+            st.session_state.sample_pts = []
+            st.rerun()
+    with c4:
+        if st.button("Apagar última linha guardada"):
             if capture["guide_lines"][key]:
                 capture["guide_lines"][key].pop()
             st.rerun()
 
     if click is not None:
-        p = (float(click["x"]), float(click["y"]))
-        st.session_state.last_click = p
+        # map click back from zoomed overlay into crop coords
+        cx = float(click["x"]) / float(zoom_editor)
+        cy = float(click["y"]) / float(zoom_editor)
+        st.session_state.sample_pts.append((cx, cy))
+        st.rerun()
 
-        if st.session_state.pending_p1 is None:
-            st.session_state.pending_p1 = p
-            st.rerun()
+    # Create fitted line
+    st.markdown("### Criar linha (fit)")
+    st.caption("Clica 4–10 pontos ao longo da guia grossa. Depois carrega em 'Criar linha (fit)'.")
+    if st.button("✅ Criar linha (fit) a partir dos pontos"):
+        if len(st.session_state.sample_pts) < 2:
+            st.warning("Precisas de pelo menos 2 pontos (recomendo 4+).")
         else:
-            p1 = st.session_state.pending_p1
-            p2 = p
-            add_segment(capture, key, p1, p2)  # <- agora fica no session_state
-            st.session_state.pending_p1 = None
-            st.rerun()
+            # fit on CROP coords
+            p0, d = fit_line_pca(st.session_state.sample_pts)
+
+            # find intersections with crop rect
+            rect = (0.0, 0.0, float(crop.size[0]-1), float(crop.size[1]-1))
+            inter = line_rect_intersections(p0, d, rect)
+
+            if len(inter) < 2:
+                st.warning("Não consegui esticar a linha até às bordas (tenta mais pontos).")
+            else:
+                pA, pB = inter[0], inter[1]
+
+                # convert to GLOBAL coords
+                gA = (pA[0] + x0, pA[1] + y0)
+                gB = (pB[0] + x0, pB[1] + y0)
+
+                add_segment(capture, key, gA, gB)
+                st.session_state.sample_pts = []
+                st.rerun()
 
     st.write("Contagens:", {k: len(capture["guide_lines"][k]) for k in capture["guide_lines"]})
-
-    json_bytes = json.dumps(capture, indent=2).encode("utf-8")
-    st.download_button("⬇️ Download capture.json atualizado", data=json_bytes, file_name="capture.json", mime="application/json")
+    st.download_button(
+        "⬇️ Download capture.json atualizado",
+        data=json.dumps(capture, indent=2).encode("utf-8"),
+        file_name="capture.json",
+        mime="application/json",
+    )
 
 else:
     st.subheader("Solver")
