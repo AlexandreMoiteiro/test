@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -255,6 +256,33 @@ def draw_overlay(
 
 
 # =========================
+# History (UNDO) helpers
+# =========================
+def push_history():
+    st.session_state.history.append({
+        "cap": copy.deepcopy(st.session_state.cap),
+        "pending_point": st.session_state.pending_point,
+        "pending_corners": copy.deepcopy(st.session_state.pending_corners),
+        "last_click": st.session_state.last_click,
+        "status_msg": st.session_state.status_msg,
+    })
+    if len(st.session_state.history) > 60:
+        st.session_state.history = st.session_state.history[-60:]
+
+
+def undo_history() -> bool:
+    if not st.session_state.history:
+        return False
+    snap = st.session_state.history.pop()
+    st.session_state.cap = snap["cap"]
+    st.session_state.pending_point = snap["pending_point"]
+    st.session_state.pending_corners = snap["pending_corners"]
+    st.session_state.last_click = snap["last_click"]
+    st.session_state.status_msg = "UNDO ✓"
+    return True
+
+
+# =========================
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="PA28 JSON Builder (3 gráficos)", layout="wide")
@@ -307,12 +335,14 @@ if "cap" not in st.session_state or st.session_state.get("cap_mode") != mode:
 
 cap = st.session_state.cap
 cap = ensure_capture(cap, mode=mode, zoom=float(zoom), page_index=int(page_index))
+st.session_state.cap = cap
 
 # State for capture workflow
 st.session_state.setdefault("pending_point", None)     # (x,y) for segment first click
 st.session_state.setdefault("pending_corners", [])     # list of {"x","y"} up to 4
 st.session_state.setdefault("last_click", None)        # (x,y)
 st.session_state.setdefault("status_msg", "")
+st.session_state.setdefault("history", [])
 
 # Controls: what to show
 with st.sidebar:
@@ -324,18 +354,28 @@ with st.sidebar:
     show_guides = st.checkbox("Mostrar guides", value=True)
 
     st.markdown("---")
-    if st.button("Reset pending (limpar clique pendente)"):
+    if st.button("↩️ Undo (voltar atrás 1 passo)"):
+        if undo_history():
+            st.rerun()
+        else:
+            st.info("Nada para fazer undo.")
+
+    if st.button("Reset pending (limpar pendentes)"):
+        push_history()
         st.session_state.pending_point = None
         st.session_state.pending_corners = []
         st.session_state.status_msg = "Pendentes limpos."
+        st.rerun()
 
     if st.button("Novo JSON (reset tudo)"):
+        push_history()
         st.session_state.cap = new_capture(mode, zoom=float(zoom), page_index=int(page_index))
         st.session_state.pending_point = None
         st.session_state.pending_corners = []
         st.session_state.last_click = None
         st.session_state.status_msg = "JSON reset."
         st.rerun()
+
 
 # Layout
 left, right = st.columns([1.6, 1])
@@ -374,6 +414,56 @@ with right:
         guide_key = task.split("GUIDE: ")[1].split(" (")[0].strip()
         st.info(cfg["guides"][guide_key])
 
+    # delete last for current task
+    def delete_last_for_task() -> bool:
+        cap_local = st.session_state.cap
+
+        # if there is a pending first point, delete it
+        if st.session_state.pending_point is not None:
+            st.session_state.pending_point = None
+            st.session_state.status_msg = "Ponto pendente apagado."
+            return True
+
+        # pending corners
+        if st.session_state.pending_corners:
+            st.session_state.pending_corners.pop()
+            st.session_state.status_msg = "Último corner pendente apagado."
+            return True
+
+        # remove last item according to current task
+        if task.startswith("TICK:") and tick_axis:
+            if cap_local["axis_ticks"][tick_axis]:
+                cap_local["axis_ticks"][tick_axis].pop()
+                st.session_state.status_msg = f"Último tick apagado ({tick_axis})."
+                return True
+
+        if task.startswith("LINE:") and line_key:
+            if cap_local["lines"][line_key]:
+                cap_local["lines"][line_key].pop()
+                st.session_state.status_msg = f"Último segmento apagado (line {line_key})."
+                return True
+
+        if task.startswith("GUIDE:") and guide_key:
+            if cap_local["guides"][guide_key]:
+                cap_local["guides"][guide_key].pop()
+                st.session_state.status_msg = f"Última guide apagada ({guide_key})."
+                return True
+
+        if task.startswith("PANEL") and panel_pick:
+            if cap_local["panel_corners"][panel_pick]:
+                cap_local["panel_corners"][panel_pick] = []
+                st.session_state.status_msg = f"Corners do painel {panel_pick} apagados."
+                return True
+
+        return False
+
+    if st.button("🗑️ Apagar último ponto (do modo atual)"):
+        push_history()
+        if delete_last_for_task():
+            st.rerun()
+        else:
+            st.info("Nada para apagar neste modo.")
+
     st.markdown("---")
     st.subheader("Último clique")
     if st.session_state.last_click is None:
@@ -394,33 +484,36 @@ with right:
     st.markdown("---")
     st.subheader("Resumo do JSON")
     st.write({
-        "panels": {p: len(cap["panel_corners"].get(p, [])) for p in cfg["panels"]},
-        "ticks": {k: len(cap["axis_ticks"].get(k, [])) for k in cfg["axis_ticks"].keys()},
-        "lines": {k: len(cap["lines"].get(k, [])) for k in cfg["lines"]},
-        "guides": {k: len(cap["guides"].get(k, [])) for k in cfg.get("guides", {}).keys()},
+        "panels": {p: len(st.session_state.cap["panel_corners"].get(p, [])) for p in cfg["panels"]},
+        "ticks": {k: len(st.session_state.cap["axis_ticks"].get(k, [])) for k in cfg["axis_ticks"].keys()},
+        "lines": {k: len(st.session_state.cap["lines"].get(k, [])) for k in cfg["lines"]},
+        "guides": {k: len(st.session_state.cap["guides"].get(k, [])) for k in cfg.get("guides", {}).keys()},
     })
 
     st.markdown("---")
     st.subheader("Export / Guardar")
-    txt = json.dumps(cap, indent=2)
+    txt = json.dumps(st.session_state.cap, indent=2)
     st.download_button("⬇️ Download JSON", data=txt, file_name=default_json_name, mime="application/json")
     if st.button(f"Guardar no repo como {default_json_name}"):
         Path(default_json_name).write_text(txt, encoding="utf-8")
         st.success(f"Guardado: {default_json_name}")
 
     st.markdown("---")
-    st.subheader("Apagar outliers (como antes)")
+    st.subheader("Apagar outliers (por índice)")
     del_kind = st.selectbox("Apagar:", ["—", "Ticks", "Lines", "Guides", "Panel corners"])
+    cap_local = st.session_state.cap
+
     if del_kind == "Ticks":
         ax = st.selectbox("Axis", list(cfg["axis_ticks"].keys()))
-        items = cap["axis_ticks"][ax]
+        items = cap_local["axis_ticks"][ax]
         if items:
             opts = [f"[{i}] v={t['value']} (x={int(t['x'])}, y={int(t['y'])})" for i, t in enumerate(items)]
             pick = st.multiselect("Seleciona índices", opts)
             if st.button("Apagar ticks selecionados"):
-                idxs = sorted([int(s.split("]")[0][1:]) for s in pick], reverse=True)
+                push_history()
+                idxs = sorted([int(s.split(']')[0][1:]) for s in pick], reverse=True)
                 for i in idxs:
-                    cap["axis_ticks"][ax].pop(i)
+                    cap_local["axis_ticks"][ax].pop(i)
                 st.session_state.status_msg = "Ticks apagados."
                 st.rerun()
         else:
@@ -428,14 +521,15 @@ with right:
 
     elif del_kind == "Lines":
         lk = st.selectbox("Line key", cfg["lines"])
-        items = cap["lines"][lk]
+        items = cap_local["lines"][lk]
         if items:
             opts = [f"[{i}] ({int(s['x1'])},{int(s['y1'])})→({int(s['x2'])},{int(s['y2'])})" for i, s in enumerate(items)]
             pick = st.multiselect("Seleciona índices", opts)
             if st.button("Apagar segmentos selecionados"):
-                idxs = sorted([int(s.split("]")[0][1:]) for s in pick], reverse=True)
+                push_history()
+                idxs = sorted([int(s.split(']')[0][1:]) for s in pick], reverse=True)
                 for i in idxs:
-                    cap["lines"][lk].pop(i)
+                    cap_local["lines"][lk].pop(i)
                 st.session_state.status_msg = "Segmentos apagados."
                 st.rerun()
         else:
@@ -446,14 +540,15 @@ with right:
             st.info("Este gráfico não tem guides.")
         else:
             gk = st.selectbox("Guide key", list(cfg["guides"].keys()))
-            items = cap["guides"][gk]
+            items = cap_local["guides"][gk]
             if items:
                 opts = [f"[{i}] ({int(s['x1'])},{int(s['y1'])})→({int(s['x2'])},{int(s['y2'])})" for i, s in enumerate(items)]
                 pick = st.multiselect("Seleciona índices", opts)
                 if st.button("Apagar guides selecionadas"):
-                    idxs = sorted([int(s.split("]")[0][1:]) for s in pick], reverse=True)
+                    push_history()
+                    idxs = sorted([int(s.split(']')[0][1:]) for s in pick], reverse=True)
                     for i in idxs:
-                        cap["guides"][gk].pop(i)
+                        cap_local["guides"][gk].pop(i)
                     st.session_state.status_msg = "Guides apagadas."
                     st.rerun()
             else:
@@ -462,18 +557,19 @@ with right:
     elif del_kind == "Panel corners":
         p = st.selectbox("Painel", cfg["panels"])
         if st.button(f"Limpar corners do painel {p}"):
-            cap["panel_corners"][p] = []
+            push_history()
+            cap_local["panel_corners"][p] = []
             st.session_state.status_msg = "Corners apagados."
             st.rerun()
 
 
 with left:
-    st.subheader("Imagem (mostra clique, painéis, etc.)")
+    st.subheader("Imagem (mostra clique + figuras finais)")
 
-    # Build overlay with last click & pending markers
-    overlay = draw_overlay(
+    # overlay BEFORE click
+    overlay_before = draw_overlay(
         bg,
-        cap,
+        st.session_state.cap,
         show_panels=show_panels,
         show_ticks=show_ticks,
         show_lines=show_lines,
@@ -483,34 +579,37 @@ with left:
         pending_corners=st.session_state.pending_corners,
     )
 
-    click = streamlit_image_coordinates(np.array(overlay), key=f"img_{mode}_{cap.get('page_index',0)}")
+    click = streamlit_image_coordinates(np.array(overlay_before), key=f"img_{mode}_{page_index}")
 
     if click is not None:
+        push_history()
+
         x = float(click["x"])
         y = float(click["y"])
         st.session_state.last_click = (x, y)
-        st.session_state.status_msg = ""  # limpar msg antiga
+        st.session_state.status_msg = ""
 
-        # APPLY the click according to task
+        cap_local = st.session_state.cap
+
         if task.startswith("PANEL"):
             st.session_state.pending_corners.append({"x": x, "y": y})
             if len(st.session_state.pending_corners) == 4:
-                cap["panel_corners"][panel_pick] = st.session_state.pending_corners
+                cap_local["panel_corners"][panel_pick] = st.session_state.pending_corners
                 st.session_state.pending_corners = []
                 st.session_state.status_msg = f"Corners guardados em '{panel_pick}'."
 
         elif task.startswith("TICK:"):
-            cap["axis_ticks"][tick_axis].append({"x": x, "y": y, "value": float(tick_value)})
+            cap_local["axis_ticks"][tick_axis].append({"x": x, "y": y, "value": float(tick_value)})
             st.session_state.status_msg = f"Tick adicionado em {tick_axis} (v={tick_value})."
 
         elif task.startswith("LINE:"):
             if st.session_state.pending_point is None:
                 st.session_state.pending_point = (x, y)
-                st.session_state.status_msg = "Primeiro ponto da linha guardado. Agora clica no segundo."
+                st.session_state.status_msg = "Primeiro ponto guardado. Agora clica no segundo."
             else:
                 x1, y1 = st.session_state.pending_point
                 st.session_state.pending_point = None
-                cap["lines"][line_key].append({"x1": x1, "y1": y1, "x2": x, "y2": y})
+                cap_local["lines"][line_key].append({"x1": x1, "y1": y1, "x2": x, "y2": y})
                 st.session_state.status_msg = f"Segmento adicionado em lines['{line_key}']."
 
         elif task.startswith("GUIDE:"):
@@ -520,12 +619,24 @@ with left:
             else:
                 x1, y1 = st.session_state.pending_point
                 st.session_state.pending_point = None
-                cap["guides"][guide_key].append({"x1": x1, "y1": y1, "x2": x, "y2": y})
+                cap_local["guides"][guide_key].append({"x1": x1, "y1": y1, "x2": x, "y2": y})
                 st.session_state.status_msg = f"Guide adicionada em guides['{guide_key}']."
 
-        # re-render to show immediate feedback
-        st.rerun()
+        st.session_state.cap = cap_local
 
-    st.image(overlay, use_container_width=True)
-    st.caption("O ponto preto é o último clique. Laranja = 1º ponto pendente (segmentos). Magenta = corners pendentes.")
+    # overlay AFTER click (mostra figura final)
+    overlay_after = draw_overlay(
+        bg,
+        st.session_state.cap,
+        show_panels=show_panels,
+        show_ticks=show_ticks,
+        show_lines=show_lines,
+        show_guides=show_guides,
+        last_click=st.session_state.last_click,
+        pending_point=st.session_state.pending_point,
+        pending_corners=st.session_state.pending_corners,
+    )
+
+    st.image(overlay_after, use_container_width=True)
+    st.caption("Preto = último clique. Laranja = 1º ponto pendente. Magenta = corners pendentes.")
 
