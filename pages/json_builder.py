@@ -13,19 +13,19 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 
 
 # =========================
-# Repo file names (os teus)
+# Repo file names
 # =========================
 FILES = {
     "landing": {
-        "bg_default": "ldg_ground_roll.pdf",
-        "json_default": "ldg_ground_roll.json",
+        "bg_default": "ldg_perf.pdf",
+        "json_default": "ldg_perf.json",
         "kind": "pdf",
         "page_default": 0,
     },
     "takeoff": {
-        "bg_default": "to_ground_roll.jpg",
-        "json_default": "to_ground_roll.json",
-        "kind": "image",
+        "bg_default": "to_perf.pdf",
+        "json_default": "to_perf.json",
+        "kind": "pdf",
         "page_default": 0,
     },
     "climb": {
@@ -38,13 +38,13 @@ FILES = {
 
 MODE_CONFIG: Dict[str, Dict[str, Any]] = {
     "landing": {
-        "title": "Landing Ground Roll",
+        "title": "Landing Distance Over 50 ft",
         "panels": ["left", "middle", "right"],
         "axis_ticks": {
             "oat_c": "OAT (°C) [painel left]",
             "weight_x100_lb": "Weight (lb/100) [painel middle]",
             "wind_kt": "Wind (kt) [painel right]",
-            "ground_roll_ft": "Ground Roll (ft) [eixo vertical right]",
+            "landing_50ft_ft": "Landing distance over 50 ft (ft) [eixo vertical right]",
         },
         "lines": [
             "isa_m15", "isa", "isa_p35",
@@ -52,18 +52,18 @@ MODE_CONFIG: Dict[str, Dict[str, Any]] = {
             "weight_ref_line", "wind_ref_zero",
         ],
         "guides": {
-            "guides_weight": "Guias WEIGHT (painel middle)",
-            "guides_wind": "Guias WIND (painel right)",
+            "middle": "Guias do painel middle",
+            "right": "Guias do painel right",
         },
     },
     "takeoff": {
-        "title": "Flaps Up Takeoff Ground Roll",
+        "title": "Takeoff Distance Over 50 ft",
         "panels": ["left", "middle", "right"],
         "axis_ticks": {
             "oat_c": "OAT (°C) [painel left]",
             "weight_x100_lb": "Weight (lb/100) [painel middle]",
             "wind_kt": "Wind (kt) [painel right]",
-            "takeoff_gr_ft": "Takeoff GR (ft) [eixo vertical right]",
+            "takeoff_50ft_ft": "Takeoff distance over 50 ft (ft) [eixo vertical right]",
         },
         "lines": [
             "isa_m15", "isa", "isa_p35",
@@ -71,8 +71,8 @@ MODE_CONFIG: Dict[str, Dict[str, Any]] = {
             "weight_ref_line", "wind_ref_zero",
         ],
         "guides": {
-            "guides_weight": "Guias WEIGHT (painel middle)",
-            "guides_wind": "Guias WIND (painel right)",
+            "middle": "Guias do painel middle",
+            "right": "Guias do painel right",
         },
     },
     "climb": {
@@ -129,7 +129,6 @@ def load_background(mode: str, upload_bg, page_index: int, zoom: float) -> Image
             pdf_bytes = Path(p).read_bytes()
         return render_pdf_page_to_pil(pdf_bytes, page_index=page_index, zoom=zoom)
 
-    # image
     if upload_bg is not None:
         return Image.open(upload_bg).convert("RGB")
 
@@ -152,10 +151,10 @@ def new_capture(mode: str, zoom: float, page_index: int) -> Dict[str, Any]:
         "mode": mode,
         "zoom": float(zoom),
         "page_index": int(page_index),
-        "panel_corners": {p: [] for p in cfg["panels"]},  # 4 pts {"x","y"}
-        "axis_ticks": {k: [] for k in cfg["axis_ticks"].keys()},  # {"x","y","value"}
-        "lines": {k: [] for k in cfg["lines"]},  # {"x1","y1","x2","y2"}
-        "guides": {k: [] for k in cfg.get("guides", {}).keys()},  # {"x1","y1","x2","y2"}
+        "panel_corners": {p: [] for p in cfg["panels"]},
+        "axis_ticks": {k: [] for k in cfg["axis_ticks"].keys()},
+        "lines": {k: [] for k in cfg["lines"]},
+        "guides": {k: [] for k in cfg.get("guides", {}).keys()},
         "notes": "Tudo em pixels do render atual (zoom e page_index).",
     }
 
@@ -203,7 +202,6 @@ def draw_overlay(
     out = base.copy()
     d = ImageDraw.Draw(out)
 
-    # panels
     if show_panels:
         for panel, pts in cap.get("panel_corners", {}).items():
             if len(pts) == 4:
@@ -211,37 +209,31 @@ def draw_overlay(
                 d.line(poly + [poly[0]], fill=(0, 140, 255), width=3)
                 d.text((poly[0][0] + 6, poly[0][1] + 6), panel, fill=(0, 140, 255))
 
-    # ticks
     if show_ticks:
         for _, ticks in cap.get("axis_ticks", {}).items():
             for t in ticks:
                 x, y = float(t["x"]), float(t["y"])
                 d.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(0, 160, 0), width=3)
 
-    # lines
     if show_lines:
         for _, segs in cap.get("lines", {}).items():
             for s in segs:
                 d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(255, 0, 0), width=3)
 
-    # guides
     if show_guides:
         for _, segs in cap.get("guides", {}).items():
             for s in segs:
                 d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(0, 0, 255), width=4)
 
-    # pending corners
     for p in pending_corners:
         x, y = p["x"], p["y"]
         d.ellipse((x - 5, y - 5, x + 5, y + 5), outline=(255, 0, 255), width=3)
 
-    # pending segment first point
     if pending_segment is not None:
         x, y = pending_segment["p"]
         d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=(255, 140, 0), width=4)
         d.text((x + 8, y + 8), f"{pending_segment['kind']}:{pending_segment['key']}", fill=(255, 140, 0))
 
-    # last click
     if last_click is not None:
         x, y = last_click
         d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=(0, 0, 0), width=4)
@@ -250,7 +242,7 @@ def draw_overlay(
 
 
 # =========================
-# History (UNDO)
+# History
 # =========================
 def push_history():
     st.session_state.history.append({
@@ -281,10 +273,9 @@ def undo_history() -> bool:
 
 
 # =========================
-# Click de-dup (CRÍTICO)
+# Click de-dup
 # =========================
 def click_id(click: Dict[str, Any], mode: str, page_index: int) -> str:
-    # quantização para evitar diferenças minúsculas
     x = int(round(float(click["x"])))
     y = int(round(float(click["y"])))
     return f"{mode}|{page_index}|{x}|{y}"
@@ -293,8 +284,8 @@ def click_id(click: Dict[str, Any], mode: str, page_index: int) -> str:
 # =========================
 # App
 # =========================
-st.set_page_config(page_title="PA28 JSON Builder (3 gráficos)", layout="wide")
-st.title("PA28 — Builder de JSON (Landing / Takeoff / Climb)")
+st.set_page_config(page_title="PA28 JSON Builder", layout="wide")
+st.title("PA28 — Builder de JSON (Takeoff/Landing 50 ft + Climb)")
 
 mode = st.sidebar.selectbox(
     "Escolhe o gráfico",
@@ -332,11 +323,9 @@ def load_json_or_new() -> Dict[str, Any]:
     return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
 
 
-# init per-mode
 if "cap" not in st.session_state or st.session_state.get("cap_mode") != mode:
     st.session_state.cap = load_json_or_new()
     st.session_state.cap_mode = mode
-    # reset click de-dup when switching mode
     st.session_state.last_processed_click_id = None
     st.session_state.prev_task_id = None
     st.session_state.pending_segment = None
@@ -346,8 +335,7 @@ if "cap" not in st.session_state or st.session_state.get("cap_mode") != mode:
 
 st.session_state.cap = ensure_capture(st.session_state.cap, mode=mode, zoom=float(zoom), page_index=int(page_index))
 
-# session state
-st.session_state.setdefault("pending_segment", None)  # {"kind":"LINE"/"GUIDE","key":str,"p":(x,y)}
+st.session_state.setdefault("pending_segment", None)
 st.session_state.setdefault("pending_corners", [])
 st.session_state.setdefault("last_click", None)
 st.session_state.setdefault("status_msg", "")
@@ -355,7 +343,6 @@ st.session_state.setdefault("history", [])
 st.session_state.setdefault("prev_task_id", None)
 st.session_state.setdefault("last_processed_click_id", None)
 
-# Sidebar overlay toggles + actions
 with st.sidebar:
     st.markdown("---")
     st.header("Overlay")
@@ -389,7 +376,6 @@ with st.sidebar:
         st.rerun()
 
 
-# Layout
 left, right = st.columns([1.6, 1])
 
 with right:
@@ -423,7 +409,6 @@ with right:
         guide_key = task.split("GUIDE: ")[1].split(" (")[0].strip()
         st.info(cfg["guides"][guide_key])
 
-    # task id + auto reset pending if changed
     if task.startswith("PANEL"):
         task_id = f"PANEL:{panel_pick}"
     elif task.startswith("TICK:"):
@@ -440,7 +425,6 @@ with right:
         st.session_state.pending_corners = []
     st.session_state.prev_task_id = task_id
 
-    # delete last for current task
     def delete_last_for_task() -> bool:
         cap_local = st.session_state.cap
 
@@ -531,7 +515,6 @@ with right:
 with left:
     st.subheader("Imagem (sem duplicar cliques)")
 
-    # overlay BEFORE (serve de input ao componente)
     overlay_before = draw_overlay(
         bg,
         st.session_state.cap,
@@ -546,7 +529,6 @@ with left:
 
     click = streamlit_image_coordinates(np.array(overlay_before), key=f"img_{mode}_{int(page_index)}")
 
-    # Processar clique APENAS se for novo (CRÍTICO)
     if click is not None:
         cid = click_id(click, mode=mode, page_index=int(page_index))
         if cid != st.session_state.last_processed_click_id:
@@ -603,7 +585,6 @@ with left:
 
             st.session_state.cap = cap_local
 
-    # overlay AFTER (mostra resultado final sempre)
     overlay_after = draw_overlay(
         bg,
         st.session_state.cap,
