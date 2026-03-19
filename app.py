@@ -246,6 +246,11 @@ def line_y_at_x(seg: Dict[str, float], x: float) -> float:
     return y1 + t * (y2 - y1)
 
 
+def x_minmax(seg: Dict[str, float]) -> Tuple[float, float]:
+    x1, x2 = float(seg["x1"]), float(seg["x2"])
+    return (min(x1, x2), max(x1, x2))
+
+
 def parse_pa_levels_ft(lines: Dict[str, List[Dict[str, float]]]) -> List[Tuple[float, str]]:
     out: List[Tuple[float, str]] = []
     for k, segs in lines.items():
@@ -289,9 +294,55 @@ def x_of_vertical_ref(seg: Dict[str, float]) -> float:
 
 
 # =========================
-# Guide interpolation
+# Guide helpers
 # =========================
-def interp_guides_y(
+def pair_takeoff_guides(segments: List[Dict[str, float]]) -> List[List[Dict[str, float]]]:
+    """
+    No takeoff builder, cada guide curva é guardada como 2 segmentos:
+    [P1->P2, P2->P3]. Aqui reconstruímos cada guide.
+    """
+    out: List[List[Dict[str, float]]] = []
+    i = 0
+    while i < len(segments):
+        if i + 1 < len(segments):
+            out.append([segments[i], segments[i + 1]])
+            i += 2
+        else:
+            out.append([segments[i]])
+            i += 1
+    return out
+
+
+def curve_y_at_x(curve: List[Dict[str, float]], x: float) -> float:
+    """
+    Avalia uma guide:
+    - 1 segmento -> reta normal
+    - 2 segmentos -> curva por partes
+    """
+    if not curve:
+        raise ValueError("Guide curve vazia.")
+
+    if len(curve) == 1:
+        return line_y_at_x(curve[0], x)
+
+    s1, s2 = curve[0], curve[1]
+    a1, b1 = x_minmax(s1)
+    a2, b2 = x_minmax(s2)
+
+    if a1 <= x <= b1:
+        return line_y_at_x(s1, x)
+    if a2 <= x <= b2:
+        return line_y_at_x(s2, x)
+
+    # fora do intervalo: usa o segmento mais próximo
+    d1 = min(abs(x - a1), abs(x - b1))
+    d2 = min(abs(x - a2), abs(x - b2))
+    if d1 <= d2:
+        return line_y_at_x(s1, x)
+    return line_y_at_x(s2, x)
+
+
+def interp_guides_y_straight(
     guides: List[Dict[str, float]],
     x_ref: float,
     y_ref: float,
@@ -321,6 +372,47 @@ def interp_guides_y(
             a = 0.0 if abs(denom) < 1e-12 else (y_ref - y0_ref) / denom
             y_tgt = (1 - a) * y0_tgt + a * y1_tgt
             return float(y_tgt), {"used": "interp", "i0": i, "i1": i + 1, "alpha": float(a)}
+
+    return y_ref, {"used": "fallback"}
+
+
+def interp_guides_y_curved_takeoff(
+    guide_segments: List[Dict[str, float]],
+    x_ref: float,
+    y_ref: float,
+    x_target: float
+) -> Tuple[float, Dict[str, Any]]:
+    if not guide_segments:
+        return y_ref, {"used": "none"}
+
+    curves = pair_takeoff_guides(guide_segments)
+
+    rows = []
+    for idx, curve in enumerate(curves):
+        yr = curve_y_at_x(curve, x_ref)
+        yt = curve_y_at_x(curve, x_target)
+        rows.append((yr, yt, idx, len(curve)))
+
+    rows.sort(key=lambda t: t[0])
+
+    if y_ref <= rows[0][0]:
+        return float(rows[0][1]), {"used": "clamp_low", "curve": rows[0][2]}
+    if y_ref >= rows[-1][0]:
+        return float(rows[-1][1]), {"used": "clamp_high", "curve": rows[-1][2]}
+
+    for i in range(len(rows) - 1):
+        y0_ref, y0_tgt, idx0, _ = rows[i]
+        y1_ref, y1_tgt, idx1, _ = rows[i + 1]
+        if y0_ref <= y_ref <= y1_ref:
+            denom = y1_ref - y0_ref
+            a = 0.0 if abs(denom) < 1e-12 else (y_ref - y0_ref) / denom
+            y_tgt = (1 - a) * y0_tgt + a * y1_tgt
+            return float(y_tgt), {
+                "used": "interp_curved",
+                "curve0": idx0,
+                "curve1": idx1,
+                "alpha": float(a),
+            }
 
     return y_ref, {"used": "fallback"}
 
@@ -467,10 +559,15 @@ def solve_performance_chart(
     x_wt = axis_coord_from_value(ax_wt_a, ax_wt_b, weight_lb / 100.0)
 
     g_mid, g_right = pick_guides(cap)
-    y_mid, dbg_mid = interp_guides_y(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
 
-    x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
-    y_out, dbg_right = interp_guides_y(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
+    if mode == "takeoff":
+        y_mid, dbg_mid = interp_guides_y_curved_takeoff(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
+        x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
+        y_out, dbg_right = interp_guides_y_curved_takeoff(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
+    else:
+        y_mid, dbg_mid = interp_guides_y_straight(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
+        x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
+        y_out, dbg_right = interp_guides_y_straight(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
 
     out_val = axis_value(ax_out_a, ax_out_b, y_out)
 
@@ -494,6 +591,7 @@ def solve_performance_chart(
     segs.append(((x_wind, y_out), (x_right_edge, y_out)))
 
     debug = {
+        "mode": mode,
         "x_oat": x_oat,
         "y_entry": y_entry,
         "x_ref_mid": x_ref_mid,
