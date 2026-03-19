@@ -55,6 +55,7 @@ MODE_CONFIG: Dict[str, Dict[str, Any]] = {
             "middle": "Guias do painel middle",
             "right": "Guias do painel right",
         },
+        "guide_points": 2,
     },
     "takeoff": {
         "title": "Takeoff Distance Over 50 ft",
@@ -71,9 +72,10 @@ MODE_CONFIG: Dict[str, Dict[str, Any]] = {
             "weight_ref_line", "wind_ref_zero",
         ],
         "guides": {
-            "middle": "Guias do painel middle",
-            "right": "Guias do painel right",
+            "middle": "Guias curvas do painel middle (3 pontos)",
+            "right": "Guias curvas do painel right (3 pontos)",
         },
+        "guide_points": 3,
     },
     "climb": {
         "title": "Climb Performance",
@@ -89,6 +91,7 @@ MODE_CONFIG: Dict[str, Dict[str, Any]] = {
             "pa_12000", "pa_13000",
         ],
         "guides": {},
+        "guide_points": 2,
     },
 }
 
@@ -230,9 +233,19 @@ def draw_overlay(
         d.ellipse((x - 5, y - 5, x + 5, y + 5), outline=(255, 0, 255), width=3)
 
     if pending_segment is not None:
-        x, y = pending_segment["p"]
-        d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=(255, 140, 0), width=4)
-        d.text((x + 8, y + 8), f"{pending_segment['kind']}:{pending_segment['key']}", fill=(255, 140, 0))
+        pts = pending_segment.get("pts", [])
+        for i, (x, y) in enumerate(pts):
+            color = (255, 140, 0) if i == 0 else (255, 180, 60)
+            d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=color, width=4)
+            d.text((x + 8, y + 8), f"{i+1}", fill=color)
+
+        if len(pts) >= 2:
+            for i in range(len(pts) - 1):
+                d.line([pts[i], pts[i + 1]], fill=(255, 165, 0), width=3)
+
+        if pts:
+            x, y = pts[0]
+            d.text((x + 8, y - 18), f"{pending_segment['kind']}:{pending_segment['key']}", fill=(255, 140, 0))
 
     if last_click is not None:
         x, y = last_click
@@ -295,6 +308,7 @@ mode = st.sidebar.selectbox(
 
 cfg = MODE_CONFIG[mode]
 files = FILES[mode]
+guide_points_required = int(cfg.get("guide_points", 2))
 
 st.sidebar.markdown("---")
 st.sidebar.header("Background")
@@ -315,12 +329,30 @@ default_json_name = json_default_name(mode)
 
 
 def load_json_or_new() -> Dict[str, Any]:
-    if upload_json is not None:
-        return json.loads(upload_json.read().decode("utf-8"))
-    p = locate_file(default_json_name)
-    if p:
-        return json.loads(Path(p).read_text(encoding="utf-8"))
-    return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
+    try:
+        if upload_json is not None:
+            raw = upload_json.read().decode("utf-8").strip()
+            if not raw:
+                st.warning("O JSON enviado está vazio. Vou criar um novo.")
+                return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
+            return json.loads(raw)
+
+        p = locate_file(default_json_name)
+        if p:
+            raw = Path(p).read_text(encoding="utf-8").strip()
+            if not raw:
+                st.warning(f"{default_json_name} está vazio. Vou criar um novo.")
+                return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
+            return json.loads(raw)
+
+        return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
+
+    except json.JSONDecodeError as e:
+        st.error(
+            f"JSON inválido em '{default_json_name}'. "
+            f"Linha {e.lineno}, coluna {e.colno}. Vou criar um novo JSON vazio."
+        )
+        return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
 
 
 if "cap" not in st.session_state or st.session_state.get("cap_mode") != mode:
@@ -385,7 +417,7 @@ with right:
     tasks += [f"TICK: {k}" for k in cfg["axis_ticks"].keys()]
     tasks += [f"LINE: {k} (2 cliques)" for k in cfg["lines"]]
     for gk in cfg.get("guides", {}).keys():
-        tasks.append(f"GUIDE: {gk} (2 cliques)")
+        tasks.append(f"GUIDE: {gk} ({guide_points_required} cliques)")
 
     task = st.selectbox("O que estás a fazer agora", tasks)
 
@@ -429,9 +461,16 @@ with right:
         cap_local = st.session_state.cap
 
         if st.session_state.pending_segment is not None:
-            st.session_state.pending_segment = None
-            st.session_state.status_msg = "Ponto pendente apagado."
-            return True
+            pts = st.session_state.pending_segment.get("pts", [])
+            if pts:
+                pts.pop()
+                if pts:
+                    st.session_state.pending_segment["pts"] = pts
+                    st.session_state.status_msg = "Último ponto pendente apagado."
+                else:
+                    st.session_state.pending_segment = None
+                    st.session_state.status_msg = "Pendente apagado."
+                return True
 
         if st.session_state.pending_corners:
             st.session_state.pending_corners.pop()
@@ -451,10 +490,18 @@ with right:
                 return True
 
         if task.startswith("GUIDE:") and guide_key:
-            if cap_local["guides"][guide_key]:
-                cap_local["guides"][guide_key].pop()
-                st.session_state.status_msg = f"Última guide apagada ({guide_key})."
-                return True
+            if guide_points_required == 3:
+                segs = cap_local["guides"][guide_key]
+                if len(segs) >= 2:
+                    segs.pop()
+                    segs.pop()
+                    st.session_state.status_msg = f"Última guide curva apagada ({guide_key})."
+                    return True
+            else:
+                if cap_local["guides"][guide_key]:
+                    cap_local["guides"][guide_key].pop()
+                    st.session_state.status_msg = f"Última guide apagada ({guide_key})."
+                    return True
 
         if task.startswith("PANEL") and panel_pick:
             if cap_local["panel_corners"][panel_pick]:
@@ -498,6 +545,9 @@ with right:
         "lines": {k: len(cap_local["lines"].get(k, [])) for k in cfg["lines"]},
         "guides": {k: len(cap_local["guides"].get(k, [])) for k in cfg.get("guides", {}).keys()},
     })
+
+    if task.startswith("GUIDE:") and mode == "takeoff":
+        st.caption("No takeoff, cada guide curva é guardada como 2 segmentos: P1→P2 e P2→P3.")
 
     st.markdown("---")
     st.subheader("Export / Guardar")
@@ -556,32 +606,59 @@ with left:
             elif task.startswith("LINE:"):
                 pend = st.session_state.pending_segment
                 if pend is None:
-                    st.session_state.pending_segment = {"kind": "LINE", "key": line_key, "p": (x, y)}
+                    st.session_state.pending_segment = {"kind": "LINE", "key": line_key, "pts": [(x, y)]}
                     st.session_state.status_msg = "Primeiro ponto guardado. Agora clica no segundo."
                 else:
                     if pend["kind"] != "LINE" or pend["key"] != line_key:
-                        st.session_state.pending_segment = {"kind": "LINE", "key": line_key, "p": (x, y)}
+                        st.session_state.pending_segment = {"kind": "LINE", "key": line_key, "pts": [(x, y)]}
                         st.session_state.status_msg = "Mudaste de linha — novo primeiro ponto guardado."
                     else:
-                        x1, y1 = pend["p"]
-                        st.session_state.pending_segment = None
-                        cap_local["lines"][line_key].append({"x1": x1, "y1": y1, "x2": x, "y2": y})
-                        st.session_state.status_msg = f"Segmento adicionado em lines['{line_key}']."
+                        pts = pend.get("pts", [])
+                        pts.append((x, y))
+                        if len(pts) == 2:
+                            x1, y1 = pts[0]
+                            x2, y2 = pts[1]
+                            cap_local["lines"][line_key].append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+                            st.session_state.pending_segment = None
+                            st.session_state.status_msg = f"Segmento adicionado em lines['{line_key}']."
+                        else:
+                            st.session_state.pending_segment["pts"] = pts
 
             elif task.startswith("GUIDE:"):
                 pend = st.session_state.pending_segment
+                required = guide_points_required
+
                 if pend is None:
-                    st.session_state.pending_segment = {"kind": "GUIDE", "key": guide_key, "p": (x, y)}
-                    st.session_state.status_msg = "Primeiro ponto da guide guardado. Agora clica no segundo."
+                    st.session_state.pending_segment = {"kind": "GUIDE", "key": guide_key, "pts": [(x, y)]}
+                    st.session_state.status_msg = f"Ponto 1/{required} da guide guardado."
                 else:
                     if pend["kind"] != "GUIDE" or pend["key"] != guide_key:
-                        st.session_state.pending_segment = {"kind": "GUIDE", "key": guide_key, "p": (x, y)}
-                        st.session_state.status_msg = "Mudaste de guide — novo primeiro ponto guardado."
+                        st.session_state.pending_segment = {"kind": "GUIDE", "key": guide_key, "pts": [(x, y)]}
+                        st.session_state.status_msg = f"Mudaste de guide — ponto 1/{required} guardado."
                     else:
-                        x1, y1 = pend["p"]
-                        st.session_state.pending_segment = None
-                        cap_local["guides"][guide_key].append({"x1": x1, "y1": y1, "x2": x, "y2": y})
-                        st.session_state.status_msg = f"Guide adicionada em guides['{guide_key}']."
+                        pts = pend.get("pts", [])
+                        pts.append((x, y))
+
+                        if len(pts) < required:
+                            st.session_state.pending_segment["pts"] = pts
+                            st.session_state.status_msg = f"Ponto {len(pts)}/{required} da guide guardado."
+                        else:
+                            if required == 2:
+                                x1, y1 = pts[0]
+                                x2, y2 = pts[1]
+                                cap_local["guides"][guide_key].append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+                                st.session_state.status_msg = f"Guide adicionada em guides['{guide_key}']."
+                            elif required == 3:
+                                x1, y1 = pts[0]
+                                x2, y2 = pts[1]
+                                x3, y3 = pts[2]
+                                cap_local["guides"][guide_key].append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+                                cap_local["guides"][guide_key].append({"x1": x2, "y1": y2, "x2": x3, "y2": y3})
+                                st.session_state.status_msg = (
+                                    f"Guide curva adicionada em guides['{guide_key}'] "
+                                    f"como 2 segmentos."
+                                )
+                            st.session_state.pending_segment = None
 
             st.session_state.cap = cap_local
 
@@ -598,5 +675,5 @@ with left:
     )
 
     st.image(overlay_after, use_container_width=True)
-    st.caption("Preto=último clique | Laranja=1º ponto pendente | Magenta=corners pendentes")
+    st.caption("Preto=último clique | Laranja=guide/line pendente | Magenta=corners pendentes")
 
