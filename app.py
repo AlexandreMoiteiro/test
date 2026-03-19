@@ -9,23 +9,23 @@ from PIL import Image, ImageDraw
 import pymupdf  # PyMuPDF
 
 
-# ======================================
-# Targets to build JSON for new charts
-# ======================================
-TARGETS = {
-    "landing_50ft": {
-        "title": "Landing Performance (50 ft)",
+# =========================
+# Assets
+# =========================
+ASSETS = {
+    "landing_perf": {
+        "title": "Landing Performance",
         "bg_default": "ldg_perf.pdf",
         "bg_kind": "pdf",
         "page_default": 0,
         "json_default_name": "ldg_perf.json",
-        "suggested_axis_keys": [
+        "default_axis_keys": [
             "oat_c",
             "weight_x100_lb",
-            "headwind_kt",
+            "wind_kt",
             "landing_50ft_ft",
         ],
-        "suggested_line_keys": [
+        "default_line_keys": [
             "pa_sea_level",
             "pa_2000",
             "pa_4000",
@@ -33,25 +33,26 @@ TARGETS = {
             "pa_7000",
             "weight_ref_line",
             "wind_ref_zero",
-            "headwind_line",
-            "tailwind_line",
         ],
-        "suggested_guide_groups": ["middle", "right"],
-        "suggested_panels": ["left", "middle", "right"],
+        "default_guide_keys": [
+            "guides_weight",
+            "guides_wind",
+        ],
+        "default_panels": ["left", "middle", "right"],
     },
-    "takeoff_50ft": {
-        "title": "Flaps Up Takeoff Performance (50 ft)",
+    "takeoff_perf": {
+        "title": "Flaps Up Takeoff Performance",
         "bg_default": "to_perf.pdf",
         "bg_kind": "pdf",
         "page_default": 0,
         "json_default_name": "to_perf.json",
-        "suggested_axis_keys": [
+        "default_axis_keys": [
             "oat_c",
             "weight_x100_lb",
-            "headwind_kt",
+            "wind_kt",
             "takeoff_50ft_ft",
         ],
-        "suggested_line_keys": [
+        "default_line_keys": [
             "pa_sea_level",
             "pa_2000",
             "pa_4000",
@@ -59,18 +60,19 @@ TARGETS = {
             "pa_8000",
             "weight_ref_line",
             "wind_ref_zero",
-            "headwind_line",
-            "tailwind_line",
         ],
-        "suggested_guide_groups": ["middle", "right"],
-        "suggested_panels": ["left", "middle", "right"],
+        "default_guide_keys": [
+            "guides_weight",
+            "guides_wind",
+        ],
+        "default_panels": ["left", "middle", "right"],
     },
 }
 
 
-# ======================================
+# =========================
 # Helpers
-# ======================================
+# =========================
 def _here(name: str) -> Optional[Path]:
     p = Path(name)
     if p.exists():
@@ -79,9 +81,6 @@ def _here(name: str) -> Optional[Path]:
         p2 = Path(__file__).resolve().parent / name
         if p2.exists():
             return p2
-    p3 = Path("/mnt/data") / name
-    if p3.exists():
-        return p3
     return None
 
 
@@ -95,8 +94,8 @@ def render_pdf_to_image(pdf_bytes: bytes, page_index: int, zoom: float) -> Image
     return img
 
 
-def load_background(target: str, upload_bg, page_index: int, zoom: float) -> Image.Image:
-    info = TARGETS[target]
+def load_background(asset_key: str, upload_bg, page_index: int, zoom: float) -> Image.Image:
+    info = ASSETS[asset_key]
     if info["bg_kind"] == "pdf":
         if upload_bg is not None:
             pdf_bytes = upload_bg.read()
@@ -116,259 +115,261 @@ def load_background(target: str, upload_bg, page_index: int, zoom: float) -> Ima
     return Image.open(p).convert("RGB")
 
 
-def ensure_capture_shape(cap: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(cap or {})
-    out.setdefault("panel_corners", {})
-    out.setdefault("axis_ticks", {})
-    out.setdefault("lines", {})
-    out.setdefault("guides", {})
-    return out
-
-
-def parse_json_text(text: str) -> Dict[str, Any]:
-    if not text.strip():
-        return ensure_capture_shape({})
-    return ensure_capture_shape(json.loads(text))
-
-
-def pt_xy(p: Any) -> Tuple[float, float]:
-    if isinstance(p, dict):
-        return float(p["x"]), float(p["y"])
-    if isinstance(p, (list, tuple)) and len(p) == 2:
-        return float(p[0]), float(p[1])
-    raise ValueError(f"Invalid point: {p}")
-
-
-def normalize_panel(panel_pts: Any) -> List[Dict[str, float]]:
-    if not isinstance(panel_pts, list) or len(panel_pts) != 4:
-        return []
-    out = []
-    for p in panel_pts:
-        x, y = pt_xy(p)
-        out.append({"x": x, "y": y})
-    return out
-
-
-def normalize_panels(cap: Dict[str, Any]) -> Dict[str, List[Dict[str, float]]]:
-    out = {}
-    pc = cap.get("panel_corners", {})
-    if not isinstance(pc, dict):
-        return out
-    for k, pts in pc.items():
-        out[k] = normalize_panel(pts)
-    return out
-
-
-def as_pretty_json(cap: Dict[str, Any]) -> str:
-    return json.dumps(cap, ensure_ascii=False, indent=2)
-
-
-def blank_template(target: str) -> Dict[str, Any]:
-    info = TARGETS[target]
+def empty_capture(asset_key: str) -> Dict[str, Any]:
+    info = ASSETS[asset_key]
     return {
         "meta": {
+            "asset": asset_key,
             "title": info["title"],
-            "source": info["bg_default"],
-            "notes": "Preencher coordenadas manualmente e validar pelo overlay.",
+            "source_file": info["bg_default"],
+            "notes": "",
         },
-        "panel_corners": {k: [] for k in info["suggested_panels"]},
-        "axis_ticks": {k: [] for k in info["suggested_axis_keys"]},
-        "lines": {k: [] for k in info["suggested_line_keys"]},
-        "guides": {k: [] for k in info["suggested_guide_groups"]},
+        "panel_corners": {k: [] for k in info["default_panels"]},
+        "axis_ticks": {k: [] for k in info["default_axis_keys"]},
+        "lines": {k: [] for k in info["default_line_keys"]},
+        "guides": {k: [] for k in info["default_guide_keys"]},
     }
 
 
-def coerce_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
+def ensure_structure(cap: Dict[str, Any], asset_key: str) -> Dict[str, Any]:
+    info = ASSETS[asset_key]
+    cap.setdefault("meta", {})
+    cap.setdefault("panel_corners", {})
+    cap.setdefault("axis_ticks", {})
+    cap.setdefault("lines", {})
+    cap.setdefault("guides", {})
+
+    for k in info["default_panels"]:
+        cap["panel_corners"].setdefault(k, [])
+    for k in info["default_axis_keys"]:
+        cap["axis_ticks"].setdefault(k, [])
+    for k in info["default_line_keys"]:
+        cap["lines"].setdefault(k, [])
+    for k in info["default_guide_keys"]:
+        cap["guides"].setdefault(k, [])
+
+    return cap
 
 
-def draw_capture_overlay(base: Image.Image, cap: Dict[str, Any], show_labels: bool = True) -> Image.Image:
+def normalize_panel(panel_pts: Any) -> List[Dict[str, float]]:
+    if not isinstance(panel_pts, list):
+        return []
+    out = []
+    for p in panel_pts:
+        if isinstance(p, dict) and "x" in p and "y" in p:
+            out.append({"x": float(p["x"]), "y": float(p["y"])})
+    return out
+
+
+def draw_overlay(base: Image.Image, cap: Dict[str, Any]) -> Image.Image:
     img = base.copy()
     d = ImageDraw.Draw(img)
-    panels = normalize_panels(cap)
 
-    # Lines
-    for name, seglist in (cap.get("lines", {}) or {}).items():
+    # lines
+    for _, seglist in cap.get("lines", {}).items():
         for s in seglist:
-            x1, y1 = coerce_float(s.get("x1")), coerce_float(s.get("y1"))
-            x2, y2 = coerce_float(s.get("x2")), coerce_float(s.get("y2"))
-            d.line([(x1, y1), (x2, y2)], fill=(255, 0, 0), width=3)
-            if show_labels:
-                d.text((x1 + 4, y1 + 4), name, fill=(255, 0, 0))
+            d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(255, 0, 0), width=3)
 
-    # Guides
-    for group, seglist in (cap.get("guides", {}) or {}).items():
-        for i, s in enumerate(seglist):
-            x1, y1 = coerce_float(s.get("x1")), coerce_float(s.get("y1"))
-            x2, y2 = coerce_float(s.get("x2")), coerce_float(s.get("y2"))
-            d.line([(x1, y1), (x2, y2)], fill=(0, 0, 255), width=4)
-            if show_labels:
-                d.text((x1 + 4, y1 - 14), f"{group}[{i}]", fill=(0, 0, 255))
+    # guides
+    for _, seglist in cap.get("guides", {}).items():
+        for s in seglist:
+            d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(0, 0, 255), width=4)
 
-    # Axis ticks
-    for axis_name, tlist in (cap.get("axis_ticks", {}) or {}).items():
-        for t in tlist:
-            x, y = coerce_float(t.get("x")), coerce_float(t.get("y"))
-            d.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(0, 160, 0), width=3)
-            if show_labels:
-                d.text((x + 6, y - 10), f"{axis_name}:{t.get('value')}", fill=(0, 160, 0))
+    # ticks
+    for key, tlist in cap.get("axis_ticks", {}).items():
+        for i, t in enumerate(tlist):
+            x, y = float(t["x"]), float(t["y"])
+            d.ellipse((x - 5, y - 5, x + 5, y + 5), outline=(0, 160, 0), width=3)
+            d.text((x + 6, y - 14), f"{key}:{i}", fill=(0, 110, 0))
 
-    # Panels
-    for panel, pts in panels.items():
+    # panels
+    for panel, pts in cap.get("panel_corners", {}).items():
+        pts = normalize_panel(pts)
         if len(pts) == 4:
-            poly = [(pts[i]["x"], pts[i]["y"]) for i in range(4)]
-            d.line(poly + [poly[0]], fill=(0, 180, 255), width=3)
-            if show_labels:
-                d.text((poly[0][0] + 6, poly[0][1] + 6), panel, fill=(0, 180, 255))
+            poly = [(p["x"], p["y"]) for p in pts]
+            d.line(poly + [poly[0]], fill=(0, 200, 255), width=3)
+            d.text((poly[0][0] + 6, poly[0][1] + 6), panel, fill=(0, 140, 255))
 
     return img
 
 
-# ======================================
-# Streamlit app
-# ======================================
+def add_tick(cap: Dict[str, Any], axis_key: str, x: float, y: float, value: float):
+    cap["axis_ticks"].setdefault(axis_key, [])
+    cap["axis_ticks"][axis_key].append({
+        "x": float(x),
+        "y": float(y),
+        "value": float(value),
+    })
+
+
+def add_segment(cap: Dict[str, Any], section: str, key: str, x1: float, y1: float, x2: float, y2: float):
+    cap[section].setdefault(key, [])
+    cap[section][key].append({
+        "x1": float(x1),
+        "y1": float(y1),
+        "x2": float(x2),
+        "y2": float(y2),
+    })
+
+
+def set_panel(cap: Dict[str, Any], panel_key: str, pts: List[Tuple[float, float]]):
+    cap["panel_corners"][panel_key] = [{"x": float(x), "y": float(y)} for x, y in pts[:4]]
+
+
+def json_download_name(asset_key: str) -> str:
+    return ASSETS[asset_key]["json_default_name"]
+
+
+# =========================
+# Session init
+# =========================
 st.set_page_config(page_title="PA28 JSON Builder", layout="wide")
-st.title("PA28 — JSON Builder para os novos gráficos")
+st.title("PA28 — JSON Builder para os gráficos")
 
-st.markdown(
-    "Usa esta app para montar e validar os JSONs dos gráficos de **takeoff 50 ft** e **landing 50 ft**. "
-    "Os PDFs que enviaste são o *Landing Performance* (fig. 5-41) e o *Flaps Up Takeoff Performance* (fig. 5-7)."
+asset_key = st.sidebar.selectbox(
+    "Escolhe o gráfico",
+    options=list(ASSETS.keys()),
+    format_func=lambda k: ASSETS[k]["title"],
 )
 
-target = st.sidebar.selectbox(
-    "Gráfico",
-    options=["landing_50ft", "takeoff_50ft"],
-    format_func=lambda k: TARGETS[k]["title"],
-)
-info = TARGETS[target]
+info = ASSETS[asset_key]
+
+if "cap_asset" not in st.session_state or st.session_state.cap_asset != asset_key:
+    st.session_state.cap_asset = asset_key
+    st.session_state.cap = empty_capture(asset_key)
+
+cap = ensure_structure(st.session_state.cap, asset_key)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Background")
-upload_bg = st.sidebar.file_uploader("Upload background opcional", type=["pdf", "png", "jpg", "jpeg"])
+upload_bg = st.sidebar.file_uploader("Upload background", type=["pdf", "png", "jpg", "jpeg"])
 zoom = st.sidebar.number_input("Zoom PDF", value=2.4, step=0.1)
-page_index = st.sidebar.number_input("Página (0-index)", value=int(info["page_default"]), step=1)
+page_index = st.sidebar.number_input("Página PDF (0-index)", value=int(info["page_default"]), step=1)
+
+bg = load_background(asset_key, upload_bg, int(page_index), float(zoom))
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("JSON source")
-use_template = st.sidebar.checkbox("Começar com template sugerido", value=True)
-upload_json = st.sidebar.file_uploader("Upload de JSON já existente", type=["json"])
-
+st.sidebar.subheader("JSON")
+upload_json = st.sidebar.file_uploader("Importar JSON existente", type=["json"])
 if upload_json is not None:
-    initial_text = upload_json.read().decode("utf-8")
-elif use_template:
-    initial_text = as_pretty_json(blank_template(target))
-else:
-    initial_text = as_pretty_json(ensure_capture_shape({}))
+    st.session_state.cap = ensure_structure(json.loads(upload_json.read().decode("utf-8")), asset_key)
+    cap = st.session_state.cap
 
-bg = load_background(target, upload_bg, page_index=int(page_index), zoom=float(zoom))
+col_img, col_edit = st.columns([1.5, 1])
 
-left, right = st.columns([1.7, 1.2])
+with col_edit:
+    st.subheader("Editor")
 
-with right:
-    st.subheader("Editor JSON")
-    st.caption(
-        "Edita as coordenadas diretamente. O overlay à esquerda mostra painéis, ticks, linhas e guides por cima do gráfico."
-    )
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Meta",
+        "Panels",
+        "Axis ticks",
+        "Lines / Guides",
+        "JSON",
+    ])
 
-    st.markdown("**Chaves sugeridas**")
-    st.write(
-        {
-            "panel_corners": info["suggested_panels"],
-            "axis_ticks": info["suggested_axis_keys"],
-            "lines": info["suggested_line_keys"],
-            "guides": info["suggested_guide_groups"],
-        }
-    )
+    with tab1:
+        cap["meta"]["asset"] = asset_key
+        cap["meta"]["title"] = info["title"]
+        cap["meta"]["source_file"] = st.text_input(
+            "Source file",
+            value=cap["meta"].get("source_file", info["bg_default"]),
+        )
+        cap["meta"]["notes"] = st.text_area(
+            "Notas",
+            value=cap["meta"].get("notes", ""),
+            height=120,
+        )
 
-    json_text = st.text_area(
-        "Conteúdo JSON",
-        value=initial_text,
-        height=780,
-    )
+    with tab2:
+        st.markdown("### Panel corners")
+        panel_key = st.selectbox("Panel", info["default_panels"])
 
-    try:
-        cap = parse_json_text(json_text)
-        valid = True
-        st.success("JSON válido.")
-    except Exception as e:
-        cap = ensure_capture_shape({})
-        valid = False
-        st.error(f"JSON inválido: {e}")
+        pcols = st.columns(2)
+        pts: List[Tuple[float, float]] = []
+        for i in range(4):
+            with pcols[i % 2]:
+                x = st.number_input(f"{panel_key} P{i+1} x", value=0.0, key=f"{panel_key}_x_{i}")
+                y = st.number_input(f"{panel_key} P{i+1} y", value=0.0, key=f"{panel_key}_y_{i}")
+                pts.append((x, y))
 
-    if valid:
-        out_name = st.text_input("Nome do ficheiro", value=info["json_default_name"])
+        if st.button("Guardar panel", key=f"save_panel_{panel_key}"):
+            set_panel(cap, panel_key, pts)
+            st.success(f"Panel '{panel_key}' guardado.")
+
+        if st.button("Limpar panel", key=f"clear_panel_{panel_key}"):
+            cap["panel_corners"][panel_key] = []
+            st.warning(f"Panel '{panel_key}' limpo.")
+
+        st.json(cap["panel_corners"].get(panel_key, []))
+
+    with tab3:
+        st.markdown("### Axis ticks")
+        axis_key = st.selectbox("Axis key", info["default_axis_keys"])
+        x = st.number_input("Tick x", value=0.0, key=f"tick_x_{axis_key}")
+        y = st.number_input("Tick y", value=0.0, key=f"tick_y_{axis_key}")
+        value = st.number_input("Tick value", value=0.0, key=f"tick_value_{axis_key}")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Adicionar tick", key=f"add_tick_{axis_key}"):
+                add_tick(cap, axis_key, x, y, value)
+                st.success("Tick adicionado.")
+        with c2:
+            if st.button("Limpar ticks deste eixo", key=f"clear_ticks_{axis_key}"):
+                cap["axis_ticks"][axis_key] = []
+                st.warning("Ticks limpos.")
+
+        st.dataframe(cap["axis_ticks"].get(axis_key, []), use_container_width=True)
+
+    with tab4:
+        st.markdown("### Segments")
+        section = st.radio("Secção", ["lines", "guides"], horizontal=True)
+
+        if section == "lines":
+            key = st.selectbox("Line key", info["default_line_keys"])
+        else:
+            key = st.selectbox("Guide key", info["default_guide_keys"])
+
+        x1 = st.number_input("x1", value=0.0, key=f"{section}_{key}_x1")
+        y1 = st.number_input("y1", value=0.0, key=f"{section}_{key}_y1")
+        x2 = st.number_input("x2", value=0.0, key=f"{section}_{key}_x2")
+        y2 = st.number_input("y2", value=0.0, key=f"{section}_{key}_y2")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Adicionar segmento", key=f"add_seg_{section}_{key}"):
+                add_segment(cap, section, key, x1, y1, x2, y2)
+                st.success("Segmento adicionado.")
+        with c2:
+            if st.button("Limpar segmentos desta chave", key=f"clear_seg_{section}_{key}"):
+                cap[section][key] = []
+                st.warning("Segmentos limpos.")
+
+        st.dataframe(cap[section].get(key, []), use_container_width=True)
+
+    with tab5:
+        st.markdown("### JSON atual")
+        json_text = json.dumps(cap, indent=2, ensure_ascii=False)
+        st.code(json_text, language="json")
+
         st.download_button(
             "Descarregar JSON",
-            data=as_pretty_json(cap).encode("utf-8"),
-            file_name=out_name,
+            data=json_text.encode("utf-8"),
+            file_name=json_download_name(asset_key),
             mime="application/json",
         )
 
-        st.markdown("---")
-        st.subheader("Checklist")
-        st.write(
-            {
-                "panel_corners": list((cap.get("panel_corners", {}) or {}).keys()),
-                "axis_ticks": list((cap.get("axis_ticks", {}) or {}).keys()),
-                "lines": list((cap.get("lines", {}) or {}).keys()),
-                "guides": list((cap.get("guides", {}) or {}).keys()),
-            }
-        )
+        if st.button("Reset JSON completo"):
+            st.session_state.cap = empty_capture(asset_key)
+            st.warning("JSON reiniciado.")
+            st.rerun()
 
-with left:
-    st.subheader(info["title"])
-    if valid:
-        img = draw_capture_overlay(bg, cap, show_labels=True)
-    else:
-        img = bg.copy()
+with col_img:
+    st.subheader("Preview")
+    img = draw_overlay(bg, cap)
     st.image(img, use_container_width=True)
-    st.caption("Vermelho: lines. Azul: guides. Verde: axis ticks. Ciano: panel_corners.")
-
-st.markdown("---")
-st.markdown(
-    "### Estrutura recomendada\n"
-    "Para estes dois gráficos, a estrutura do JSON pode continuar praticamente igual ao solver atual:"
-)
-
-st.code(
-    json.dumps(
-        {
-            "panel_corners": {
-                "left": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}, {"x": 0, "y": 1}],
-                "middle": [],
-                "right": [],
-            },
-            "axis_ticks": {
-                "oat_c": [{"x": 0, "y": 0, "value": -20}],
-                "weight_x100_lb": [{"x": 0, "y": 0, "value": 25}],
-                "headwind_kt": [{"x": 0, "y": 0, "value": 0}],
-                "landing_50ft_ft": [{"x": 0, "y": 0, "value": 1000}],
-            },
-            "lines": {
-                "pa_sea_level": [{"x1": 0, "y1": 0, "x2": 1, "y2": 1}],
-                "pa_2000": [],
-                "pa_4000": [],
-                "weight_ref_line": [],
-                "wind_ref_zero": [],
-            },
-            "guides": {
-                "middle": [{"x1": 0, "y1": 0, "x2": 1, "y2": 1}],
-                "right": [{"x1": 0, "y1": 0, "x2": 1, "y2": 1}],
-            },
-        },
-        ensure_ascii=False,
-        indent=2,
-    ),
-    language="json",
-)
-
-st.info(
-    "Depois de fechares os dois JSONs, o passo seguinte é trocar no solver as chaves do output para `landing_50ft_ft` e `takeoff_50ft_ft` e adaptar os labels do UI."
-)
-
+    st.caption("Vermelho: lines • Azul: guides • Verde: axis ticks • Ciano: panel_corners")
 
 
 
