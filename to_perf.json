@@ -1,0 +1,33 @@
+{
+  "mode": "takeoff",
+  "zoom": 2.3,
+  "page_index": 0,
+  "panel_corners": {
+    "left": [],
+    "middle": [],
+    "right": []
+  },
+  "axis_ticks": {
+    "oat_c": [],
+    "weight_x100_lb": [],
+    "wind_kt": [],
+    "takeoff_50ft_ft": []
+  },
+  "lines": {
+    "isa_m15": [],
+    "isa": [],
+    "isa_p35": [],
+    "pa_sea_level": [],
+    "pa_2000": [],
+    "pa_4000": [],
+    "pa_6000": [],
+    "pa_8000": [],
+    "weight_ref_line": [],
+    "wind_ref_zero": []
+  },
+  "guides": {
+    "middle": [],
+    "right": []
+  },
+  "notes": "Tudo em pixels do render atual (zoom e page_index)."
+}
