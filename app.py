@@ -192,10 +192,10 @@ def validate_solver_capture(cap: Dict[str, Any], mode: str) -> List[str]:
             errs.append("panel_corners['right'] precisa de 4 corners.")
 
         if len(guides.get("middle", []) or []) < 1:
-            errs.append("guides['middle'] precisa de pelo menos 1 segmento/guide.")
+            errs.append("guides['middle'] precisa de pelo menos 1 guide/segmento.")
 
         if len(guides.get("right", []) or []) < 1:
-            errs.append("guides['right'] precisa de pelo menos 1 segmento/guide.")
+            errs.append("guides['right'] precisa de pelo menos 1 guide/segmento.")
 
     else:
         required_tick_keys = ["oat_c", "roc_fpm"]
@@ -217,7 +217,11 @@ def validate_solver_capture(cap: Dict[str, Any], mode: str) -> List[str]:
 # =========================
 # Math helpers
 # =========================
-def fit_axis_value_from_ticks(ticks: List[Dict[str, float]], coord: str, axis_name: str = "axis") -> Tuple[float, float]:
+def fit_axis_value_from_ticks(
+    ticks: List[Dict[str, float]],
+    coord: str,
+    axis_name: str = "axis"
+) -> Tuple[float, float]:
     if len(ticks) < 2:
         raise ValueError(f"O eixo '{axis_name}' precisa de pelo menos 2 ticks, mas só tem {len(ticks)}.")
 
@@ -264,7 +268,10 @@ def parse_pa_levels_ft(lines: Dict[str, List[Dict[str, float]]]) -> List[Tuple[f
     return out
 
 
-def interp_between_levels(v: float, levels: List[Tuple[float, str]]) -> Tuple[Tuple[float, str], Tuple[float, str], float]:
+def interp_between_levels(
+    v: float,
+    levels: List[Tuple[float, str]]
+) -> Tuple[Tuple[float, str], Tuple[float, str], float]:
     if not levels:
         raise ValueError("No PA levels available (all pa_* lines empty?).")
     if v <= levels[0][0]:
@@ -289,7 +296,7 @@ def x_of_vertical_ref(seg: Dict[str, float]) -> float:
 
 
 # =========================
-# Guide helpers (novo)
+# Guide helpers
 # =========================
 def _seg_endpoints(seg: Dict[str, float]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     return (float(seg["x1"]), float(seg["y1"])), (float(seg["x2"]), float(seg["y2"]))
@@ -299,22 +306,15 @@ def _same_point(a: Tuple[float, float], b: Tuple[float, float], tol: float = 1.5
     return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
 
 
-def group_guides_for_mode(segments: List[Dict[str, float]], mode: str) -> List[List[Dict[str, float]]]:
-    """
-    landing: cada guide continua a ser 1 segmento
-    takeoff: cada guide curva foi guardada como 2 segmentos consecutivos
-    """
-    if mode != "takeoff":
-        return [[s] for s in segments]
-
+def group_guides_polyline_pairs(segments: List[Dict[str, float]]) -> List[List[Dict[str, float]]]:
     groups: List[List[Dict[str, float]]] = []
     i = 0
     while i < len(segments):
         if i + 1 < len(segments):
             s1 = segments[i]
             s2 = segments[i + 1]
-            a1, b1 = _seg_endpoints(s1)
-            a2, b2 = _seg_endpoints(s2)
+            _, b1 = _seg_endpoints(s1)
+            a2, _ = _seg_endpoints(s2)
 
             if _same_point(b1, a2):
                 groups.append([s1, s2])
@@ -328,11 +328,6 @@ def group_guides_for_mode(segments: List[Dict[str, float]], mode: str) -> List[L
 
 
 def polyline_y_at_x(poly: List[Dict[str, float]], x: float) -> float:
-    """
-    Calcula y(x) numa polilinha de 1 ou 2 segmentos.
-    Se x cair dentro do intervalo horizontal de um segmento, usa esse.
-    Se não cair exatamente, usa o segmento cujo intervalo esteja mais próximo.
-    """
     if not poly:
         raise ValueError("Polyline vazia.")
 
@@ -396,13 +391,25 @@ def pick_guides(cap: Dict[str, Any], mode: str) -> Tuple[List[List[Dict[str, flo
     g = cap.get("guides", {}) or {}
     mid_raw = g.get("middle", []) or []
     right_raw = g.get("right", []) or []
-    return group_guides_for_mode(mid_raw, mode), group_guides_for_mode(right_raw, mode)
+
+    if mode == "takeoff":
+        mid = group_guides_polyline_pairs(mid_raw)   # só weight é polilinha
+        right = [[s] for s in right_raw]             # crosswind/headwind continua simples
+        return mid, right
+
+    return [[s] for s in mid_raw], [[s] for s in right_raw]
 
 
 # =========================
 # Drawing
 # =========================
-def draw_arrow(draw: ImageDraw.ImageDraw, p1: Tuple[float, float], p2: Tuple[float, float], color: Tuple[int, int, int], w: int = 4):
+def draw_arrow(
+    draw: ImageDraw.ImageDraw,
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+    color: Tuple[int, int, int],
+    w: int = 4
+):
     draw.line([p1, p2], fill=color, width=w)
 
     x1, y1 = p1
@@ -688,7 +695,10 @@ info = ASSETS[mode]
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Background")
-upload_bg = st.sidebar.file_uploader("Upload background (se não estiver na pasta)", type=["pdf", "png", "jpg", "jpeg"])
+upload_bg = st.sidebar.file_uploader(
+    "Upload background (se não estiver na pasta)",
+    type=["pdf", "png", "jpg", "jpeg"]
+)
 zoom = st.sidebar.number_input("Zoom PDF", value=2.3, step=0.1)
 page_index = st.sidebar.number_input("Página (0-index) [PDF]", value=int(info["page_default"]), step=1)
 
