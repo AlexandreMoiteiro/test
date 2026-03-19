@@ -98,12 +98,30 @@ def load_background(mode: str, upload_bg, page_index: int, zoom: float) -> Image
 
 def load_json(mode: str, upload_json) -> Dict[str, Any]:
     info = ASSETS[mode]
-    if upload_json is not None:
-        return json.loads(upload_json.read().decode("utf-8"))
-    p = _here(info["json_default"])
-    if not p:
-        raise FileNotFoundError(f"Não encontrei {info['json_default']}")
-    return json.loads(p.read_text(encoding="utf-8"))
+
+    try:
+        if upload_json is not None:
+            raw = upload_json.read().decode("utf-8").strip()
+            if not raw:
+                raise ValueError("O ficheiro JSON enviado está vazio.")
+            return json.loads(raw)
+
+        p = _here(info["json_default"])
+        if not p:
+            raise FileNotFoundError(f"Não encontrei {info['json_default']}")
+
+        raw = p.read_text(encoding="utf-8").strip()
+        if not raw:
+            raise ValueError(f"O ficheiro {info['json_default']} está vazio.")
+
+        return json.loads(raw)
+
+    except json.JSONDecodeError as e:
+        src_name = info["json_default"] if upload_json is None else getattr(upload_json, "name", "uploaded file")
+        raise ValueError(
+            f"JSON inválido em '{src_name}'. Linha {e.lineno}, coluna {e.colno}. "
+            f"Verifica se o ficheiro começa com '{{' e não tem blocos ```json nem texto extra."
+        ) from e
 
 
 # =========================
@@ -138,11 +156,71 @@ def normalize_panels(cap: Dict[str, Any]) -> Dict[str, List[Dict[str, float]]]:
 
 
 # =========================
+# Validation
+# =========================
+def validate_solver_capture(cap: Dict[str, Any], mode: str) -> List[str]:
+    errs: List[str] = []
+
+    ticks = cap.get("axis_ticks", {}) or {}
+    lines = cap.get("lines", {}) or {}
+    panels = normalize_panels(cap)
+    guides = cap.get("guides", {}) or {}
+
+    if mode in ("landing", "takeoff"):
+        out_axis_key = ASSETS[mode]["out_axis_key"]
+
+        required_tick_keys = ["oat_c", "weight_x100_lb", "wind_kt", out_axis_key]
+        for k in required_tick_keys:
+            n = len(ticks.get(k, []) or [])
+            if n < 2:
+                errs.append(f"axis_ticks['{k}'] precisa de pelo menos 2 ticks (tem {n}).")
+
+        n_pa = sum(1 for k, v in lines.items() if k.startswith("pa_") and len(v) > 0)
+        if n_pa < 2:
+            errs.append(f"É preciso pelo menos 2 linhas de pressure altitude (pa_*). Atualmente tens {n_pa}.")
+
+        if len(lines.get("weight_ref_line", []) or []) < 1:
+            errs.append("lines['weight_ref_line'] precisa de pelo menos 1 segmento.")
+
+        if len(lines.get("wind_ref_zero", []) or []) < 1:
+            errs.append("lines['wind_ref_zero'] precisa de pelo menos 1 segmento.")
+
+        if len(panels.get("left", []) or []) != 4:
+            errs.append("panel_corners['left'] precisa de 4 corners.")
+
+        if len(panels.get("right", []) or []) != 4:
+            errs.append("panel_corners['right'] precisa de 4 corners.")
+
+        if len(guides.get("middle", []) or []) < 1:
+            errs.append("guides['middle'] precisa de pelo menos 1 guide.")
+
+        if len(guides.get("right", []) or []) < 1:
+            errs.append("guides['right'] precisa de pelo menos 1 guide.")
+
+    else:
+        required_tick_keys = ["oat_c", "roc_fpm"]
+        for k in required_tick_keys:
+            n = len(ticks.get(k, []) or [])
+            if n < 2:
+                errs.append(f"axis_ticks['{k}'] precisa de pelo menos 2 ticks (tem {n}).")
+
+        n_pa = sum(1 for k, v in lines.items() if k.startswith("pa_") and len(v) > 0)
+        if n_pa < 2:
+            errs.append(f"É preciso pelo menos 2 linhas de pressure altitude (pa_*). Atualmente tens {n_pa}.")
+
+        if len(panels.get("main", []) or []) != 4:
+            errs.append("panel_corners['main'] precisa de 4 corners.")
+
+    return errs
+
+
+# =========================
 # Math helpers
 # =========================
-def fit_axis_value_from_ticks(ticks: List[Dict[str, float]], coord: str) -> Tuple[float, float]:
+def fit_axis_value_from_ticks(ticks: List[Dict[str, float]], coord: str, axis_name: str = "axis") -> Tuple[float, float]:
     if len(ticks) < 2:
-        raise ValueError("São precisos pelo menos 2 ticks para ajustar um eixo.")
+        raise ValueError(f"O eixo '{axis_name}' precisa de pelo menos 2 ticks, mas só tem {len(ticks)}.")
+
     xs = np.array([float(t[coord]) for t in ticks], dtype=float)
     vs = np.array([float(t["value"]) for t in ticks], dtype=float)
     A = np.vstack([xs, np.ones_like(xs)]).T
@@ -363,12 +441,12 @@ def solve_performance_chart(
     lines = cap["lines"]
     panels = normalize_panels(cap)
 
-    ax_oat_a, ax_oat_b = fit_axis_value_from_ticks(ticks["oat_c"], "x")
-    ax_wt_a, ax_wt_b = fit_axis_value_from_ticks(ticks["weight_x100_lb"], "x")
-    ax_wind_a, ax_wind_b = fit_axis_value_from_ticks(ticks["wind_kt"], "x")
+    ax_oat_a, ax_oat_b = fit_axis_value_from_ticks(ticks["oat_c"], "x", "oat_c")
+    ax_wt_a, ax_wt_b = fit_axis_value_from_ticks(ticks["weight_x100_lb"], "x", "weight_x100_lb")
+    ax_wind_a, ax_wind_b = fit_axis_value_from_ticks(ticks["wind_kt"], "x", "wind_kt")
 
     out_axis_key = ASSETS[mode]["out_axis_key"]
-    ax_out_a, ax_out_b = fit_axis_value_from_ticks(ticks[out_axis_key], "y")
+    ax_out_a, ax_out_b = fit_axis_value_from_ticks(ticks[out_axis_key], "y", out_axis_key)
 
     if not lines.get("weight_ref_line"):
         raise ValueError("Missing lines['weight_ref_line']")
@@ -441,8 +519,8 @@ def solve_climb(
     lines = cap["lines"]
     panels = normalize_panels(cap)
 
-    ax_oat_a, ax_oat_b = fit_axis_value_from_ticks(ticks["oat_c"], "x")
-    ax_roc_a, ax_roc_b = fit_axis_value_from_ticks(ticks["roc_fpm"], "y")
+    ax_oat_a, ax_oat_b = fit_axis_value_from_ticks(ticks["oat_c"], "x", "oat_c")
+    ax_roc_a, ax_roc_b = fit_axis_value_from_ticks(ticks["roc_fpm"], "y", "roc_fpm")
 
     x_oat = axis_coord_from_value(ax_oat_a, ax_oat_b, oat_c)
 
@@ -547,8 +625,14 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("JSON")
 upload_json = st.sidebar.file_uploader("Upload JSON (se não estiver na pasta)", type=["json"])
 
-cap = load_json(mode, upload_json)
-bg = load_background(mode, upload_bg, page_index=int(page_index), zoom=float(zoom))
+try:
+    cap = load_json(mode, upload_json)
+    bg = load_background(mode, upload_bg, page_index=int(page_index), zoom=float(zoom))
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+validation_errors = validate_solver_capture(cap, mode)
 
 left, right = st.columns([1.7, 1])
 
@@ -562,50 +646,61 @@ with right:
     label_text: Optional[str] = None
     label_tip: Optional[Tuple[float, float]] = None
 
-    if mode in ("landing", "takeoff"):
-        oat = st.number_input("OAT (°C)", value=21.0 if mode == "landing" else 23.0, step=1.0)
-        pa = st.number_input("Pressure Altitude (ft)", value=2500.0 if mode == "landing" else 2000.0, step=500.0)
-        wt = st.number_input("Weight (lb)", value=2240.0 if mode == "landing" else 2400.0, step=50.0)
-        wind = st.number_input("Headwind (kt)", value=5.0 if mode == "landing" else 8.0, step=1.0)
+    if validation_errors:
+        st.error("O JSON ainda não está completo para correr o solver.")
+        with st.expander("Ver o que falta", expanded=True):
+            for err in validation_errors:
+                st.write(f"- {err}")
 
-        raw, segs, dbg = solve_performance_chart(
-            cap, mode=mode, oat_c=float(oat), pa_ft=float(pa), weight_lb=float(wt), wind_kt=float(wind)
-        )
-        out = round_to_step(raw, info["round_to"])
-        st.metric(
-            info["metric_label"],
-            f"{out:.0f}",
-            help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}"
-        )
-
-        if segs:
-            _, tip = segs[-1]
-            label_text = f"{out:.0f} ft"
-            label_tip = tip
+        st.markdown("---")
+        show_overlay = st.checkbox("Mostrar overlay das linhas capturadas", value=True)
+        show_path = st.checkbox("Mostrar caminho do solver (setas)", value=False)
 
     else:
-        oat = st.number_input("OAT (°C)", value=19.0, step=1.0)
-        pa = st.number_input("Pressure Altitude (ft)", value=4000.0, step=500.0)
+        if mode in ("landing", "takeoff"):
+            oat = st.number_input("OAT (°C)", value=21.0 if mode == "landing" else 23.0, step=1.0)
+            pa = st.number_input("Pressure Altitude (ft)", value=2500.0 if mode == "landing" else 2000.0, step=500.0)
+            wt = st.number_input("Weight (lb)", value=2240.0 if mode == "landing" else 2400.0, step=50.0)
+            wind = st.number_input("Headwind (kt)", value=5.0 if mode == "landing" else 8.0, step=1.0)
 
-        raw, segs, dbg = solve_climb(cap, oat_c=float(oat), pa_ft=float(pa))
-        out = round_to_step(raw, info["round_to"])
-        st.metric(
-            info["metric_label"],
-            f"{out:.0f}",
-            help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}"
-        )
+            raw, segs, dbg = solve_performance_chart(
+                cap, mode=mode, oat_c=float(oat), pa_ft=float(pa), weight_lb=float(wt), wind_kt=float(wind)
+            )
+            out = round_to_step(raw, info["round_to"])
+            st.metric(
+                info["metric_label"],
+                f"{out:.0f}",
+                help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}"
+            )
 
-        if segs:
-            _, tip = segs[-1]
-            label_text = f"{out:.0f} fpm"
-            label_tip = tip
+            if segs:
+                _, tip = segs[-1]
+                label_text = f"{out:.0f} ft"
+                label_tip = tip
 
-    st.markdown("---")
-    show_overlay = st.checkbox("Mostrar overlay das linhas capturadas", value=True)
-    show_path = st.checkbox("Mostrar caminho do solver (setas)", value=True)
+        else:
+            oat = st.number_input("OAT (°C)", value=19.0, step=1.0)
+            pa = st.number_input("Pressure Altitude (ft)", value=4000.0, step=500.0)
 
-    with st.expander("Debug"):
-        st.json(dbg)
+            raw, segs, dbg = solve_climb(cap, oat_c=float(oat), pa_ft=float(pa))
+            out = round_to_step(raw, info["round_to"])
+            st.metric(
+                info["metric_label"],
+                f"{out:.0f}",
+                help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}"
+            )
+
+            if segs:
+                _, tip = segs[-1]
+                label_text = f"{out:.0f} fpm"
+                label_tip = tip
+
+        st.markdown("---")
+        show_overlay = st.checkbox("Mostrar overlay das linhas capturadas", value=True)
+        show_path = st.checkbox("Mostrar caminho do solver (setas)", value=True)
+
+        with st.expander("Debug"):
+            st.json(dbg)
 
 with left:
     img = draw_overlay(
@@ -620,5 +715,3 @@ with left:
     )
     st.image(img, use_container_width=True)
     st.caption("Vermelho: linhas. Azul: guides. Verde: ticks. Ciano: painéis. Laranja: caminho do solver + valor.")
-
-
