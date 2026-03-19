@@ -1,117 +1,71 @@
 from __future__ import annotations
 
 import json
-import copy
+import math
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import streamlit as st
-import pymupdf
-from PIL import Image, ImageDraw
-from streamlit_image_coordinates import streamlit_image_coordinates
+from PIL import Image, ImageDraw, ImageFont
+import pymupdf  # PyMuPDF
 
 
 # =========================
-# Repo file names
+# Assets / Modes
 # =========================
-FILES = {
-    "landing": {
-        "bg_default": "ldg_perf.pdf",
-        "json_default": "ldg_perf.json",
-        "kind": "pdf",
-        "page_default": 0,
-    },
-    "takeoff": {
-        "bg_default": "to_perf.pdf",
-        "json_default": "to_perf.json",
-        "kind": "pdf",
-        "page_default": 0,
-    },
-    "climb": {
-        "bg_default": "climb_perf.jpg",
-        "json_default": "climb_perf.json",
-        "kind": "image",
-        "page_default": 0,
-    },
-}
-
-MODE_CONFIG: Dict[str, Dict[str, Any]] = {
+ASSETS = {
     "landing": {
         "title": "Landing Distance Over 50 ft",
-        "panels": ["left", "middle", "right"],
-        "axis_ticks": {
-            "oat_c": "OAT (°C) [painel left]",
-            "weight_x100_lb": "Weight (lb/100) [painel middle]",
-            "wind_kt": "Wind (kt) [painel right]",
-            "landing_50ft_ft": "Landing distance over 50 ft (ft) [eixo vertical right]",
-        },
-        "lines": [
-            "isa_m15", "isa", "isa_p35",
-            "pa_sea_level", "pa_2000", "pa_4000", "pa_6000", "pa_7000",
-            "weight_ref_line", "wind_ref_zero",
-        ],
-        "guides": {
-            "middle": "Guias do painel middle",
-            "right": "Guias do painel right",
-        },
-        "guide_points": 2,
+        "bg_default": "ldg_perf.pdf",
+        "json_default": "ldg_perf.json",
+        "bg_kind": "pdf",
+        "page_default": 0,
+        "round_to": 5,
+        "label_font": 24,
+        "out_axis_key": "landing_50ft_ft",
+        "metric_label": "Landing distance over 50 ft (ft)",
     },
     "takeoff": {
         "title": "Takeoff Distance Over 50 ft",
-        "panels": ["left", "middle", "right"],
-        "axis_ticks": {
-            "oat_c": "OAT (°C) [painel left]",
-            "weight_x100_lb": "Weight (lb/100) [painel middle]",
-            "wind_kt": "Wind (kt) [painel right]",
-            "takeoff_50ft_ft": "Takeoff distance over 50 ft (ft) [eixo vertical right]",
-        },
-        "lines": [
-            "isa_m15", "isa", "isa_p35",
-            "pa_sea_level", "pa_2000", "pa_4000", "pa_6000", "pa_8000",
-            "weight_ref_line", "wind_ref_zero",
-        ],
-        "guides": {
-            "middle": "Guias curvas do painel middle (3 pontos)",
-            "right": "Guias curvas do painel right (3 pontos)",
-        },
-        "guide_points": 3,
+        "bg_default": "to_perf.pdf",
+        "json_default": "to_perf.json",
+        "bg_kind": "pdf",
+        "page_default": 0,
+        "round_to": 5,
+        "label_font": 18,
+        "out_axis_key": "takeoff_50ft_ft",
+        "metric_label": "Takeoff distance over 50 ft (ft)",
     },
     "climb": {
         "title": "Climb Performance",
-        "panels": ["main"],
-        "axis_ticks": {
-            "oat_c": "OAT (°C) [eixo X]",
-            "roc_fpm": "Rate of Climb (FPM) [eixo Y]",
-        },
-        "lines": [
-            "isa_m15", "isa", "isa_p35",
-            "pa_sea_level", "pa_1000", "pa_2000", "pa_3000", "pa_4000", "pa_5000",
-            "pa_6000", "pa_7000", "pa_8000", "pa_9000", "pa_10000", "pa_11000",
-            "pa_12000", "pa_13000",
-        ],
-        "guides": {},
-        "guide_points": 2,
+        "bg_default": "climb_perf.jpg",
+        "json_default": "climb_perf.json",
+        "bg_kind": "image",
+        "page_default": 0,
+        "round_to": 10,
+        "label_font": 18,
+        "metric_label": "Rate of climb (FPM)",
     },
 }
 
 
 # =========================
-# IO / Render
+# File helpers
 # =========================
-def locate_file(name: str) -> Optional[str]:
+def _here(name: str) -> Optional[Path]:
     p = Path(name)
     if p.exists():
-        return str(p)
+        return p
     if "__file__" in globals():
         p2 = Path(__file__).resolve().parent / name
         if p2.exists():
-            return str(p2)
+            return p2
     return None
 
 
 @st.cache_data(show_spinner=False)
-def render_pdf_page_to_pil(pdf_bytes: bytes, page_index: int, zoom: float) -> Image.Image:
+def render_pdf_to_image(pdf_bytes: bytes, page_index: int, zoom: float) -> Image.Image:
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(page_index)
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
@@ -121,71 +75,552 @@ def render_pdf_page_to_pil(pdf_bytes: bytes, page_index: int, zoom: float) -> Im
 
 
 def load_background(mode: str, upload_bg, page_index: int, zoom: float) -> Image.Image:
-    info = FILES[mode]
-    if info["kind"] == "pdf":
+    info = ASSETS[mode]
+
+    if info["bg_kind"] == "pdf":
         if upload_bg is not None:
             pdf_bytes = upload_bg.read()
         else:
-            p = locate_file(info["bg_default"])
+            p = _here(info["bg_default"])
             if not p:
                 raise FileNotFoundError(f"Não encontrei {info['bg_default']}")
-            pdf_bytes = Path(p).read_bytes()
-        return render_pdf_page_to_pil(pdf_bytes, page_index=page_index, zoom=zoom)
+            pdf_bytes = p.read_bytes()
+        return render_pdf_to_image(pdf_bytes, page_index=page_index, zoom=zoom)
 
     if upload_bg is not None:
         return Image.open(upload_bg).convert("RGB")
 
-    p = locate_file(info["bg_default"])
+    p = _here(info["bg_default"])
     if not p:
         raise FileNotFoundError(f"Não encontrei {info['bg_default']}")
     return Image.open(p).convert("RGB")
 
 
-def json_default_name(mode: str) -> str:
-    return FILES[mode]["json_default"]
+def load_json(mode: str, upload_json) -> Dict[str, Any]:
+    info = ASSETS[mode]
+
+    try:
+        if upload_json is not None:
+            raw = upload_json.read().decode("utf-8").strip()
+            if not raw:
+                raise ValueError("O ficheiro JSON enviado está vazio.")
+            return json.loads(raw)
+
+        p = _here(info["json_default"])
+        if not p:
+            raise FileNotFoundError(f"Não encontrei {info['json_default']}")
+
+        raw = p.read_text(encoding="utf-8").strip()
+        if not raw:
+            raise ValueError(f"O ficheiro {info['json_default']} está vazio.")
+
+        return json.loads(raw)
+
+    except json.JSONDecodeError as e:
+        src_name = info["json_default"] if upload_json is None else getattr(upload_json, "name", "uploaded file")
+        raise ValueError(
+            f"JSON inválido em '{src_name}'. Linha {e.lineno}, coluna {e.colno}. "
+            f"Verifica se o ficheiro começa com '{{' e não tem blocos ```json nem texto extra."
+        ) from e
 
 
 # =========================
-# Capture schema
+# Normalization helpers
 # =========================
-def new_capture(mode: str, zoom: float, page_index: int) -> Dict[str, Any]:
-    cfg = MODE_CONFIG[mode]
-    return {
-        "mode": mode,
-        "zoom": float(zoom),
-        "page_index": int(page_index),
-        "panel_corners": {p: [] for p in cfg["panels"]},
-        "axis_ticks": {k: [] for k in cfg["axis_ticks"].keys()},
-        "lines": {k: [] for k in cfg["lines"]},
-        "guides": {k: [] for k in cfg.get("guides", {}).keys()},
-        "notes": "Tudo em pixels do render atual (zoom e page_index).",
+def pt_xy(p: Any) -> Tuple[float, float]:
+    if isinstance(p, dict):
+        return float(p["x"]), float(p["y"])
+    if isinstance(p, (list, tuple)) and len(p) == 2:
+        return float(p[0]), float(p[1])
+    raise ValueError(f"Invalid point: {p}")
+
+
+def normalize_panel(panel_pts: Any) -> List[Dict[str, float]]:
+    if not isinstance(panel_pts, list) or len(panel_pts) != 4:
+        return []
+    out = []
+    for p in panel_pts:
+        x, y = pt_xy(p)
+        out.append({"x": x, "y": y})
+    return out
+
+
+def normalize_panels(cap: Dict[str, Any]) -> Dict[str, List[Dict[str, float]]]:
+    out = {}
+    pc = cap.get("panel_corners", {})
+    if not isinstance(pc, dict):
+        return out
+    for k, pts in pc.items():
+        out[k] = normalize_panel(pts)
+    return out
+
+
+# =========================
+# Validation
+# =========================
+def validate_solver_capture(cap: Dict[str, Any], mode: str) -> List[str]:
+    errs: List[str] = []
+
+    ticks = cap.get("axis_ticks", {}) or {}
+    lines = cap.get("lines", {}) or {}
+    panels = normalize_panels(cap)
+    guides = cap.get("guides", {}) or {}
+
+    if mode in ("landing", "takeoff"):
+        out_axis_key = ASSETS[mode]["out_axis_key"]
+
+        required_tick_keys = ["oat_c", "weight_x100_lb", "wind_kt", out_axis_key]
+        for k in required_tick_keys:
+            n = len(ticks.get(k, []) or [])
+            if n < 2:
+                errs.append(f"axis_ticks['{k}'] precisa de pelo menos 2 ticks (tem {n}).")
+
+        n_pa = sum(1 for k, v in lines.items() if k.startswith("pa_") and len(v) > 0)
+        if n_pa < 2:
+            errs.append(f"É preciso pelo menos 2 linhas de pressure altitude (pa_*). Atualmente tens {n_pa}.")
+
+        if len(lines.get("weight_ref_line", []) or []) < 1:
+            errs.append("lines['weight_ref_line'] precisa de pelo menos 1 segmento.")
+
+        if len(lines.get("wind_ref_zero", []) or []) < 1:
+            errs.append("lines['wind_ref_zero'] precisa de pelo menos 1 segmento.")
+
+        if len(panels.get("left", []) or []) != 4:
+            errs.append("panel_corners['left'] precisa de 4 corners.")
+
+        if len(panels.get("right", []) or []) != 4:
+            errs.append("panel_corners['right'] precisa de 4 corners.")
+
+        if len(guides.get("middle", []) or []) < 1:
+            errs.append("guides['middle'] precisa de pelo menos 1 segmento/guide.")
+
+        if len(guides.get("right", []) or []) < 1:
+            errs.append("guides['right'] precisa de pelo menos 1 segmento/guide.")
+
+    else:
+        required_tick_keys = ["oat_c", "roc_fpm"]
+        for k in required_tick_keys:
+            n = len(ticks.get(k, []) or [])
+            if n < 2:
+                errs.append(f"axis_ticks['{k}'] precisa de pelo menos 2 ticks (tem {n}).")
+
+        n_pa = sum(1 for k, v in lines.items() if k.startswith("pa_") and len(v) > 0)
+        if n_pa < 2:
+            errs.append(f"É preciso pelo menos 2 linhas de pressure altitude (pa_*). Atualmente tens {n_pa}.")
+
+        if len(panels.get("main", []) or []) != 4:
+            errs.append("panel_corners['main'] precisa de 4 corners.")
+
+    return errs
+
+
+# =========================
+# Math helpers
+# =========================
+def fit_axis_value_from_ticks(ticks: List[Dict[str, float]], coord: str, axis_name: str = "axis") -> Tuple[float, float]:
+    if len(ticks) < 2:
+        raise ValueError(f"O eixo '{axis_name}' precisa de pelo menos 2 ticks, mas só tem {len(ticks)}.")
+
+    xs = np.array([float(t[coord]) for t in ticks], dtype=float)
+    vs = np.array([float(t["value"]) for t in ticks], dtype=float)
+    A = np.vstack([xs, np.ones_like(xs)]).T
+    a, b = np.linalg.lstsq(A, vs, rcond=None)[0]
+    return float(a), float(b)
+
+
+def axis_value(a: float, b: float, coord_val: float) -> float:
+    return a * coord_val + b
+
+
+def axis_coord_from_value(a: float, b: float, value: float) -> float:
+    if abs(a) < 1e-12:
+        raise ValueError("Axis fit degenerate (a ~ 0).")
+    return (value - b) / a
+
+
+def line_y_at_x(seg: Dict[str, float], x: float) -> float:
+    x1, y1, x2, y2 = map(float, (seg["x1"], seg["y1"], seg["x2"], seg["y2"]))
+    if abs(x2 - x1) < 1e-12:
+        return y1
+    t = (x - x1) / (x2 - x1)
+    return y1 + t * (y2 - y1)
+
+
+def parse_pa_levels_ft(lines: Dict[str, List[Dict[str, float]]]) -> List[Tuple[float, str]]:
+    out: List[Tuple[float, str]] = []
+    for k, segs in lines.items():
+        if not k.startswith("pa_"):
+            continue
+        if not segs:
+            continue
+        if k == "pa_sea_level":
+            out.append((0.0, k))
+            continue
+        try:
+            out.append((float(k.replace("pa_", "")), k))
+        except Exception:
+            pass
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def interp_between_levels(v: float, levels: List[Tuple[float, str]]) -> Tuple[Tuple[float, str], Tuple[float, str], float]:
+    if not levels:
+        raise ValueError("No PA levels available (all pa_* lines empty?).")
+    if v <= levels[0][0]:
+        return levels[0], levels[0], 0.0
+    if v >= levels[-1][0]:
+        return levels[-1], levels[-1], 0.0
+    for i in range(len(levels) - 1):
+        a, ka = levels[i]
+        b, kb = levels[i + 1]
+        if a <= v <= b:
+            alpha = (v - a) / (b - a) if b != a else 0.0
+            return (a, ka), (b, kb), float(alpha)
+    return levels[-1], levels[-1], 0.0
+
+
+def round_to_step(x: float, step: float) -> float:
+    return step * round(x / step)
+
+
+def x_of_vertical_ref(seg: Dict[str, float]) -> float:
+    return 0.5 * (float(seg["x1"]) + float(seg["x2"]))
+
+
+# =========================
+# Guide helpers (novo)
+# =========================
+def _seg_endpoints(seg: Dict[str, float]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    return (float(seg["x1"]), float(seg["y1"])), (float(seg["x2"]), float(seg["y2"]))
+
+
+def _same_point(a: Tuple[float, float], b: Tuple[float, float], tol: float = 1.5) -> bool:
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def group_guides_for_mode(segments: List[Dict[str, float]], mode: str) -> List[List[Dict[str, float]]]:
+    """
+    landing: cada guide continua a ser 1 segmento
+    takeoff: cada guide curva foi guardada como 2 segmentos consecutivos
+    """
+    if mode != "takeoff":
+        return [[s] for s in segments]
+
+    groups: List[List[Dict[str, float]]] = []
+    i = 0
+    while i < len(segments):
+        if i + 1 < len(segments):
+            s1 = segments[i]
+            s2 = segments[i + 1]
+            a1, b1 = _seg_endpoints(s1)
+            a2, b2 = _seg_endpoints(s2)
+
+            if _same_point(b1, a2):
+                groups.append([s1, s2])
+                i += 2
+                continue
+
+        groups.append([segments[i]])
+        i += 1
+
+    return groups
+
+
+def polyline_y_at_x(poly: List[Dict[str, float]], x: float) -> float:
+    """
+    Calcula y(x) numa polilinha de 1 ou 2 segmentos.
+    Se x cair dentro do intervalo horizontal de um segmento, usa esse.
+    Se não cair exatamente, usa o segmento cujo intervalo esteja mais próximo.
+    """
+    if not poly:
+        raise ValueError("Polyline vazia.")
+
+    if len(poly) == 1:
+        return line_y_at_x(poly[0], x)
+
+    candidates = []
+    for seg in poly:
+        x1, x2 = float(seg["x1"]), float(seg["x2"])
+        xmin, xmax = min(x1, x2), max(x1, x2)
+        in_range = xmin - 1e-9 <= x <= xmax + 1e-9
+        dist = 0.0 if in_range else min(abs(x - xmin), abs(x - xmax))
+        candidates.append((dist, in_range, seg))
+
+    candidates.sort(key=lambda t: (t[0], 0 if t[1] else 1))
+    best_seg = candidates[0][2]
+    return line_y_at_x(best_seg, x)
+
+
+def interp_guides_y(
+    guide_groups: List[List[Dict[str, float]]],
+    x_ref: float,
+    y_ref: float,
+    x_target: float
+) -> Tuple[float, Dict[str, Any]]:
+    if not guide_groups:
+        return y_ref, {"used": "none"}
+
+    rows = []
+    for poly in guide_groups:
+        yr = polyline_y_at_x(poly, x_ref)
+        yt = polyline_y_at_x(poly, x_target)
+        rows.append((yr, yt, len(poly)))
+
+    rows.sort(key=lambda t: t[0])
+
+    if y_ref <= rows[0][0]:
+        return float(rows[0][1]), {"used": "clamp_low", "poly_len": rows[0][2]}
+    if y_ref >= rows[-1][0]:
+        return float(rows[-1][1]), {"used": "clamp_high", "poly_len": rows[-1][2]}
+
+    for i in range(len(rows) - 1):
+        y0_ref, y0_tgt, n0 = rows[i]
+        y1_ref, y1_tgt, n1 = rows[i + 1]
+        if y0_ref <= y_ref <= y1_ref:
+            denom = (y1_ref - y0_ref)
+            a = 0.0 if abs(denom) < 1e-12 else (y_ref - y0_ref) / denom
+            y_tgt = (1 - a) * y0_tgt + a * y1_tgt
+            return float(y_tgt), {
+                "used": "interp",
+                "i0": i,
+                "i1": i + 1,
+                "alpha": float(a),
+                "poly_lens": [n0, n1],
+            }
+
+    return y_ref, {"used": "fallback"}
+
+
+def pick_guides(cap: Dict[str, Any], mode: str) -> Tuple[List[List[Dict[str, float]]], List[List[Dict[str, float]]]]:
+    g = cap.get("guides", {}) or {}
+    mid_raw = g.get("middle", []) or []
+    right_raw = g.get("right", []) or []
+    return group_guides_for_mode(mid_raw, mode), group_guides_for_mode(right_raw, mode)
+
+
+# =========================
+# Drawing
+# =========================
+def draw_arrow(draw: ImageDraw.ImageDraw, p1: Tuple[float, float], p2: Tuple[float, float], color: Tuple[int, int, int], w: int = 4):
+    draw.line([p1, p2], fill=color, width=w)
+
+    x1, y1 = p1
+    x2, y2 = p2
+    ang = math.atan2(y2 - y1, x2 - x1)
+    L = 14
+    a1 = ang + math.radians(150)
+    a2 = ang - math.radians(150)
+    h1 = (x2 + L * math.cos(a1), y2 + L * math.sin(a1))
+    h2 = (x2 + L * math.cos(a2), y2 + L * math.sin(a2))
+    draw.polygon([p2, h1, h2], fill=color)
+
+
+def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def text_bbox(draw: ImageDraw.ImageDraw, text: str, font) -> Tuple[int, int]:
+    try:
+        x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+        return int(x1 - x0), int(y1 - y0)
+    except Exception:
+        return (8 * len(text), 14)
+
+
+def place_label_smart(
+    draw: ImageDraw.ImageDraw,
+    img_w: int,
+    img_h: int,
+    tip: Tuple[float, float],
+    text: str,
+    font,
+    pad: int = 4,
+    safe_margin: int = 8,
+) -> Tuple[Tuple[int, int], Tuple[int, int, int, int]]:
+    tx, ty = int(tip[0]), int(tip[1])
+    tw, th = text_bbox(draw, text, font)
+
+    candidates = [
+        (10, -th - 10),
+        (-tw - 10, -th - 10),
+        (10, 10),
+        (-tw - 10, 10),
+        (-tw - 10, -th // 2),
+        (10, -th // 2),
+        (-tw // 2, -th - 12),
+        (-tw // 2, 12),
+    ]
+
+    def ok(x: int, y: int) -> bool:
+        rx0 = x - pad
+        ry0 = y - pad
+        rx1 = x + tw + pad
+        ry1 = y + th + pad
+        if rx0 < safe_margin or ry0 < safe_margin:
+            return False
+        if rx1 > img_w - safe_margin or ry1 > img_h - safe_margin:
+            return False
+        if rx1 > img_w - 30:
+            return False
+        return True
+
+    for dx, dy in candidates:
+        x = tx + dx
+        y = ty + dy
+        if ok(x, y):
+            rect = (x - pad, y - pad, x + tw + pad, y + th + pad)
+            return (x, y), rect
+
+    x = min(max(tx - tw - 10, safe_margin), img_w - tw - safe_margin - 30)
+    y = min(max(ty - th - 10, safe_margin), img_h - th - safe_margin)
+    rect = (x - pad, y - pad, x + tw + pad, y + th + pad)
+    return (x, y), rect
+
+
+def draw_label_smart(
+    draw: ImageDraw.ImageDraw,
+    img_w: int,
+    img_h: int,
+    tip: Tuple[float, float],
+    text: str,
+    font,
+    color_text: Tuple[int, int, int] = (255, 140, 0),
+):
+    (x, y), rect = place_label_smart(draw, img_w, img_h, tip, text, font)
+    draw.rectangle(rect, fill=(255, 255, 255), outline=(0, 0, 0), width=2)
+    draw.text((x, y), text, fill=color_text, font=font)
+
+
+# =========================
+# SOLVERS
+# =========================
+def solve_performance_chart(
+    cap: Dict[str, Any],
+    mode: str,
+    oat_c: float,
+    pa_ft: float,
+    weight_lb: float,
+    wind_kt: float
+) -> Tuple[float, List[Tuple[Tuple[float, float], Tuple[float, float]]], Dict[str, Any]]:
+    ticks = cap["axis_ticks"]
+    lines = cap["lines"]
+    panels = normalize_panels(cap)
+
+    ax_oat_a, ax_oat_b = fit_axis_value_from_ticks(ticks["oat_c"], "x", "oat_c")
+    ax_wt_a, ax_wt_b = fit_axis_value_from_ticks(ticks["weight_x100_lb"], "x", "weight_x100_lb")
+    ax_wind_a, ax_wind_b = fit_axis_value_from_ticks(ticks["wind_kt"], "x", "wind_kt")
+
+    out_axis_key = ASSETS[mode]["out_axis_key"]
+    ax_out_a, ax_out_b = fit_axis_value_from_ticks(ticks[out_axis_key], "y", out_axis_key)
+
+    if not lines.get("weight_ref_line"):
+        raise ValueError("Missing lines['weight_ref_line']")
+    if not lines.get("wind_ref_zero"):
+        raise ValueError("Missing lines['wind_ref_zero']")
+
+    x_ref_mid = x_of_vertical_ref(lines["weight_ref_line"][0])
+    x_ref_right = x_of_vertical_ref(lines["wind_ref_zero"][0])
+
+    x_oat = axis_coord_from_value(ax_oat_a, ax_oat_b, oat_c)
+
+    pa_levels = parse_pa_levels_ft(lines)
+    (lo_ft, k_lo), (hi_ft, k_hi), alpha = interp_between_levels(pa_ft, pa_levels)
+    seg_lo = lines[k_lo][0]
+    seg_hi = lines[k_hi][0]
+    y_entry = (1 - alpha) * line_y_at_x(seg_lo, x_oat) + alpha * line_y_at_x(seg_hi, x_oat)
+
+    x_wt = axis_coord_from_value(ax_wt_a, ax_wt_b, weight_lb / 100.0)
+
+    g_mid, g_right = pick_guides(cap, mode=mode)
+    y_mid, dbg_mid = interp_guides_y(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
+
+    x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
+    y_out, dbg_right = interp_guides_y(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
+
+    out_val = axis_value(ax_out_a, ax_out_b, y_out)
+
+    segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+
+    left_panel = panels.get("left") or []
+    if not left_panel:
+        raise ValueError("Missing panel_corners['left']")
+    y_bottom_left = float(left_panel[2]["y"])
+
+    segs.append(((x_oat, y_bottom_left), (x_oat, y_entry)))
+    segs.append(((x_oat, y_entry), (x_ref_mid, y_entry)))
+    segs.append(((x_ref_mid, y_entry), (x_wt, y_mid)))
+    segs.append(((x_wt, y_mid), (x_ref_right, y_mid)))
+    segs.append(((x_ref_right, y_mid), (x_wind, y_out)))
+
+    right_panel = panels.get("right") or []
+    if not right_panel:
+        raise ValueError("Missing panel_corners['right']")
+    x_right_edge = float(right_panel[1]["x"])
+    segs.append(((x_wind, y_out), (x_right_edge, y_out)))
+
+    debug = {
+        "x_oat": x_oat,
+        "y_entry": y_entry,
+        "x_ref_mid": x_ref_mid,
+        "x_wt": x_wt,
+        "y_mid": y_mid,
+        "x_ref_right": x_ref_right,
+        "x_wind": x_wind,
+        "y_out": y_out,
+        "out_axis_key": out_axis_key,
+        "n_mid_guides": len(g_mid),
+        "n_right_guides": len(g_right),
+        "pa_interp": {"lo": (lo_ft, k_lo), "hi": (hi_ft, k_hi), "alpha": alpha},
+        "guide_mid": dbg_mid,
+        "guide_right": dbg_right,
     }
+    return out_val, segs, debug
 
 
-def ensure_capture(cap: Dict[str, Any], mode: str, zoom: float, page_index: int) -> Dict[str, Any]:
-    cfg = MODE_CONFIG[mode]
-    cap.setdefault("mode", mode)
-    cap["zoom"] = float(zoom)
-    cap["page_index"] = int(page_index)
+def solve_climb(
+    cap: Dict[str, Any],
+    oat_c: float,
+    pa_ft: float
+) -> Tuple[float, List[Tuple[Tuple[float, float], Tuple[float, float]]], Dict[str, Any]]:
+    ticks = cap["axis_ticks"]
+    lines = cap["lines"]
+    panels = normalize_panels(cap)
 
-    cap.setdefault("panel_corners", {})
-    for p in cfg["panels"]:
-        cap["panel_corners"].setdefault(p, [])
+    ax_oat_a, ax_oat_b = fit_axis_value_from_ticks(ticks["oat_c"], "x", "oat_c")
+    ax_roc_a, ax_roc_b = fit_axis_value_from_ticks(ticks["roc_fpm"], "y", "roc_fpm")
 
-    cap.setdefault("axis_ticks", {})
-    for k in cfg["axis_ticks"].keys():
-        cap["axis_ticks"].setdefault(k, [])
+    x_oat = axis_coord_from_value(ax_oat_a, ax_oat_b, oat_c)
 
-    cap.setdefault("lines", {})
-    for k in cfg["lines"]:
-        cap["lines"].setdefault(k, [])
+    pa_levels = parse_pa_levels_ft(lines)
+    (lo_ft, k_lo), (hi_ft, k_hi), alpha = interp_between_levels(pa_ft, pa_levels)
+    seg_lo = lines[k_lo][0]
+    seg_hi = lines[k_hi][0]
+    y = (1 - alpha) * line_y_at_x(seg_lo, x_oat) + alpha * line_y_at_x(seg_hi, x_oat)
 
-    cap.setdefault("guides", {})
-    for gk in cfg.get("guides", {}).keys():
-        cap["guides"].setdefault(gk, [])
+    roc = axis_value(ax_roc_a, ax_roc_b, y)
 
-    cap.setdefault("notes", "")
-    return cap
+    main = panels.get("main") or []
+    if not main:
+        raise ValueError("Missing panel_corners['main']")
+    y_bottom = float(main[2]["y"])
+    x_right_edge = float(main[1]["x"])
+
+    segs = [
+        ((x_oat, y_bottom), (x_oat, y)),
+        ((x_oat, y), (x_right_edge, y)),
+    ]
+
+    debug = {
+        "x_oat": x_oat,
+        "y": y,
+        "x_right_edge": x_right_edge,
+        "pa_interp": {"lo": (lo_ft, k_lo), "hi": (hi_ft, k_hi), "alpha": alpha},
+    }
+    return roc, segs, debug
 
 
 # =========================
@@ -194,485 +629,160 @@ def ensure_capture(cap: Dict[str, Any], mode: str, zoom: float, page_index: int)
 def draw_overlay(
     base: Image.Image,
     cap: Dict[str, Any],
-    show_panels: bool,
-    show_ticks: bool,
-    show_lines: bool,
-    show_guides: bool,
-    last_click: Optional[Tuple[float, float]],
-    pending_segment: Optional[Dict[str, Any]],
-    pending_corners: List[Dict[str, float]],
+    show_overlay: bool,
+    show_path: bool,
+    path_segs: List[Tuple[Tuple[float, float], Tuple[float, float]]],
+    label_text: Optional[str],
+    label_tip: Optional[Tuple[float, float]],
+    label_font_size: int,
 ) -> Image.Image:
-    out = base.copy()
-    d = ImageDraw.Draw(out)
+    img = base.copy()
+    d = ImageDraw.Draw(img)
+    W, H = img.size
 
-    if show_panels:
-        for panel, pts in cap.get("panel_corners", {}).items():
-            if len(pts) == 4:
-                poly = [(pts[i]["x"], pts[i]["y"]) for i in range(4)]
-                d.line(poly + [poly[0]], fill=(0, 140, 255), width=3)
-                d.text((poly[0][0] + 6, poly[0][1] + 6), panel, fill=(0, 140, 255))
+    panels = normalize_panels(cap)
 
-    if show_ticks:
-        for _, ticks in cap.get("axis_ticks", {}).items():
-            for t in ticks:
+    if show_overlay:
+        for _, seglist in cap.get("lines", {}).items():
+            for s in seglist:
+                d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(255, 0, 0), width=3)
+
+        for _, seglist in cap.get("guides", {}).items():
+            for s in seglist:
+                d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(0, 0, 255), width=4)
+
+        for _, tlist in cap.get("axis_ticks", {}).items():
+            for t in tlist:
                 x, y = float(t["x"]), float(t["y"])
                 d.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(0, 160, 0), width=3)
 
-    if show_lines:
-        for _, segs in cap.get("lines", {}).items():
-            for s in segs:
-                d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(255, 0, 0), width=3)
+        for panel, pts in panels.items():
+            if len(pts) == 4:
+                poly = [(pts[i]["x"], pts[i]["y"]) for i in range(4)]
+                d.line(poly + [poly[0]], fill=(0, 140, 255), width=3)
+                d.text((poly[0][0] + 6, poly[0][1] + 6), str(panel), fill=(0, 140, 255))
 
-    if show_guides:
-        for _, segs in cap.get("guides", {}).items():
-            for s in segs:
-                d.line([(s["x1"], s["y1"]), (s["x2"], s["y2"])], fill=(0, 0, 255), width=4)
+    if show_path:
+        for p1, p2 in path_segs:
+            draw_arrow(d, p1, p2, color=(255, 140, 0), w=5)
 
-    for p in pending_corners:
-        x, y = p["x"], p["y"]
-        d.ellipse((x - 5, y - 5, x + 5, y + 5), outline=(255, 0, 255), width=3)
+    if label_text and label_tip:
+        font = load_font(label_font_size)
+        draw_label_smart(d, W, H, label_tip, label_text, font)
 
-    if pending_segment is not None:
-        pts = pending_segment.get("pts", [])
-        for i, (x, y) in enumerate(pts):
-            color = (255, 140, 0) if i == 0 else (255, 180, 60)
-            d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=color, width=4)
-            d.text((x + 8, y + 8), f"{i+1}", fill=color)
-
-        if len(pts) >= 2:
-            for i in range(len(pts) - 1):
-                d.line([pts[i], pts[i + 1]], fill=(255, 165, 0), width=3)
-
-        if pts:
-            x, y = pts[0]
-            d.text((x + 8, y - 18), f"{pending_segment['kind']}:{pending_segment['key']}", fill=(255, 140, 0))
-
-    if last_click is not None:
-        x, y = last_click
-        d.ellipse((x - 6, y - 6, x + 6, y + 6), outline=(0, 0, 0), width=4)
-
-    return out
+    return img
 
 
 # =========================
-# History
+# Streamlit UI
 # =========================
-def push_history():
-    st.session_state.history.append({
-        "cap": copy.deepcopy(st.session_state.cap),
-        "pending_segment": copy.deepcopy(st.session_state.pending_segment),
-        "pending_corners": copy.deepcopy(st.session_state.pending_corners),
-        "last_click": st.session_state.last_click,
-        "status_msg": st.session_state.status_msg,
-        "prev_task_id": st.session_state.prev_task_id,
-        "last_processed_click_id": st.session_state.last_processed_click_id,
-    })
-    if len(st.session_state.history) > 80:
-        st.session_state.history = st.session_state.history[-80:]
-
-
-def undo_history() -> bool:
-    if not st.session_state.history:
-        return False
-    snap = st.session_state.history.pop()
-    st.session_state.cap = snap["cap"]
-    st.session_state.pending_segment = snap["pending_segment"]
-    st.session_state.pending_corners = snap["pending_corners"]
-    st.session_state.last_click = snap["last_click"]
-    st.session_state.status_msg = "UNDO ✓"
-    st.session_state.prev_task_id = snap["prev_task_id"]
-    st.session_state.last_processed_click_id = snap["last_processed_click_id"]
-    return True
-
-
-# =========================
-# Click de-dup
-# =========================
-def click_id(click: Dict[str, Any], mode: str, page_index: int) -> str:
-    x = int(round(float(click["x"])))
-    y = int(round(float(click["y"])))
-    return f"{mode}|{page_index}|{x}|{y}"
-
-
-# =========================
-# App
-# =========================
-st.set_page_config(page_title="PA28 JSON Builder", layout="wide")
-st.title("PA28 — Builder de JSON (Takeoff/Landing 50 ft + Climb)")
+st.set_page_config(page_title="PA28 Solvers", layout="wide")
+st.title("PA28 — Solvers (Takeoff / Landing 50 ft / Climb)")
 
 mode = st.sidebar.selectbox(
     "Escolhe o gráfico",
     options=["landing", "takeoff", "climb"],
-    format_func=lambda k: MODE_CONFIG[k]["title"],
+    format_func=lambda k: ASSETS[k]["title"],
 )
-
-cfg = MODE_CONFIG[mode]
-files = FILES[mode]
-guide_points_required = int(cfg.get("guide_points", 2))
+info = ASSETS[mode]
 
 st.sidebar.markdown("---")
-st.sidebar.header("Background")
-upload_bg = st.sidebar.file_uploader("Upload background (opcional)", type=["pdf", "png", "jpg", "jpeg"])
-zoom = st.sidebar.number_input("Zoom (PDF)", value=2.3, step=0.1)
-page_index = st.sidebar.number_input("Página (0-index) [PDF]", value=int(files["page_default"]), step=1)
+st.sidebar.subheader("Background")
+upload_bg = st.sidebar.file_uploader("Upload background (se não estiver na pasta)", type=["pdf", "png", "jpg", "jpeg"])
+zoom = st.sidebar.number_input("Zoom PDF", value=2.3, step=0.1)
+page_index = st.sidebar.number_input("Página (0-index) [PDF]", value=int(info["page_default"]), step=1)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("JSON")
+upload_json = st.sidebar.file_uploader("Upload JSON (se não estiver na pasta)", type=["json"])
 
 try:
+    cap = load_json(mode, upload_json)
     bg = load_background(mode, upload_bg, page_index=int(page_index), zoom=float(zoom))
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.sidebar.markdown("---")
-st.sidebar.header("JSON")
-upload_json = st.sidebar.file_uploader("Upload JSON (opcional)", type=["json"])
-default_json_name = json_default_name(mode)
+validation_errors = validate_solver_capture(cap, mode)
 
-
-def load_json_or_new() -> Dict[str, Any]:
-    try:
-        if upload_json is not None:
-            raw = upload_json.read().decode("utf-8").strip()
-            if not raw:
-                st.warning("O JSON enviado está vazio. Vou criar um novo.")
-                return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
-            return json.loads(raw)
-
-        p = locate_file(default_json_name)
-        if p:
-            raw = Path(p).read_text(encoding="utf-8").strip()
-            if not raw:
-                st.warning(f"{default_json_name} está vazio. Vou criar um novo.")
-                return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
-            return json.loads(raw)
-
-        return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
-
-    except json.JSONDecodeError as e:
-        st.error(
-            f"JSON inválido em '{default_json_name}'. "
-            f"Linha {e.lineno}, coluna {e.colno}. Vou criar um novo JSON vazio."
-        )
-        return new_capture(mode, zoom=float(zoom), page_index=int(page_index))
-
-
-if "cap" not in st.session_state or st.session_state.get("cap_mode") != mode:
-    st.session_state.cap = load_json_or_new()
-    st.session_state.cap_mode = mode
-    st.session_state.last_processed_click_id = None
-    st.session_state.prev_task_id = None
-    st.session_state.pending_segment = None
-    st.session_state.pending_corners = []
-    st.session_state.last_click = None
-    st.session_state.status_msg = ""
-
-st.session_state.cap = ensure_capture(st.session_state.cap, mode=mode, zoom=float(zoom), page_index=int(page_index))
-
-st.session_state.setdefault("pending_segment", None)
-st.session_state.setdefault("pending_corners", [])
-st.session_state.setdefault("last_click", None)
-st.session_state.setdefault("status_msg", "")
-st.session_state.setdefault("history", [])
-st.session_state.setdefault("prev_task_id", None)
-st.session_state.setdefault("last_processed_click_id", None)
-
-with st.sidebar:
-    st.markdown("---")
-    st.header("Overlay")
-    show_panels = st.checkbox("Mostrar painéis", value=True)
-    show_ticks = st.checkbox("Mostrar ticks", value=True)
-    show_lines = st.checkbox("Mostrar linhas", value=True)
-    show_guides = st.checkbox("Mostrar guides", value=True)
-
-    st.markdown("---")
-    if st.button("↩️ Undo (voltar atrás 1 passo)"):
-        if undo_history():
-            st.rerun()
-        else:
-            st.info("Nada para desfazer.")
-
-    if st.button("Novo JSON (reset tudo)"):
-        push_history()
-        st.session_state.cap = new_capture(mode, zoom=float(zoom), page_index=int(page_index))
-        st.session_state.pending_segment = None
-        st.session_state.pending_corners = []
-        st.session_state.last_click = None
-        st.session_state.last_processed_click_id = None
-        st.session_state.status_msg = "JSON reset."
-        st.rerun()
-
-    if st.button("Limpar pendentes"):
-        push_history()
-        st.session_state.pending_segment = None
-        st.session_state.pending_corners = []
-        st.session_state.status_msg = "Pendentes limpos."
-        st.rerun()
-
-
-left, right = st.columns([1.6, 1])
+left, right = st.columns([1.7, 1])
 
 with right:
-    st.subheader("Modo de captura")
+    st.subheader("Inputs")
 
-    tasks = ["PANEL: 4 cliques (corners)"]
-    tasks += [f"TICK: {k}" for k in cfg["axis_ticks"].keys()]
-    tasks += [f"LINE: {k} (2 cliques)" for k in cfg["lines"]]
-    for gk in cfg.get("guides", {}).keys():
-        tasks.append(f"GUIDE: {gk} ({guide_points_required} cliques)")
+    segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    dbg: Dict[str, Any] = {}
+    raw = 0.0
 
-    task = st.selectbox("O que estás a fazer agora", tasks)
+    label_text: Optional[str] = None
+    label_tip: Optional[Tuple[float, float]] = None
 
-    panel_pick = None
-    tick_axis = None
-    tick_value = None
-    line_key = None
-    guide_key = None
+    if validation_errors:
+        st.error("O JSON ainda não está completo para correr o solver.")
+        with st.expander("Ver o que falta", expanded=True):
+            for err in validation_errors:
+                st.write(f"- {err}")
 
-    if task.startswith("PANEL"):
-        panel_pick = st.selectbox("Qual painel?", cfg["panels"])
+        st.markdown("---")
+        show_overlay = st.checkbox("Mostrar overlay das linhas capturadas", value=True)
+        show_path = st.checkbox("Mostrar caminho do solver (setas)", value=False)
 
-    elif task.startswith("TICK:"):
-        tick_axis = task.split("TICK: ")[1].strip()
-        tick_value = st.number_input("Valor do tick", value=0.0, step=1.0)
-
-    elif task.startswith("LINE:"):
-        line_key = task.split("LINE: ")[1].split(" (")[0].strip()
-
-    elif task.startswith("GUIDE:"):
-        guide_key = task.split("GUIDE: ")[1].split(" (")[0].strip()
-        st.info(cfg["guides"][guide_key])
-
-    if task.startswith("PANEL"):
-        task_id = f"PANEL:{panel_pick}"
-    elif task.startswith("TICK:"):
-        task_id = f"TICK:{tick_axis}"
-    elif task.startswith("LINE:"):
-        task_id = f"LINE:{line_key}"
-    elif task.startswith("GUIDE:"):
-        task_id = f"GUIDE:{guide_key}"
     else:
-        task_id = task
+        if mode in ("landing", "takeoff"):
+            oat = st.number_input("OAT (°C)", value=21.0 if mode == "landing" else 23.0, step=1.0)
+            pa = st.number_input("Pressure Altitude (ft)", value=2500.0 if mode == "landing" else 2000.0, step=500.0)
+            wt = st.number_input("Weight (lb)", value=2240.0 if mode == "landing" else 2400.0, step=50.0)
+            wind = st.number_input("Headwind (kt)", value=5.0 if mode == "landing" else 8.0, step=1.0)
 
-    if st.session_state.prev_task_id is not None and st.session_state.prev_task_id != task_id:
-        st.session_state.pending_segment = None
-        st.session_state.pending_corners = []
-    st.session_state.prev_task_id = task_id
+            raw, segs, dbg = solve_performance_chart(
+                cap, mode=mode, oat_c=float(oat), pa_ft=float(pa), weight_lb=float(wt), wind_kt=float(wind)
+            )
+            out = round_to_step(raw, info["round_to"])
+            st.metric(
+                info["metric_label"],
+                f"{out:.0f}",
+                help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}"
+            )
 
-    def delete_last_for_task() -> bool:
-        cap_local = st.session_state.cap
+            if segs:
+                _, tip = segs[-1]
+                label_text = f"{out:.0f} ft"
+                label_tip = tip
 
-        if st.session_state.pending_segment is not None:
-            pts = st.session_state.pending_segment.get("pts", [])
-            if pts:
-                pts.pop()
-                if pts:
-                    st.session_state.pending_segment["pts"] = pts
-                    st.session_state.status_msg = "Último ponto pendente apagado."
-                else:
-                    st.session_state.pending_segment = None
-                    st.session_state.status_msg = "Pendente apagado."
-                return True
-
-        if st.session_state.pending_corners:
-            st.session_state.pending_corners.pop()
-            st.session_state.status_msg = "Último corner pendente apagado."
-            return True
-
-        if task.startswith("TICK:") and tick_axis:
-            if cap_local["axis_ticks"][tick_axis]:
-                cap_local["axis_ticks"][tick_axis].pop()
-                st.session_state.status_msg = f"Último tick apagado ({tick_axis})."
-                return True
-
-        if task.startswith("LINE:") and line_key:
-            if cap_local["lines"][line_key]:
-                cap_local["lines"][line_key].pop()
-                st.session_state.status_msg = f"Último segmento apagado (line {line_key})."
-                return True
-
-        if task.startswith("GUIDE:") and guide_key:
-            if guide_points_required == 3:
-                segs = cap_local["guides"][guide_key]
-                if len(segs) >= 2:
-                    segs.pop()
-                    segs.pop()
-                    st.session_state.status_msg = f"Última guide curva apagada ({guide_key})."
-                    return True
-            else:
-                if cap_local["guides"][guide_key]:
-                    cap_local["guides"][guide_key].pop()
-                    st.session_state.status_msg = f"Última guide apagada ({guide_key})."
-                    return True
-
-        if task.startswith("PANEL") and panel_pick:
-            if cap_local["panel_corners"][panel_pick]:
-                cap_local["panel_corners"][panel_pick] = []
-                st.session_state.status_msg = f"Corners do painel {panel_pick} apagados."
-                return True
-
-        return False
-
-    if st.button("🗑️ Apagar último (pendente/último item)"):
-        push_history()
-        if delete_last_for_task():
-            st.rerun()
         else:
-            st.info("Nada para apagar neste modo.")
+            oat = st.number_input("OAT (°C)", value=19.0, step=1.0)
+            pa = st.number_input("Pressure Altitude (ft)", value=4000.0, step=500.0)
 
-    st.markdown("---")
-    st.subheader("Último clique")
-    if st.session_state.last_click is None:
-        st.write("—")
-    else:
-        x, y = st.session_state.last_click
-        st.write(f"x={int(x)}, y={int(y)}")
+            raw, segs, dbg = solve_climb(cap, oat_c=float(oat), pa_ft=float(pa))
+            out = round_to_step(raw, info["round_to"])
+            st.metric(
+                info["metric_label"],
+                f"{out:.0f}",
+                help=f"Raw={raw:.1f} — arredondado de {info['round_to']} em {info['round_to']}"
+            )
 
-    st.subheader("Pendentes")
-    st.write({
-        "pending_segment": st.session_state.pending_segment,
-        "pending_corners_count": len(st.session_state.pending_corners),
-        "last_processed_click_id": st.session_state.last_processed_click_id,
-    })
+            if segs:
+                _, tip = segs[-1]
+                label_text = f"{out:.0f} fpm"
+                label_tip = tip
 
-    if st.session_state.status_msg:
-        st.success(st.session_state.status_msg)
+        st.markdown("---")
+        show_overlay = st.checkbox("Mostrar overlay das linhas capturadas", value=True)
+        show_path = st.checkbox("Mostrar caminho do solver (setas)", value=True)
 
-    st.markdown("---")
-    st.subheader("Resumo")
-    cap_local = st.session_state.cap
-    st.write({
-        "panels": {p: len(cap_local["panel_corners"].get(p, [])) for p in cfg["panels"]},
-        "ticks": {k: len(cap_local["axis_ticks"].get(k, [])) for k in cfg["axis_ticks"].keys()},
-        "lines": {k: len(cap_local["lines"].get(k, [])) for k in cfg["lines"]},
-        "guides": {k: len(cap_local["guides"].get(k, [])) for k in cfg.get("guides", {}).keys()},
-    })
-
-    if task.startswith("GUIDE:") and mode == "takeoff":
-        st.caption("No takeoff, cada guide curva é guardada como 2 segmentos: P1→P2 e P2→P3.")
-
-    st.markdown("---")
-    st.subheader("Export / Guardar")
-    txt = json.dumps(cap_local, indent=2)
-    st.download_button("⬇️ Download JSON", data=txt, file_name=default_json_name, mime="application/json")
-    if st.button(f"Guardar no repo como {default_json_name}"):
-        Path(default_json_name).write_text(txt, encoding="utf-8")
-        st.success(f"Guardado: {default_json_name}")
-
-    st.markdown("---")
-    with st.expander("Ver JSON"):
-        st.code(txt, language="json")
-
+        with st.expander("Debug"):
+            st.json(dbg)
 
 with left:
-    st.subheader("Imagem (sem duplicar cliques)")
-
-    overlay_before = draw_overlay(
+    img = draw_overlay(
         bg,
-        st.session_state.cap,
-        show_panels=show_panels,
-        show_ticks=show_ticks,
-        show_lines=show_lines,
-        show_guides=show_guides,
-        last_click=st.session_state.last_click,
-        pending_segment=st.session_state.pending_segment,
-        pending_corners=st.session_state.pending_corners,
+        cap,
+        show_overlay=show_overlay,
+        show_path=show_path,
+        path_segs=segs,
+        label_text=label_text,
+        label_tip=label_tip,
+        label_font_size=int(info["label_font"]),
     )
-
-    click = streamlit_image_coordinates(np.array(overlay_before), key=f"img_{mode}_{int(page_index)}")
-
-    if click is not None:
-        cid = click_id(click, mode=mode, page_index=int(page_index))
-        if cid != st.session_state.last_processed_click_id:
-            push_history()
-            st.session_state.last_processed_click_id = cid
-
-            x = float(click["x"])
-            y = float(click["y"])
-            st.session_state.last_click = (x, y)
-            st.session_state.status_msg = ""
-
-            cap_local = st.session_state.cap
-
-            if task.startswith("PANEL"):
-                st.session_state.pending_corners.append({"x": x, "y": y})
-                if len(st.session_state.pending_corners) == 4:
-                    cap_local["panel_corners"][panel_pick] = st.session_state.pending_corners
-                    st.session_state.pending_corners = []
-                    st.session_state.status_msg = f"Corners guardados em '{panel_pick}'."
-
-            elif task.startswith("TICK:"):
-                cap_local["axis_ticks"][tick_axis].append({"x": x, "y": y, "value": float(tick_value)})
-                st.session_state.status_msg = f"Tick adicionado em {tick_axis} (v={tick_value})."
-
-            elif task.startswith("LINE:"):
-                pend = st.session_state.pending_segment
-                if pend is None:
-                    st.session_state.pending_segment = {"kind": "LINE", "key": line_key, "pts": [(x, y)]}
-                    st.session_state.status_msg = "Primeiro ponto guardado. Agora clica no segundo."
-                else:
-                    if pend["kind"] != "LINE" or pend["key"] != line_key:
-                        st.session_state.pending_segment = {"kind": "LINE", "key": line_key, "pts": [(x, y)]}
-                        st.session_state.status_msg = "Mudaste de linha — novo primeiro ponto guardado."
-                    else:
-                        pts = pend.get("pts", [])
-                        pts.append((x, y))
-                        if len(pts) == 2:
-                            x1, y1 = pts[0]
-                            x2, y2 = pts[1]
-                            cap_local["lines"][line_key].append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-                            st.session_state.pending_segment = None
-                            st.session_state.status_msg = f"Segmento adicionado em lines['{line_key}']."
-                        else:
-                            st.session_state.pending_segment["pts"] = pts
-
-            elif task.startswith("GUIDE:"):
-                pend = st.session_state.pending_segment
-                required = guide_points_required
-
-                if pend is None:
-                    st.session_state.pending_segment = {"kind": "GUIDE", "key": guide_key, "pts": [(x, y)]}
-                    st.session_state.status_msg = f"Ponto 1/{required} da guide guardado."
-                else:
-                    if pend["kind"] != "GUIDE" or pend["key"] != guide_key:
-                        st.session_state.pending_segment = {"kind": "GUIDE", "key": guide_key, "pts": [(x, y)]}
-                        st.session_state.status_msg = f"Mudaste de guide — ponto 1/{required} guardado."
-                    else:
-                        pts = pend.get("pts", [])
-                        pts.append((x, y))
-
-                        if len(pts) < required:
-                            st.session_state.pending_segment["pts"] = pts
-                            st.session_state.status_msg = f"Ponto {len(pts)}/{required} da guide guardado."
-                        else:
-                            if required == 2:
-                                x1, y1 = pts[0]
-                                x2, y2 = pts[1]
-                                cap_local["guides"][guide_key].append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-                                st.session_state.status_msg = f"Guide adicionada em guides['{guide_key}']."
-                            elif required == 3:
-                                x1, y1 = pts[0]
-                                x2, y2 = pts[1]
-                                x3, y3 = pts[2]
-                                cap_local["guides"][guide_key].append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-                                cap_local["guides"][guide_key].append({"x1": x2, "y1": y2, "x2": x3, "y2": y3})
-                                st.session_state.status_msg = (
-                                    f"Guide curva adicionada em guides['{guide_key}'] "
-                                    f"como 2 segmentos."
-                                )
-                            st.session_state.pending_segment = None
-
-            st.session_state.cap = cap_local
-
-    overlay_after = draw_overlay(
-        bg,
-        st.session_state.cap,
-        show_panels=show_panels,
-        show_ticks=show_ticks,
-        show_lines=show_lines,
-        show_guides=show_guides,
-        last_click=st.session_state.last_click,
-        pending_segment=st.session_state.pending_segment,
-        pending_corners=st.session_state.pending_corners,
-    )
-
-    st.image(overlay_after, use_container_width=True)
-    st.caption("Preto=último clique | Laranja=guide/line pendente | Magenta=corners pendentes")
+    st.image(img, use_container_width=True)
+    st.caption("Vermelho: linhas. Azul: guides. Verde: ticks. Ciano: painéis. Laranja: caminho do solver + valor.")
