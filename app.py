@@ -192,10 +192,10 @@ def validate_solver_capture(cap: Dict[str, Any], mode: str) -> List[str]:
             errs.append("panel_corners['right'] precisa de 4 corners.")
 
         if len(guides.get("middle", []) or []) < 1:
-            errs.append("guides['middle'] precisa de pelo menos 1 guide.")
+            errs.append("guides['middle'] precisa de pelo menos 1 segmento/guide.")
 
         if len(guides.get("right", []) or []) < 1:
-            errs.append("guides['right'] precisa de pelo menos 1 guide.")
+            errs.append("guides['right'] precisa de pelo menos 1 segmento/guide.")
 
     else:
         required_tick_keys = ["oat_c", "roc_fpm"]
@@ -246,11 +246,6 @@ def line_y_at_x(seg: Dict[str, float], x: float) -> float:
     return y1 + t * (y2 - y1)
 
 
-def x_minmax(seg: Dict[str, float]) -> Tuple[float, float]:
-    x1, x2 = float(seg["x1"]), float(seg["x2"])
-    return (min(x1, x2), max(x1, x2))
-
-
 def parse_pa_levels_ft(lines: Dict[str, List[Dict[str, float]]]) -> List[Tuple[float, str]]:
     out: List[Tuple[float, str]] = []
     for k, segs in lines.items():
@@ -294,132 +289,114 @@ def x_of_vertical_ref(seg: Dict[str, float]) -> float:
 
 
 # =========================
-# Guide helpers
+# Guide helpers (novo)
 # =========================
-def pair_takeoff_guides(segments: List[Dict[str, float]]) -> List[List[Dict[str, float]]]:
+def _seg_endpoints(seg: Dict[str, float]) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    return (float(seg["x1"]), float(seg["y1"])), (float(seg["x2"]), float(seg["y2"]))
+
+
+def _same_point(a: Tuple[float, float], b: Tuple[float, float], tol: float = 1.5) -> bool:
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def group_guides_for_mode(segments: List[Dict[str, float]], mode: str) -> List[List[Dict[str, float]]]:
     """
-    No takeoff builder, cada guide curva é guardada como 2 segmentos:
-    [P1->P2, P2->P3]. Aqui reconstruímos cada guide.
+    landing: cada guide continua a ser 1 segmento
+    takeoff: cada guide curva foi guardada como 2 segmentos consecutivos
     """
-    out: List[List[Dict[str, float]]] = []
+    if mode != "takeoff":
+        return [[s] for s in segments]
+
+    groups: List[List[Dict[str, float]]] = []
     i = 0
     while i < len(segments):
         if i + 1 < len(segments):
-            out.append([segments[i], segments[i + 1]])
-            i += 2
-        else:
-            out.append([segments[i]])
-            i += 1
-    return out
+            s1 = segments[i]
+            s2 = segments[i + 1]
+            a1, b1 = _seg_endpoints(s1)
+            a2, b2 = _seg_endpoints(s2)
+
+            if _same_point(b1, a2):
+                groups.append([s1, s2])
+                i += 2
+                continue
+
+        groups.append([segments[i]])
+        i += 1
+
+    return groups
 
 
-def curve_y_at_x(curve: List[Dict[str, float]], x: float) -> float:
+def polyline_y_at_x(poly: List[Dict[str, float]], x: float) -> float:
     """
-    Avalia uma guide:
-    - 1 segmento -> reta normal
-    - 2 segmentos -> curva por partes
+    Calcula y(x) numa polilinha de 1 ou 2 segmentos.
+    Se x cair dentro do intervalo horizontal de um segmento, usa esse.
+    Se não cair exatamente, usa o segmento cujo intervalo esteja mais próximo.
     """
-    if not curve:
-        raise ValueError("Guide curve vazia.")
+    if not poly:
+        raise ValueError("Polyline vazia.")
 
-    if len(curve) == 1:
-        return line_y_at_x(curve[0], x)
+    if len(poly) == 1:
+        return line_y_at_x(poly[0], x)
 
-    s1, s2 = curve[0], curve[1]
-    a1, b1 = x_minmax(s1)
-    a2, b2 = x_minmax(s2)
+    candidates = []
+    for seg in poly:
+        x1, x2 = float(seg["x1"]), float(seg["x2"])
+        xmin, xmax = min(x1, x2), max(x1, x2)
+        in_range = xmin - 1e-9 <= x <= xmax + 1e-9
+        dist = 0.0 if in_range else min(abs(x - xmin), abs(x - xmax))
+        candidates.append((dist, in_range, seg))
 
-    if a1 <= x <= b1:
-        return line_y_at_x(s1, x)
-    if a2 <= x <= b2:
-        return line_y_at_x(s2, x)
-
-    # fora do intervalo: usa o segmento mais próximo
-    d1 = min(abs(x - a1), abs(x - b1))
-    d2 = min(abs(x - a2), abs(x - b2))
-    if d1 <= d2:
-        return line_y_at_x(s1, x)
-    return line_y_at_x(s2, x)
+    candidates.sort(key=lambda t: (t[0], 0 if t[1] else 1))
+    best_seg = candidates[0][2]
+    return line_y_at_x(best_seg, x)
 
 
-def interp_guides_y_straight(
-    guides: List[Dict[str, float]],
+def interp_guides_y(
+    guide_groups: List[List[Dict[str, float]]],
     x_ref: float,
     y_ref: float,
     x_target: float
 ) -> Tuple[float, Dict[str, Any]]:
-    if not guides:
+    if not guide_groups:
         return y_ref, {"used": "none"}
 
     rows = []
-    for g in guides:
-        yr = line_y_at_x(g, x_ref)
-        yt = line_y_at_x(g, x_target)
-        rows.append((yr, yt))
+    for poly in guide_groups:
+        yr = polyline_y_at_x(poly, x_ref)
+        yt = polyline_y_at_x(poly, x_target)
+        rows.append((yr, yt, len(poly)))
 
     rows.sort(key=lambda t: t[0])
 
     if y_ref <= rows[0][0]:
-        return float(rows[0][1]), {"used": "clamp_low"}
+        return float(rows[0][1]), {"used": "clamp_low", "poly_len": rows[0][2]}
     if y_ref >= rows[-1][0]:
-        return float(rows[-1][1]), {"used": "clamp_high"}
+        return float(rows[-1][1]), {"used": "clamp_high", "poly_len": rows[-1][2]}
 
     for i in range(len(rows) - 1):
-        y0_ref, y0_tgt = rows[i]
-        y1_ref, y1_tgt = rows[i + 1]
+        y0_ref, y0_tgt, n0 = rows[i]
+        y1_ref, y1_tgt, n1 = rows[i + 1]
         if y0_ref <= y_ref <= y1_ref:
             denom = (y1_ref - y0_ref)
             a = 0.0 if abs(denom) < 1e-12 else (y_ref - y0_ref) / denom
             y_tgt = (1 - a) * y0_tgt + a * y1_tgt
-            return float(y_tgt), {"used": "interp", "i0": i, "i1": i + 1, "alpha": float(a)}
-
-    return y_ref, {"used": "fallback"}
-
-
-def interp_guides_y_curved_takeoff(
-    guide_segments: List[Dict[str, float]],
-    x_ref: float,
-    y_ref: float,
-    x_target: float
-) -> Tuple[float, Dict[str, Any]]:
-    if not guide_segments:
-        return y_ref, {"used": "none"}
-
-    curves = pair_takeoff_guides(guide_segments)
-
-    rows = []
-    for idx, curve in enumerate(curves):
-        yr = curve_y_at_x(curve, x_ref)
-        yt = curve_y_at_x(curve, x_target)
-        rows.append((yr, yt, idx, len(curve)))
-
-    rows.sort(key=lambda t: t[0])
-
-    if y_ref <= rows[0][0]:
-        return float(rows[0][1]), {"used": "clamp_low", "curve": rows[0][2]}
-    if y_ref >= rows[-1][0]:
-        return float(rows[-1][1]), {"used": "clamp_high", "curve": rows[-1][2]}
-
-    for i in range(len(rows) - 1):
-        y0_ref, y0_tgt, idx0, _ = rows[i]
-        y1_ref, y1_tgt, idx1, _ = rows[i + 1]
-        if y0_ref <= y_ref <= y1_ref:
-            denom = y1_ref - y0_ref
-            a = 0.0 if abs(denom) < 1e-12 else (y_ref - y0_ref) / denom
-            y_tgt = (1 - a) * y0_tgt + a * y1_tgt
             return float(y_tgt), {
-                "used": "interp_curved",
-                "curve0": idx0,
-                "curve1": idx1,
+                "used": "interp",
+                "i0": i,
+                "i1": i + 1,
                 "alpha": float(a),
+                "poly_lens": [n0, n1],
             }
 
     return y_ref, {"used": "fallback"}
 
 
-def pick_guides(cap: Dict[str, Any]) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+def pick_guides(cap: Dict[str, Any], mode: str) -> Tuple[List[List[Dict[str, float]]], List[List[Dict[str, float]]]]:
     g = cap.get("guides", {}) or {}
-    return g.get("middle", []) or [], g.get("right", []) or []
+    mid_raw = g.get("middle", []) or []
+    right_raw = g.get("right", []) or []
+    return group_guides_for_mode(mid_raw, mode), group_guides_for_mode(right_raw, mode)
 
 
 # =========================
@@ -558,16 +535,11 @@ def solve_performance_chart(
 
     x_wt = axis_coord_from_value(ax_wt_a, ax_wt_b, weight_lb / 100.0)
 
-    g_mid, g_right = pick_guides(cap)
+    g_mid, g_right = pick_guides(cap, mode=mode)
+    y_mid, dbg_mid = interp_guides_y(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
 
-    if mode == "takeoff":
-        y_mid, dbg_mid = interp_guides_y_curved_takeoff(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
-        x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
-        y_out, dbg_right = interp_guides_y_curved_takeoff(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
-    else:
-        y_mid, dbg_mid = interp_guides_y_straight(g_mid, x_ref=x_ref_mid, y_ref=y_entry, x_target=x_wt)
-        x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
-        y_out, dbg_right = interp_guides_y_straight(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
+    x_wind = axis_coord_from_value(ax_wind_a, ax_wind_b, wind_kt)
+    y_out, dbg_right = interp_guides_y(g_right, x_ref=x_ref_right, y_ref=y_mid, x_target=x_wind)
 
     out_val = axis_value(ax_out_a, ax_out_b, y_out)
 
@@ -591,7 +563,6 @@ def solve_performance_chart(
     segs.append(((x_wind, y_out), (x_right_edge, y_out)))
 
     debug = {
-        "mode": mode,
         "x_oat": x_oat,
         "y_entry": y_entry,
         "x_ref_mid": x_ref_mid,
@@ -601,6 +572,8 @@ def solve_performance_chart(
         "x_wind": x_wind,
         "y_out": y_out,
         "out_axis_key": out_axis_key,
+        "n_mid_guides": len(g_mid),
+        "n_right_guides": len(g_right),
         "pa_interp": {"lo": (lo_ft, k_lo), "hi": (hi_ft, k_hi), "alpha": alpha},
         "guide_mid": dbg_mid,
         "guide_right": dbg_right,
